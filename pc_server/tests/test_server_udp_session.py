@@ -15,6 +15,10 @@ class FakeConn:
         self._chunks = list(chunks or [])
         self.sent = []
         self.closed = False
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
 
     def sendall(self, data):
         self.sent.append(data)
