@@ -3,6 +3,8 @@
 AI 코딩 에이전트가 이 프로젝트를 이어받아 작업할 수 있도록 작성된 컨텍스트 문서입니다.
 이 파일 하나만 읽어도 현재 상태와 다음 할 일을 파악할 수 있도록 유지하세요.
 
+> **Claude Code 사용 시:** Android↔서버 양쪽에 걸친 기능 작업은 `phone-pad-orchestrator` 스킬(`.claude/skills/`)이 android-dev/server-dev/protocol-qa 3인 에이전트 팀으로 처리합니다. 하네스 트리거 규칙과 변경 이력은 `CLAUDE.md` 참조.
+
 ---
 
 ## 1. 프로젝트 한 줄 요약
