@@ -13,6 +13,12 @@ object GestureConfig {
     /** 커서 이동 이벤트를 발생시킬 최소 이동 거리 (px) — 탭 중 미세 떨림 억제 */
     const val MOVE_MIN_DISTANCE_PX = 5f
 
-    /** PC 서버 기본 포트 */
+    /** PC 서버 기본 포트 (TCP — CLICK/SCROLL/DRAG/HEARTBEAT 및 세션 핸드셰이크) */
     const val DEFAULT_PORT = 9000
+
+    /** PC 서버 UDP 포트 (MOVE 전용) */
+    const val UDP_PORT = 9001
+
+    /** TCP 연결 직후 세션 핸드셰이크 한 줄을 기다리는 최대 시간 (ms) */
+    const val SESSION_HANDSHAKE_TIMEOUT_MS = 3000
 }
