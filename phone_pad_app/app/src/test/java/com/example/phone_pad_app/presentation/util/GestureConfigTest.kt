@@ -23,6 +23,20 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `heartbeat 상수는 확정 스펙 값과 일치한다`() {
+        // 서버(pc_server) HEARTBEAT_INTERVAL_S = 5.0 / HEARTBEAT_MISS_LIMIT = 3 과 대칭
+        assertEquals(5000L, GestureConfig.HEARTBEAT_INTERVAL_MS)
+        assertEquals(3, GestureConfig.HEARTBEAT_MISS_LIMIT)
+        // 5초 × 3회 ≈ 15초 (AGENTS.md 섹션 6)
+        assertEquals(
+            15_000L,
+            GestureConfig.HEARTBEAT_INTERVAL_MS * GestureConfig.HEARTBEAT_MISS_LIMIT
+        )
+        // 소켓 soTimeout(Int)으로 그대로 쓸 수 있는 범위여야 한다
+        assertTrue(GestureConfig.HEARTBEAT_INTERVAL_MS <= Int.MAX_VALUE.toLong())
+    }
+
+    @Test
     fun `제스처 임계값은 MOVE 최소 거리가 탭 최대 거리보다 작다`() {
         assertTrue(GestureConfig.MOVE_MIN_DISTANCE_PX < GestureConfig.TAP_MAX_DISTANCE_PX)
         assertTrue(GestureConfig.MOVE_SENSITIVITY > 0f)

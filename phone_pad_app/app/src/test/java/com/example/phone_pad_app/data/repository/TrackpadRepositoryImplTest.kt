@@ -13,6 +13,7 @@ import io.mockk.slot
 import io.mockk.coVerifyOrder
 import io.mockk.verify
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -29,11 +30,18 @@ class TrackpadRepositoryImplTest {
     private lateinit var udpClient: UdpClient
     private lateinit var repository: TrackpadRepositoryImpl
 
+    /**
+     * heartbeat 루프는 이 디스패처에 올라간다.
+     * 이 테스트 클래스는 스케줄러를 진행시키지 않으므로 루프 본문은 실행되지 않으며,
+     * 채널 분기/세션 관련 검증에 영향을 주지 않는다 (타이밍 검증은 TrackpadRepositoryHeartbeatTest).
+     */
+    private val loopDispatcher = StandardTestDispatcher()
+
     @Before
     fun setUp() {
         tcpClient = mockk(relaxed = true)
         udpClient = mockk(relaxed = true)
-        repository = TrackpadRepositoryImpl(tcpClient, udpClient)
+        repository = TrackpadRepositoryImpl(tcpClient, udpClient, loopDispatcher)
     }
 
     private suspend fun connectSuccessfully() {
@@ -172,12 +180,15 @@ class TrackpadRepositoryImplTest {
     }
 
     @Test
-    fun `UDP 전송 실패는 Error 상태로 보고된다`() = runTest {
+    fun `UDP 전송 실패는 연결 상태를 덮어쓰지 않는다`() = runTest {
+        // F-2: MOVE는 고빈도 이벤트라 실패해도 조용히 버린다. 실제 연결 유실은
+        // heartbeat watchdog이 감지해 Error로 전환하므로, 여기서 상태를 바꾸면
+        // 그 원인 메시지(예: "Heartbeat timeout")를 지워버리게 된다.
         connectSuccessfully()
         coEvery { udpClient.send(any()) } throws java.io.IOException("udp down")
 
         repository.sendEvent(TrackpadEvent.Move(1f, 1f))
 
-        assertEquals(ConnectionState.Error("udp down"), repository.connectionState.first())
+        assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
     }
 }
