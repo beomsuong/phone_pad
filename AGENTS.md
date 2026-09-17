@@ -30,7 +30,7 @@ phone_pad/
 │       ├── data/
 │       │   ├── network/       TcpClient.kt, UdpClient.kt, SessionHandshake.kt
 │       │   └── repository/    TrackpadRepositoryImpl.kt
-│       ├── di/                AppModule.kt
+│       ├── di/                AppModule.kt, DispatcherModule.kt
 │       └── presentation/
 │           ├── util/          GestureConfig.kt
 │           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt
@@ -81,7 +81,7 @@ phone_pad/
 // 서버 → 클라이언트, 연결 직후 1회, 반드시 첫 줄
 {"type":"SESSION","session":"0123456789abcdef0123456789abcdef"}  // uuid4().hex, 32자리 hex
 ```
-클라이언트는 이 줄을 받아야 `ConnectionState.Connected`로 전환한다 (`SESSION_HANDSHAKE_TIMEOUT_MS` 내 미수신 시 `Error`). TCP 연결이 끊기면 서버는 해당 세션을 즉시 회수한다.
+클라이언트는 이 줄을 받아야 `ConnectionState.Connected`로 전환한다 (`SESSION_HANDSHAKE_TIMEOUT_MS` 내 미수신 시 `Error`). 핸드셰이크 직후부터 서버는 해당 소켓에 `HEARTBEAT_INTERVAL_S` 초 `recv` 타임아웃을 걸고, **연속 `HEARTBEAT_MISS_LIMIT`(3)회 동안 상향 데이터가 전혀 없으면(≈15초) 세션을 회수하고 연결을 끊는다.** 여기서 "데이터"는 HEARTBEAT뿐 아니라 CLICK 등 어떤 상향 이벤트든 해당되며, 매번 카운터가 0으로 리셋된다.
 
 ```jsonc
 // 좌클릭
@@ -100,8 +100,17 @@ phone_pad/
 {"type":"DRAG_START"}
 {"type":"DRAG_END"}
 
-// heartbeat (Phase 2, 미구현 — TCP 수신 루프 자체가 아직 없음)
+// heartbeat — ✅ 구현됨. 클라이언트 → 서버, HEARTBEAT_INTERVAL_MS(5000ms)마다.
+// 연결 유지 신호일 뿐 마우스 명령이 아니므로 InputController.handle_event로
+// 넘기지 않는다. 서버는 항상 클라이언트 주도로만 반응한다(서버가 먼저 보내지 않음).
 {"type":"HEARTBEAT"}
+
+// heartbeat ack — ✅ 구현됨. 서버 → 클라이언트, HEARTBEAT 수신 즉시 응답.
+// 클라이언트는 내용을 파싱하지 않고 "아무 줄이나 수신"으로만 취급해 미응답
+// 카운터를 리셋한다 — 서버가 클라이언트에 보내는 유일한 하향 트래픽이므로
+// 사실상 이 ACK가 클라이언트 쪽 리셋의 유일한 수단이다(서버 쪽은 CLICK 등
+// 어떤 상향 데이터로도 리셋되어 비대칭).
+{"type":"HEARTBEAT_ACK"}
 ```
 
 **UDP 9001** — MOVE 전용. 패킷 하나 = 이벤트 하나, 개행 없음
@@ -139,6 +148,8 @@ MOVE_MIN_DISTANCE_PX   = 5f     // 커서 이동 최소 거리 (떨림 억제)
 DEFAULT_PORT           = 9000
 UDP_PORT               = 9001   // MOVE 전용 UDP 포트
 SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대 시간
+HEARTBEAT_INTERVAL_MS  = 5000L  // heartbeat 전송 주기 (서버 HEARTBEAT_INTERVAL_S=5.0과 반드시 동시 갱신)
+HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MISS_LIMIT=3과 반드시 동시 갱신)
 ```
 
 ---
@@ -156,18 +167,19 @@ SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대
 ### 🔶 Phase 2 — 하이브리드 통신 + 추가 제스처 (일부 완료)
 - [x] MOVE를 UDP(9001)로 분리, 세션 토큰 기반 매칭
 - [x] Python 서버에 UDP 소켓 추가 (TCP 세션과 매핑) — `SessionRegistry` (threading.Lock 보호)
-- [ ] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제) — **알려진 공백**: Android가 핸드셰이크 이후 TCP를 전혀 읽지 않아, 서버가 세션을 회수해도 앱은 `Connected` 상태로 남고 커서만 조용히 멈춘다. 이 항목 구현 시 반드시 `TcpClient`에 수신 루프 추가
+- [x] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제) — 카운터 기반, 양쪽 5초 창 × 3회로 판정. Android가 핸드셰이크 이후 TCP를 읽지 않던 공백이 해소되어, 서버가 세션을 회수하면 앱도 `Error`로 전환된다
 - [ ] 2손가락 탭 → 우클릭
 - [ ] 2손가락 드래그 → 스크롤
 - [ ] Android: `PointerInfo` 기반 멀티터치 제스처 감지
 
 **Phase 2 구현 시 핵심 파일:**
-- `data/network/TcpClient.kt` — 세션 핸드셰이크 완료. heartbeat 수신 루프는 아직 없음(추가 필요)
+- `data/network/TcpClient.kt` — 세션 핸드셰이크 + heartbeat 수신용 `readLine()`/`applyHeartbeatTimeout()` 완료
 - `data/network/UdpClient.kt` — 완료
 - `data/network/SessionHandshake.kt` — 완료 (세션 라인 파서)
-- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 완료
+- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조
+- `di/DispatcherModule.kt` — heartbeat 루프용 `@IoDispatcher` 제공(테스트에서 가상 시간 디스패처로 교체 가능)
 - `presentation/trackpad/TrackpadScreen.kt` — 멀티터치 제스처 감지 (미착수)
-- `pc_server/server.py` — UDP 소켓 + 세션 매핑 완료
+- `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료
 - `pc_server/input_controller.py` — sub-pixel 잔차 누적 없음(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장
 
 ### ⬜ Phase 3 — 제스처 확장
@@ -180,7 +192,7 @@ SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대
 ### ⬜ Phase 4 — 완성도
 - [ ] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료
 - [ ] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지)
-- [ ] 재연결 로직 (연결 끊김 감지 → 자동 재시도)
+- [ ] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — heartbeat가 만드는 `ConnectionState.Error("Heartbeat timeout")`/`Error("Connection lost")`를 재시도 트리거로 사용
 - [ ] 예외 처리 강화 (네트워크 오류, 권한 오류 등)
 - [ ] PyInstaller로 단일 exe 패키징
 
@@ -203,11 +215,11 @@ Android                                          PC Server
    |<-- {"type":"SESSION","session":"<32hex>"} ---   |   ✅ 구현됨 (연결 직후 첫 줄)
    |                                                 |
    |-- TCP: CLICK -------------------------------->  |   ✅ 구현됨
-   |-- TCP: SCROLL/HEARTBEAT --------------------->  |   (Phase 2 예정, 미구현)
+   |-- TCP: SCROLL -------------------------------->  |   (Phase 2 예정, 미구현)
    |-- UDP: {session, type:MOVE, dx, dy} --------->  |   ✅ 구현됨
    |                                                 |
-   |-- TCP: HEARTBEAT (5s) ----------------------->  |   (Phase 2 예정, 미구현)
-   |<-- TCP: HEARTBEAT_ACK ------------------------  |   (Phase 2 예정, 미구현)
+   |-- TCP: HEARTBEAT (첫 전송은 연결 후 5s) ----->  |   ✅ 구현됨 (이후 5초 주기)
+   |<-- TCP: HEARTBEAT_ACK ------------------------  |   ✅ 구현됨 (handle_event 미경유)
 ```
 
 ---
@@ -221,6 +233,8 @@ python server.py
 # → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) 포트에서 대기
 ```
 **Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다).
+
+**트러블슈팅:** 커서가 갑자기 멈추고 앱이 `Heartbeat timeout`/`Connection lost`를 띄우면 TCP 9000 경로(Wi-Fi 절전, 도즈 모드 등으로 heartbeat 전송이 지연되는 경우 포함)를 먼저 의심한다. TCP 세션이 회수되면 이미 전송 중이던 UDP MOVE도 서버가 조용히 무시하므로 함께 멈춘다.
 
 ### Android 앱
 1. Android Studio에서 `phone_pad_app/` 열기
@@ -241,6 +255,11 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
   채널 선택(이동 좌표면 UDP+session 필드 포함, 아니면 TCP) →
   `TrackpadRepositoryImpl.kt`의 `when` 직렬화 → `input_controller.py`의 `handle_event`
   (UDP로 보낼 경우 `pc_server/server.py`의 `handle_udp_packet`도 함께 확인)
+  - **예외:** 연결 유지/전송 계층 전용 메시지(예: `HEARTBEAT`/`HEARTBEAT_ACK`)는 sealed
+    class에 넣지 않고 data 계층(`TrackpadRepositoryImpl`) 내부 상수로만 만든다.
+    제스처가 아니므로 `SendEventUseCase`를 경유해 presentation이 임의로 발사할 수
+    있게 되는 것을 원치 않기 때문이다. 대신 와이어 리터럴을 고정하는 테스트를
+    반드시 둔다(예: `TrackpadRepositoryHeartbeatTest`의 리터럴 검증 테스트).
 - 제스처 판정 임계값은 반드시 `GestureConfig.kt` 상수로 분리
 - ViewModel에서 직접 네트워크 호출 금지 — UseCase 경유
 - 새 화면 추가 시 `presentation/<feature>/` 하위 패키지로 분리
@@ -262,3 +281,5 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | PIN 인증 | Phase 5 선택 사항 — UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않아 동일 WiFi 내 스푸핑이 가능함. PIN 인증 설계 시 함께 재검토 |
 | 다중 기기 연결 | 정책 미정 — 서버는 현재 활성 세션 전부를 동시에 처리 가능한 구조(집합 기반)라, 여러 기기가 동시에 연결하면 전부 커서를 움직일 수 있음 |
 | sub-pixel 이동 정밀도 | `InputController`가 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음 — 별도 이슈로 개선 검토 |
+| heartbeat 리셋 비대칭 | 서버는 CLICK 등 어떤 상향 데이터로도 미응답 카운터가 리셋되지만, 서버→클라이언트 하향 트래픽은 ACK뿐이라 Android 쪽은 사실상 ACK만이 유일한 리셋 수단. 한쪽 방향만 끊기는 비대칭 시나리오가 가능하므로 Phase 4 재연결 설계 시 전제로 고려 |
+| Android 절전/도즈 환경의 heartbeat | 화면 꺼짐·도즈·Wi-Fi 절전으로 5초 주기 전송이 지연되면 서버가 먼저 15초 타임아웃으로 끊는 오탐 가능성 — 실기기 미검증, Phase 4 재연결/wake lock 검토 시 함께 다룰 것 |
