@@ -11,3 +11,5 @@
 |------|----------|------|------|
 | 2026-09-17 | 초기 구성 (android-dev/server-dev/protocol-qa 3인 팀) | 전체 | Android↔서버 경계면 불일치를 초기에 잡기 위해 하네스 도입 |
 | 2026-09-17 | 하이브리드 실행 모드 도입 (단일 사이드는 서브 에이전트 1명, 교차 경계면만 3인 팀) | skills/phone-pad-orchestrator | 한쪽만 건드리는 작업에 매번 팀 오버헤드를 쓰는 게 낭비라는 피드백 |
+| 2026-09-17 | Phase 2B에서 `TeamCreate`/`TaskCreate` 사용 제거, "리더가 스펙 사전 확정 → 병렬 Agent 호출 → 사후 QA" 방식으로 교체 | skills/phone-pad-orchestrator | 첫 실전 실행(MOVE UDP 분리)에서 이 환경에 해당 도구가 없음을 확인 |
+| 2026-09-17 | MOVE 이벤트 UDP(9001) 분리 + TCP 세션 핸드셰이크 구현 (android-dev/server-dev 병렬 + protocol-qa 검증, F-2 재연결 토큰 누수 수정) | phone_pad_app, pc_server, AGENTS.md | AGENTS.md Phase 2 로드맵 항목 진행 |

@@ -28,7 +28,7 @@ phone_pad/
 │       │   ├── repository/    TrackpadRepository.kt (interface)
 │       │   └── usecase/       SendEventUseCase.kt
 │       ├── data/
-│       │   ├── network/       TcpClient.kt
+│       │   ├── network/       TcpClient.kt, UdpClient.kt, SessionHandshake.kt
 │       │   └── repository/    TrackpadRepositoryImpl.kt
 │       ├── di/                AppModule.kt
 │       └── presentation/
@@ -36,7 +36,8 @@ phone_pad/
 │           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt
 └── pc_server/                 ← Windows Python 서버
     ├── server.py
-    └── input_controller.py
+    ├── input_controller.py
+    └── tests/                 pytest 단위 테스트
 ```
 
 ---
@@ -71,40 +72,43 @@ phone_pad/
 - **MOVE 이벤트만 UDP**, 나머지(클릭·스크롤·드래그·heartbeat 등) **전부 TCP**
 - "이동 좌표인가?" 한 가지 기준으로 채널 결정. 애매하면 TCP.
 
-### 현재 구현 (Phase 1 — TCP 단일)
-포트: TCP **9000**
-형식: **newline-delimited JSON** (한 줄 = 한 이벤트, `\n` 종료)
+### 현재 구현 (Phase 2 — 하이브리드, MOVE UDP 분리 완료)
+
+**TCP 9000** — newline-delimited JSON (한 줄 = 한 이벤트, `\n` 종료)
+
+세션 핸드셰이크: 클라이언트가 TCP 연결하면 서버가 다른 어떤 이벤트보다도 먼저 세션 토큰 한 줄을 보낸다.
+```jsonc
+// 서버 → 클라이언트, 연결 직후 1회, 반드시 첫 줄
+{"type":"SESSION","session":"0123456789abcdef0123456789abcdef"}  // uuid4().hex, 32자리 hex
+```
+클라이언트는 이 줄을 받아야 `ConnectionState.Connected`로 전환한다 (`SESSION_HANDSHAKE_TIMEOUT_MS` 내 미수신 시 `Error`). TCP 연결이 끊기면 서버는 해당 세션을 즉시 회수한다.
 
 ```jsonc
-// 커서 이동
-{"type":"MOVE","dx":2.5,"dy":-1.0}
-
 // 좌클릭
 {"type":"CLICK","button":"left"}
 
-// 우클릭 (Phase 2)
+// 우클릭 (Phase 2, 미구현)
 {"type":"CLICK","button":"right"}
 
-// 더블클릭 (Phase 2)
+// 더블클릭 (Phase 2, 미구현)
 {"type":"DOUBLE_CLICK","button":"left"}
 
-// 스크롤 (Phase 2)
+// 스크롤 (Phase 2, 미구현)
 {"type":"SCROLL","dx":0,"dy":-3}
 
-// 드래그 (Phase 3)
+// 드래그 (Phase 3, 미구현)
 {"type":"DRAG_START"}
 {"type":"DRAG_END"}
 
-// heartbeat (Phase 2+)
+// heartbeat (Phase 2, 미구현 — TCP 수신 루프 자체가 아직 없음)
 {"type":"HEARTBEAT"}
 ```
 
-### Phase 2 이후 — 하이브리드
-- UDP 포트: **9001** (MOVE 전용, 세션 토큰 포함)
-  ```json
-  {"session":"abc123","type":"MOVE","dx":2.5,"dy":-1.0}
-  ```
-- TCP로 세션 토큰 발급 후 UDP 인증에 사용
+**UDP 9001** — MOVE 전용. 패킷 하나 = 이벤트 하나, 개행 없음
+```json
+{"session":"0123456789abcdef0123456789abcdef","type":"MOVE","dx":2.5,"dy":-1.0}
+```
+서버는 `session`이 TCP로 발급된 활성 목록에 없으면(문자열이 아니거나, 미등록이거나, 연결이 이미 끊겼으면) 조용히 무시한다 — 크래시하지 않는다.
 
 ---
 
@@ -133,6 +137,8 @@ TAP_MAX_DISTANCE_PX    = 20f    // 탭 판정 최대 이동 거리
 TAP_MAX_DURATION_MS    = 200L   // 탭 판정 최대 지속 시간
 MOVE_MIN_DISTANCE_PX   = 5f     // 커서 이동 최소 거리 (떨림 억제)
 DEFAULT_PORT           = 9000
+UDP_PORT               = 9001   // MOVE 전용 UDP 포트
+SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대 시간
 ```
 
 ---
@@ -147,20 +153,22 @@ DEFAULT_PORT           = 9000
 - [x] Python 서버: TCP 수신 + SendInput 커서/클릭 제어
 - [x] Android 연결 UI (IP 입력 → 연결 중 → 트랙패드 서페이스)
 
-### ⬜ Phase 2 — 하이브리드 통신 + 추가 제스처
-- [ ] MOVE를 UDP(9001)로 분리, 세션 토큰 기반 매칭
-- [ ] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제)
+### 🔶 Phase 2 — 하이브리드 통신 + 추가 제스처 (일부 완료)
+- [x] MOVE를 UDP(9001)로 분리, 세션 토큰 기반 매칭
+- [x] Python 서버에 UDP 소켓 추가 (TCP 세션과 매핑) — `SessionRegistry` (threading.Lock 보호)
+- [ ] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제) — **알려진 공백**: Android가 핸드셰이크 이후 TCP를 전혀 읽지 않아, 서버가 세션을 회수해도 앱은 `Connected` 상태로 남고 커서만 조용히 멈춘다. 이 항목 구현 시 반드시 `TcpClient`에 수신 루프 추가
 - [ ] 2손가락 탭 → 우클릭
 - [ ] 2손가락 드래그 → 스크롤
-- [ ] Python 서버에 UDP 소켓 추가 (TCP 세션과 매핑)
 - [ ] Android: `PointerInfo` 기반 멀티터치 제스처 감지
 
 **Phase 2 구현 시 핵심 파일:**
-- `data/network/TcpClient.kt` — heartbeat 추가
-- `data/network/UdpClient.kt` — 신규 생성
-- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기
-- `presentation/trackpad/TrackpadScreen.kt` — 멀티터치 제스처 감지
-- `pc_server/server.py` — UDP 소켓 + 세션 매핑 추가
+- `data/network/TcpClient.kt` — 세션 핸드셰이크 완료. heartbeat 수신 루프는 아직 없음(추가 필요)
+- `data/network/UdpClient.kt` — 완료
+- `data/network/SessionHandshake.kt` — 완료 (세션 라인 파서)
+- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 완료
+- `presentation/trackpad/TrackpadScreen.kt` — 멀티터치 제스처 감지 (미착수)
+- `pc_server/server.py` — UDP 소켓 + 세션 매핑 완료
+- `pc_server/input_controller.py` — sub-pixel 잔차 누적 없음(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장
 
 ### ⬜ Phase 3 — 제스처 확장
 - [ ] 1손가락 더블탭 → DOUBLE_CLICK (타이머 기반 판정)
@@ -183,22 +191,23 @@ DEFAULT_PORT           = 9000
 
 ---
 
-## 7. 세션 흐름 (Phase 2+ 설계)
+## 7. 세션 흐름
 
 ```
-Android                              PC Server
-   |                                     |
-   |-- UDP broadcast (탐색) ---------->  |
-   |<-- UDP response (IP:port) --------  |
-   |                                     |
-   |-- TCP connect ------------------>   |
-   |<-- {"session":"abc123"} ---------   |
-   |                                     |
-   |-- TCP: CLICK/SCROLL/HEARTBEAT -->   |
-   |-- UDP: {session, MOVE, dx, dy} -->  |
-   |                                     |
-   |-- TCP: HEARTBEAT (5s) ---------->   |
-   |<-- TCP: HEARTBEAT_ACK -----------   |
+Android                                          PC Server
+   |                                                 |
+   |-- UDP broadcast (탐색) --------------------->   |   (Phase 4 예정, 미구현 — 현재는 수동 IP 입력)
+   |<-- UDP response (IP:port) -------------------   |   (Phase 4 예정, 미구현)
+   |                                                 |
+   |-- TCP connect ------------------------------>   |
+   |<-- {"type":"SESSION","session":"<32hex>"} ---   |   ✅ 구현됨 (연결 직후 첫 줄)
+   |                                                 |
+   |-- TCP: CLICK -------------------------------->  |   ✅ 구현됨
+   |-- TCP: SCROLL/HEARTBEAT --------------------->  |   (Phase 2 예정, 미구현)
+   |-- UDP: {session, type:MOVE, dx, dy} --------->  |   ✅ 구현됨
+   |                                                 |
+   |-- TCP: HEARTBEAT (5s) ----------------------->  |   (Phase 2 예정, 미구현)
+   |<-- TCP: HEARTBEAT_ACK ------------------------  |   (Phase 2 예정, 미구현)
 ```
 
 ---
@@ -209,20 +218,29 @@ Android                              PC Server
 ```bash
 cd pc_server
 python server.py
-# → TCP 9000 포트에서 대기
+# → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) 포트에서 대기
 ```
+**Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다).
 
 ### Android 앱
 1. Android Studio에서 `phone_pad_app/` 열기
 2. 빌드 후 기기에 설치
-3. 앱 실행 → PC IP 입력 → 연결
+3. 앱 실행 → PC IP 입력 → 연결 (TCP 핸드셰이크로 세션 토큰을 받아야 Connected로 전환됨)
+
+### 테스트 실행
+```bash
+cd pc_server && python -m pytest         # 서버 단위 테스트
+cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스트
+```
 
 ---
 
 ## 9. 코딩 컨벤션
 
 - 새 이벤트 타입 추가 시: `TrackpadEvent.kt` sealed class 확장 →
+  채널 선택(이동 좌표면 UDP+session 필드 포함, 아니면 TCP) →
   `TrackpadRepositoryImpl.kt`의 `when` 직렬화 → `input_controller.py`의 `handle_event`
+  (UDP로 보낼 경우 `pc_server/server.py`의 `handle_udp_packet`도 함께 확인)
 - 제스처 판정 임계값은 반드시 `GestureConfig.kt` 상수로 분리
 - ViewModel에서 직접 네트워크 호출 금지 — UseCase 경유
 - 새 화면 추가 시 `presentation/<feature>/` 하위 패키지로 분리
@@ -241,5 +259,6 @@ python server.py
 | Android DI | Hilt 2.48 사용 중 (확정) |
 | 바이너리 프로토콜 전환 | Phase 2 성능 테스트 후 결정 |
 | PC 서버 배포 | PyInstaller — Phase 4에서 |
-| PIN 인증 | Phase 5 선택 사항 |
-| 다중 기기 연결 | 정책 미정 |
+| PIN 인증 | Phase 5 선택 사항 — UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않아 동일 WiFi 내 스푸핑이 가능함. PIN 인증 설계 시 함께 재검토 |
+| 다중 기기 연결 | 정책 미정 — 서버는 현재 활성 세션 전부를 동시에 처리 가능한 구조(집합 기반)라, 여러 기기가 동시에 연결하면 전부 커서를 움직일 수 있음 |
+| sub-pixel 이동 정밀도 | `InputController`가 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음 — 별도 이슈로 개선 검토 |

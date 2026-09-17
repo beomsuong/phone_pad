@@ -66,36 +66,20 @@ Phone Pad 기능 작업을 요청 범위에 따라 가벼운 경로(단일 에�
 3. **QA는 생략한다** — 이벤트 스펙이 바뀌지 않았으므로 검증할 경계면이 없다. 단, 에이전트의 산출물을 검토하는 과정에서 의도치 않게 이벤트 필드/타입을 건드린 것이 발견되면 즉시 Phase 2B(교차 경계면 경로)로 전환한다
 4. Phase 5로 진행
 
-### Phase 2B: 교차 경계면 경로 (에이전트 팀)
+### Phase 2B: 교차 경계면 경로 (병렬 서브 에이전트 + 사후 QA)
 
-**실행 모드:** 에이전트 팀 (android-dev + server-dev + protocol-qa)
+**실행 모드:** 에이전트 팀 — 단, 이 저장소/환경에는 `TeamCreate`/`TaskCreate` 도구가 없다(2026-09-17 실행에서 확인). `TeamCreate`를 시도하지 말고 아래 방식으로 동일한 의도(스펙 불일치 방지 + 즉시 경계면 검증)를 구현한다:
 
-1. 팀 생성:
-   ```
-   TeamCreate(
-     team_name: "phone-pad-team",
-     members: [
-       { name: "android-dev", agent_type: "android-dev", model: "opus", prompt: "<request.md 경로 + 담당 이벤트 타입>" },
-       { name: "server-dev", agent_type: "server-dev", model: "opus", prompt: "<request.md 경로 + 담당 이벤트 타입>" },
-       { name: "protocol-qa", agent_type: "protocol-qa", model: "opus", prompt: "<request.md 경로 + incremental QA 지시>" }
-     ]
-   )
-   ```
-2. 작업 등록:
-   ```
-   TaskCreate(tasks: [
-     { title: "Android: {이벤트} 감지·전송 구현", assignee: "android-dev" },
-     { title: "Android: {이벤트} 단위 테스트 작성", assignee: "android-dev", depends_on: ["Android: {이벤트} 감지·전송 구현"] },
-     { title: "Server: {이벤트} 처리 구현", assignee: "server-dev" },
-     { title: "Server: {이벤트} 단위 테스트 작성", assignee: "server-dev", depends_on: ["Server: {이벤트} 처리 구현"] },
-     { title: "QA: {이벤트} 경계면 정합성 검증", assignee: "protocol-qa", depends_on: ["Android: {이벤트} 감지·전송 구현", "Server: {이벤트} 처리 구현"] }
-   ])
-   ```
-3. **구현 (팀원 자체 조율):** android-dev/server-dev는 이벤트 JSON 스펙을 착수 전에 SendMessage로 합의하고, 완료 즉시 protocol-qa에게 알린다. protocol-qa는 양쪽을 기다리지 않고 먼저 끝난 쪽부터 문서(AGENTS.md) 대조를 시작한다. 불일치 발견 시 해당 에이전트에게 파일:라인 단위로 구체적 수정을 요청한다.
-4. **리더 모니터링:** 팀원 유휴 시 알림 수신, 막히면 SendMessage로 개입, `TaskGet`으로 진행률 확인
-5. **최종 검증:** 모든 작업 완료 후 protocol-qa의 최종 리포트 확인. 실패 항목은 최대 2회까지 재요청, 그래도 실패하면 사용자에게 보고 후 진행 여부 확인
-6. 팀원들에게 종료 알림 후 `TeamDelete`
-7. Phase 5로 진행
+1. **리더가 스펙을 먼저 확정한다.** android-dev/server-dev가 실시간으로 SendMessage 협상을 하는 대신, 리더가 `AGENTS.md`와 사용자 요청을 근거로 이벤트 JSON 필드명·타입·채널·(필요 시) 세션/핸드셰이크 형식을 정확히 정의해 `_workspace/00_input/request.md`에 적는다. 여기 적힌 스펙은 두 에이전트 모두에게 동일하게 전달되므로, 필드명이 갈라질 여지가 없다.
+2. **android-dev와 server-dev를 한 메시지에서 병렬로 호출한다** (`Agent` 도구, `subagent_type`: 각각 "android-dev"/"server-dev", `model: "opus"`). 프롬프트에 request.md 경로, 구현 범위, "스펙을 임의로 바꾸지 말 것"을 명시한다. 이 두 호출은 서로 독립적이므로 병렬 실행이 안전하다.
+3. 두 에이전트의 완료 알림(SubagentHandback)을 받으면, **protocol-qa를 호출**(`Agent` 도구, `subagent_type: "protocol-qa"`, `model: "opus"`)해 request.md + 양쪽 summary + 실제 코드를 "양쪽 동시 읽기"로 대조하게 한다. QA는 코드를 고치지 않고 리포트만 작성한다(`_workspace/*_protocol-qa_report.md`).
+4. **실패 항목 처리:** QA 리포트의 실패 항목 중,
+   - 수정 방법이 명확하고 규모가 작으면(수 줄 이내) 리더가 직접 `Edit`으로 고치고, 관련 테스트를 실행해 회귀가 없는지 확인한다(가능하면 QA가 제안한 회귀 테스트도 추가한다)
+   - 규모가 크거나 해당 에이전트의 전문성이 필요하면 `SendMessage`로 해당 에이전트(예: `to: "android-dev"`, 완료된 에이전트는 이름으로 재개 가능)에게 파일:라인 단위로 재작업을 요청한다. 최대 2회까지 재요청, 그래도 실패하면 사용자에게 보고 후 진행 여부 확인
+   - 문서(AGENTS.md) 불일치는 리더가 직접 갱신한다 (Phase 5에서 일괄 처리)
+5. Phase 5로 진행
+
+**참고:** `SendMessage`는 실제로 존재하며 완료된 서브 에이전트를 이름/agentId로 재개할 수 있다. 다만 이번 실행에서는 스펙을 사전 확정해 놓아 병렬 실행 중 실시간 협상이 필요 없었다 — 만약 스펙이 request.md만으로 명확히 정의되지 않는 애매한 작업이라면, 한쪽을 먼저 실행해 스펙을 확정한 뒤(예: android-dev가 실제 정의한 필드) 그 결과를 다른 쪽 프롬프트에 포함시켜 순차 실행하는 것을 고려한다.
 
 ### Phase 5: 정리 (공통)
 
@@ -112,8 +96,8 @@ Phone Pad 기능 작업을 요청 범위에 따라 가벼운 경로(단일 에�
               │
     ┌─────────┴─────────┐
     ↓ 단일 사이드         ↓ 교차 경계면
-[Agent(android-dev        [TeamCreate]
- 또는 server-dev)]         android-dev ←SendMessage(스펙 합의)→ server-dev
+[Agent(android-dev        [리더가 스펙 사전 확정: request.md]
+ 또는 server-dev)]         Agent(android-dev) ∥ Agent(server-dev)  (병렬 호출)
     │                            │                                │
     ↓ 반환값 + summary          ↓ 완료 알림                     ↓ 완료 알림
     │                       android summary                 server summary
