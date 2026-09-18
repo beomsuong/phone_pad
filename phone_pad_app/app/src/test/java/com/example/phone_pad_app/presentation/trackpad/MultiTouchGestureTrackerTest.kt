@@ -447,4 +447,41 @@ class MultiTouchGestureTrackerTest {
         tracker.onPointerEvent(one, 0f, 0f, 1_000L)
         assertEquals(left, tracker.onGestureEnd(1_000L + tapDurationMs).clickButton)
     }
+
+    // ---------------------------------------------------------------- 탭 위치 (더블탭 판정용)
+
+    @Test
+    fun `1손가락 탭은 구간 시작 좌표를 탭 위치로 돌려준다`() {
+        // DoubleTapDetector가 두 탭 사이 거리를 재려면 호출부가 좌표를 따로 들고 다니지 않아도
+        // 되도록 종료 판정이 위치를 함께 실어 줘야 한다.
+        tracker.onPointerEvent(one, 123f, 456f, 0L)
+
+        val end = tracker.onGestureEnd(tapDurationMs)
+        assertEquals(left, end.clickButton)
+        assertEquals(123f, end.x, 0.001f)
+        assertEquals(456f, end.y, 0.001f)
+    }
+
+    @Test
+    fun `탭 중 미세 떨림이 있어도 탭 위치는 구간 시작 좌표로 고정된다`() {
+        tracker.onPointerEvent(one, 100f, 100f, 0L)
+        tracker.onPointerEvent(one, 100f + jitterPx, 100f + jitterPx, tapDurationMs / 2)
+
+        val end = tracker.onGestureEnd(tapDurationMs)
+        assertEquals(left, end.clickButton)
+        assertEquals(100f, end.x, 0.001f)
+        assertEquals(100f, end.y, 0.001f)
+    }
+
+    @Test
+    fun `꼬리 보정된 2손가락 탭은 꼬리가 아니라 직전 구간의 좌표를 돌려준다`() {
+        // 판정 기준(직전 구간)과 좌표 기준이 어긋나면 안 된다.
+        tracker.onPointerEvent(2, 10f, 20f, 0L)
+        tracker.onPointerEvent(one, 900f, 900f, 10L)
+
+        val end = tracker.onGestureEnd(10L + releaseTailMs)
+        assertEquals(right, end.clickButton)
+        assertEquals("꼬리(900,900)가 아니라 2손가락 구간의 시작 좌표", 10f, end.x, 0.001f)
+        assertEquals(20f, end.y, 0.001f)
+    }
 }

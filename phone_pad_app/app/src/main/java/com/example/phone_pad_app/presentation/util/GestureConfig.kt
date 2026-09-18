@@ -54,6 +54,27 @@ object GestureConfig {
      */
     const val MULTI_TOUCH_RELEASE_GRACE_MS = 50L
 
+    /**
+     * 두 탭을 하나의 더블탭으로 묶을 최대 간격 (ms) — 첫 탭 종료 ~ 둘째 탭 종료.
+     *
+     * 이 값은 동시에 **모든 1손가락 탭(좌클릭)이 겪는 지연 시간**이기도 하다. 탭이 끝난 즉시
+     * CLICK을 보내버리면 뒤이어 오는 두 번째 탭과 병합할 기회가 사라지므로, 이 시간만큼
+     * 기다렸다가 두 번째 탭이 없을 때 비로소 CLICK을 보낸다 (`TrackpadScreen`의 지연 클릭 job).
+     * 더블클릭을 지원하는 구조에서 피할 수 없는 트레이드오프이며, 값을 키우면 더블탭 인식은
+     * 관대해지지만 단일 클릭 체감 지연이 그만큼 늘어난다. 실기기 미검증 — 조정 가능.
+     */
+    const val DOUBLE_TAP_INTERVAL_MS = 300L
+
+    /**
+     * 두 탭의 중심 좌표 사이 최대 허용 거리 (px).
+     *
+     * [TAP_MAX_DISTANCE_PX](20px)의 2배 — 사람이 같은 자리를 두 번 탭해도 몇 px씩 어긋나므로,
+     * "탭 하나로 인정되는 이동 거리"보다 넉넉하게 잡아야 두 번째 탭이 더블탭으로 묶인다.
+     * 이 좌표 판정은 폰 화면 좌표계에서만 이루어지며 PC 커서 위치와는 무관하다 —
+     * 서버는 커서를 전혀 움직이지 않고 DOUBLE_CLICK 하나만 처리한다 (AGENTS.md 섹션 4).
+     */
+    const val DOUBLE_TAP_DISTANCE_PX = 40f
+
     /** PC 서버 기본 포트 (TCP — CLICK/SCROLL/DRAG/HEARTBEAT 및 세션 핸드셰이크) */
     const val DEFAULT_PORT = 9000
 

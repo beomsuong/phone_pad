@@ -116,6 +116,18 @@ class TrackpadRepositoryImpl @Inject constructor(
                 }
             }
 
+            is TrackpadEvent.DoubleClick -> {
+                // 이동 좌표가 아니므로 TCP (session 필드 없음, AGENTS.md 섹션 4).
+                // CLICK과 같은 등급의 저빈도 · 사용자 명시 행동이라 전송 실패를 조용히 버리지
+                // 않고 Error로 알린다 — MOVE/SCROLL처럼 초당 수십 번 나가는 이벤트가 아니어서
+                // watchdog이 세팅한 원인 메시지를 덮어쓸 위험이 사실상 없다.
+                try {
+                    tcpClient.send("""{"type":"DOUBLE_CLICK","button":"${event.button}"}""")
+                } catch (e: Exception) {
+                    _connectionState.value = ConnectionState.Error(e.message ?: "Send failed")
+                }
+            }
+
             is TrackpadEvent.Scroll -> {
                 // 이동 좌표가 아니므로 TCP. dx/dy는 이미 정수 스텝이라 CLICK과 같은 평문 이벤트로
                 // 보낸다 (session 필드 없음, AGENTS.md 섹션 4).

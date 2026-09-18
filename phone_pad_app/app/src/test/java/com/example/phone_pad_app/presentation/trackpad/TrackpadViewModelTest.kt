@@ -71,6 +71,30 @@ class TrackpadViewModelTest {
     }
 
     @Test
+    fun `sendDoubleClick은 button이 left인 DOUBLE_CLICK 이벤트를 보낸다`() {
+        viewModel.sendDoubleClick()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DoubleClick(button = "left")) }
+    }
+
+    @Test
+    fun `sendDoubleClick은 CLICK 이벤트를 보내지 않는다`() {
+        // 더블탭은 CLICK 두 개가 아니라 DOUBLE_CLICK 하나로 번역된다 (확정 스펙)
+        viewModel.sendDoubleClick()
+
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Click::class)) }
+    }
+
+    @Test
+    fun `sendClick과 sendDoubleClick은 서로 다른 이벤트 타입으로 구분된다`() {
+        viewModel.sendClick()
+        viewModel.sendDoubleClick()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Click(button = "left")) }
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DoubleClick(button = "left")) }
+    }
+
+    @Test
     fun `sendMove는 MOVE 이벤트를 보낸다 - 클릭 경로와 섞이지 않는다`() {
         viewModel.sendMove(1.5f, -2f)
 

@@ -67,6 +67,35 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `더블탭 상수는 확정 스펙 값과 일치한다`() {
+        assertEquals(300L, GestureConfig.DOUBLE_TAP_INTERVAL_MS)
+        assertEquals(40f, GestureConfig.DOUBLE_TAP_DISTANCE_PX, 0.001f)
+    }
+
+    @Test
+    fun `더블탭 허용 거리는 탭 최대 이동 거리보다 크다`() {
+        // 사람이 같은 자리를 두 번 탭해도 몇 px씩 어긋난다. "탭 하나로 인정되는 이동 거리"보다
+        // 넉넉해야 두 번째 탭이 더블탭으로 묶인다 (확정 스펙: TAP_MAX_DISTANCE_PX의 2배).
+        assertTrue(
+            GestureConfig.DOUBLE_TAP_DISTANCE_PX > GestureConfig.TAP_MAX_DISTANCE_PX
+        )
+        assertEquals(
+            GestureConfig.TAP_MAX_DISTANCE_PX * 2f,
+            GestureConfig.DOUBLE_TAP_DISTANCE_PX,
+            0.001f,
+        )
+    }
+
+    @Test
+    fun `더블탭 간격은 탭 최대 지속 시간보다 길다`() {
+        // 두 번째 탭은 "탭으로 끝난 뒤"에야 판정에 들어온다. 간격이 탭 지속 시간보다 짧으면
+        // 정상 속도로 두 번 탭해도 두 번째 탭이 시작되기 전에 지연 클릭이 먼저 나가버린다.
+        assertTrue(
+            GestureConfig.DOUBLE_TAP_INTERVAL_MS > GestureConfig.TAP_MAX_DURATION_MS
+        )
+    }
+
+    @Test
     fun `멀티터치 해제 유예는 탭 최대 지속 시간의 절반보다 짧다`() {
         // 이 여유가 없으면 "손가락 하나를 떼고 남은 손가락으로 탭"하는 동작까지
         // 2손가락 탭으로 삼켜버린다 (MultiTouchGestureTracker의 꼬리 보정 전제 조건)

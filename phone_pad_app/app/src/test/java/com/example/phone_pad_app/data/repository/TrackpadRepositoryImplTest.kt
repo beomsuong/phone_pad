@@ -99,6 +99,53 @@ class TrackpadRepositoryImplTest {
     }
 
     @Test
+    fun `DoubleClick 이벤트는 TCP로 전송되고 session 필드를 포함하지 않는다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DoubleClick("left"))
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        // AGENTS.md 섹션 4의 와이어 포맷을 리터럴로 고정한다 (서버 handle_event와의 계약)
+        assertEquals("""{"type":"DOUBLE_CLICK","button":"left"}""", json.captured)
+        // 이동 좌표가 아니므로 UDP로 새면 안 된다
+        coVerify(exactly = 0) { udpClient.send(any()) }
+    }
+
+    @Test
+    fun `DoubleClick 기본 button은 left다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DoubleClick())
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        assertEquals("""{"type":"DOUBLE_CLICK","button":"left"}""", json.captured)
+    }
+
+    @Test
+    fun `DoubleClick은 CLICK 두 개로 쪼개지지 않는다`() = runTest {
+        // 이번 스펙의 핵심: 개별 CLICK 두 개가 아니라 DOUBLE_CLICK 한 줄만 나가야 한다.
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DoubleClick())
+
+        coVerify(exactly = 1) { tcpClient.send(any()) }
+        coVerify(exactly = 0) { tcpClient.send(match { it.contains(""""type":"CLICK"""") }) }
+    }
+
+    @Test
+    fun `DoubleClick 전송 실패는 CLICK과 같이 Error로 알린다`() = runTest {
+        // MOVE/SCROLL과 달리 저빈도 · 사용자 명시 행동이므로 조용히 버리지 않는다.
+        connectSuccessfully()
+        coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
+
+        repository.sendEvent(TrackpadEvent.DoubleClick())
+
+        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+    }
+
+    @Test
     fun `Scroll 이벤트는 정수 스텝을 담아 TCP로 전송된다`() = runTest {
         connectSuccessfully()
 

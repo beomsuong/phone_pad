@@ -40,10 +40,15 @@ data class GestureDecision(
  *        ([MultiTouchGestureTracker.BUTTON_LEFT] / [MultiTouchGestureTracker.BUTTON_RIGHT]),
  *        탭이 아니면 null. 값은 `{"type":"CLICK","button":...}`의 `button` 필드와 같은 어휘다.
  * @param pointerCount 마지막 구간의 손가락 개수.
+ * @param x 탭으로 판정된 위치의 X (판정 근거가 된 구간의 시작 좌표). 더블탭 판정([DoubleTapDetector])이
+ *        두 탭 사이 거리를 재는 데 쓴다. [clickButton]이 null이면 의미 없는 값이다.
+ * @param y 탭으로 판정된 위치의 Y.
  */
 data class GestureEndDecision(
     val clickButton: String? = null,
     val pointerCount: Int = 0,
+    val x: Float = 0f,
+    val y: Float = 0f,
 )
 
 /**
@@ -107,6 +112,8 @@ class MultiTouchGestureTracker {
     private var prevPointerCount = 0
     private var prevStartTimeMs = 0L
     private var prevIsDrag = false
+    private var prevStartX = 0f
+    private var prevStartY = 0f
 
     /**
      * 포인터 이벤트 한 건을 처리한다.
@@ -200,26 +207,36 @@ class MultiTouchGestureTracker {
      */
     fun onGestureEnd(timestampMs: Long): GestureEndDecision {
         val lastPointerCount = if (hasSegment) segmentPointerCount else 0
-        val clickButton = resolveClickButton(timestampMs, lastPointerCount)
+        val tap = resolveTap(timestampMs, lastPointerCount)
 
         reset()
-        return GestureEndDecision(clickButton = clickButton, pointerCount = lastPointerCount)
+        return GestureEndDecision(
+            clickButton = tap.button,
+            pointerCount = lastPointerCount,
+            x = tap.x,
+            y = tap.y,
+        )
     }
 
+    /** [resolveTap]의 결과 — 버튼과, 그 판정 근거가 된 구간의 시작 좌표. */
+    private data class TapResolution(val button: String?, val x: Float, val y: Float)
+
     /**
-     * 종료 시각 기준으로 어떤 버튼의 탭이었는지 판정한다. 탭이 아니면 null.
+     * 종료 시각 기준으로 어떤 버튼의 탭이었는지, 그리고 그 탭의 위치가 어디인지 판정한다.
+     * 탭이 아니면 [TapResolution.button]이 null.
      *
      * 마지막 구간이 "손가락을 어긋나게 뗀 꼬리"(개수 감소로 시작 + 이동 없음 + 유예 시간 내 종료)면
-     * 그 꼬리를 버리고 직전 구간(더 많은 손가락)을 제스처의 실체로 보고 판정한다.
+     * 그 꼬리를 버리고 직전 구간(더 많은 손가락)을 제스처의 실체로 보고 판정한다 — 좌표도
+     * 같은 기준을 따라 그 구간의 시작 좌표를 쓴다.
      */
-    private fun resolveClickButton(timestampMs: Long, lastPointerCount: Int): String? {
-        if (!hasSegment) return null
+    private fun resolveTap(timestampMs: Long, lastPointerCount: Int): TapResolution {
+        if (!hasSegment) return TapResolution(null, 0f, 0f)
 
         // F-2: 직전 구간이 이미 드래그/스크롤이었다면, 손가락을 마저 떼는 짧은 꼬리는
         // 새 탭으로 재해석하지 않는다 — 유예 시간 안에 끝났는지와 무관하게 무조건 무시.
         // 이게 없으면 2손가락 스크롤 직후 손가락을 어긋나게 떼기만 해도(50~200ms 사이)
         // 좌클릭이 튀어나온다("스크롤하고 손 뗐을 뿐인데 링크가 클릭됨").
-        if (hasPrevSegment && prevIsDrag) return null
+        if (hasPrevSegment && prevIsDrag) return TapResolution(null, segmentStartX, segmentStartY)
 
         val elapsed = timestampMs - segmentStartTimeMs
         val isReleaseTail = hasPrevSegment &&
@@ -228,13 +245,25 @@ class MultiTouchGestureTracker {
             elapsed < GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS
 
         return if (isReleaseTail) {
-            buttonForTap(
-                pointerCount = prevPointerCount,
-                drag = prevIsDrag,
-                elapsed = timestampMs - prevStartTimeMs,
+            TapResolution(
+                button = buttonForTap(
+                    pointerCount = prevPointerCount,
+                    drag = prevIsDrag,
+                    elapsed = timestampMs - prevStartTimeMs,
+                ),
+                x = prevStartX,
+                y = prevStartY,
             )
         } else {
-            buttonForTap(pointerCount = lastPointerCount, drag = isDrag, elapsed = elapsed)
+            TapResolution(
+                button = buttonForTap(
+                    pointerCount = lastPointerCount,
+                    drag = isDrag,
+                    elapsed = elapsed,
+                ),
+                x = segmentStartX,
+                y = segmentStartY,
+            )
         }
     }
 
@@ -264,6 +293,8 @@ class MultiTouchGestureTracker {
         prevPointerCount = 0
         prevStartTimeMs = 0L
         prevIsDrag = false
+        prevStartX = 0f
+        prevStartY = 0f
     }
 
     private fun startSegment(pointerCount: Int, x: Float, y: Float, timestampMs: Long) {
@@ -272,6 +303,8 @@ class MultiTouchGestureTracker {
             prevPointerCount = segmentPointerCount
             prevStartTimeMs = segmentStartTimeMs
             prevIsDrag = isDrag
+            prevStartX = segmentStartX
+            prevStartY = segmentStartY
         }
         hasSegment = true
         segmentPointerCount = pointerCount

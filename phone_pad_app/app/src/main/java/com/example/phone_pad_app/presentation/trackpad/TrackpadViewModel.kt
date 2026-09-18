@@ -64,6 +64,22 @@ class TrackpadViewModel @Inject constructor(
     }
 
     /**
+     * 1손가락 더블탭 → 더블클릭. `{"type":"DOUBLE_CLICK","button":"left"}` (TCP)
+     *
+     * 개별 CLICK 두 개가 아니라 이 이벤트 하나만 보낸다 — 두 탭의 병합 판정은
+     * [DoubleTapDetector]가, 지연 전송은 `TrackpadScreen`이 이미 끝낸 상태로 들어온다.
+     */
+    fun sendDoubleClick() {
+        viewModelScope.launch {
+            runCatching {
+                sendEventUseCase(
+                    TrackpadEvent.DoubleClick(MultiTouchGestureTracker.BUTTON_LEFT)
+                )
+            }
+        }
+    }
+
+    /**
      * 2손가락 드래그 → 휠 스크롤. `{"type":"SCROLL","dx":0,"dy":-3}` (TCP)
      *
      * [dx]/[dy]는 픽셀이 아니라 정수 스텝(휠 노치)이다 — px→스텝 변환과 잔차 누적은
