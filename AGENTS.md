@@ -268,6 +268,13 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
   - Android: `usecase`/`repository` 등 도메인 로직은 JUnit + MockK 단위 테스트, 제스처 판정 로직(`GestureConfig` 기준값)은 별도 테스트로 검증
   - Python 서버: `input_controller.py`의 `handle_event` 등 이벤트 처리 로직은 `unittest`/`pytest`로 단위 테스트 작성
   - 테스트 없는 PR/커밋은 지양 — 최소한 핵심 로직(제스처 판정, 이벤트 직렬화/처리)은 커버
+- **커밋은 파트별로 나눈다** — Android/서버 양쪽에 걸친 작업이라도 한 커밋에 몰아넣지 않고, 다음 기준으로 분리한다:
+  1. `feat(android): ...` — `phone_pad_app/` 변경 (앱 코드 + 테스트)
+  2. `feat(server): ...` — `pc_server/` 변경 (서버 코드 + 테스트)
+  3. `docs(harness): ...` — `AGENTS.md`/`CLAUDE.md`/`.claude/` 갱신 + `_workspace/` 실행 기록
+  - 커밋 메시지는 `type(scope): subject` 형식(스코프를 괄호 안에 표기)을 따르고, `type`은 `feat`/`fix`/`refactor`/`docs` 등 일반적인 컨벤션을 사용한다
+  - 세 파트 중 실제로 변경이 없는 파트는 커밋을 만들지 않는다 (예: 문서만 고쳤으면 `docs(harness):` 하나만)
+  - `phone-pad-orchestrator` 스킬로 진행한 작업을 커밋할 때는 항상 이 방식을 기본으로 따른다 (사용자가 다르게 요청하면 그에 따른다)
 
 ---
 
