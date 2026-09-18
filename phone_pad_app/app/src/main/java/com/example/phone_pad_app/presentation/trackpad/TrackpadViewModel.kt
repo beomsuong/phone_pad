@@ -63,6 +63,18 @@ class TrackpadViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 2손가락 드래그 → 휠 스크롤. `{"type":"SCROLL","dx":0,"dy":-3}` (TCP)
+     *
+     * [dx]/[dy]는 픽셀이 아니라 정수 스텝(휠 노치)이다 — px→스텝 변환과 잔차 누적은
+     * [MultiTouchGestureTracker]가 끝낸 뒤라 여기서는 그대로 전달만 한다.
+     */
+    fun sendScroll(dx: Int, dy: Int) {
+        viewModelScope.launch {
+            runCatching { sendEventUseCase(TrackpadEvent.Scroll(dx, dy)) }
+        }
+    }
+
     /** 2손가락 탭 → 우클릭. `{"type":"CLICK","button":"right"}` (TCP) */
     fun sendRightClick() {
         viewModelScope.launch {

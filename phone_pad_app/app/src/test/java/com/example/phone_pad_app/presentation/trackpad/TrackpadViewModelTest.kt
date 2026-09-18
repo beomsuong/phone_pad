@@ -79,6 +79,24 @@ class TrackpadViewModelTest {
     }
 
     @Test
+    fun `sendScroll은 정수 스텝 그대로 SCROLL 이벤트를 보낸다`() {
+        viewModel.sendScroll(0, -3)
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Scroll(dx = 0, dy = -3)) }
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Click::class)) }
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Move::class)) }
+    }
+
+    @Test
+    fun `트래커의 ScrollDelta가 그대로 도메인 이벤트 필드로 옮겨진다`() {
+        // MultiTouchGestureTracker → TrackpadScreen → ViewModel 사이에서 축이 뒤바뀌지 않는지 고정
+        val delta = ScrollDelta(dx = 2, dy = -5)
+        viewModel.sendScroll(delta.dx, delta.dy)
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Scroll(dx = 2, dy = -5)) }
+    }
+
+    @Test
     fun `제스처 판정기가 돌려주는 버튼 문자열과 도메인 이벤트의 button 값이 같다`() {
         // MultiTouchGestureTracker의 판정 결과 → TrackpadScreen 분기 → ViewModel 전송까지
         // 같은 어휘를 쓰는지 고정한다 (AGENTS.md 섹션 4)

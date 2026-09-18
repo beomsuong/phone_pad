@@ -99,6 +99,33 @@ class TrackpadRepositoryImplTest {
     }
 
     @Test
+    fun `Scroll 이벤트는 정수 스텝을 담아 TCP로 전송된다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.Scroll(dx = 0, dy = -3))
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        // AGENTS.md 섹션 4의 와이어 포맷을 리터럴로 고정한다 (서버 handle_event와의 계약)
+        assertEquals("""{"type":"SCROLL","dx":0,"dy":-3}""", json.captured)
+        // SCROLL은 이동 좌표가 아니므로 UDP로 새면 안 된다
+        coVerify(exactly = 0) { udpClient.send(any()) }
+    }
+
+    @Test
+    fun `Scroll JSON은 session 필드를 포함하지 않고 소수점도 붙지 않는다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.Scroll(dx = 2, dy = 5))
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        assertFalse("CLICK과 같은 TCP 평문 이벤트다", json.captured.contains("session"))
+        assertFalse("dx/dy는 정수 스텝이다", json.captured.contains("."))
+        assertEquals("""{"type":"SCROLL","dx":2,"dy":5}""", json.captured)
+    }
+
+    @Test
     fun `핸드셰이크가 오지 않으면 Error로 전환하고 UDP를 준비하지 않는다`() = runTest {
         coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns null
 
@@ -188,6 +215,18 @@ class TrackpadRepositoryImplTest {
         coEvery { udpClient.send(any()) } throws java.io.IOException("udp down")
 
         repository.sendEvent(TrackpadEvent.Move(1f, 1f))
+
+        assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
+    }
+
+    @Test
+    fun `SCROLL 전송 실패는 연결 상태를 덮어쓰지 않는다`() = runTest {
+        // F-1(스크롤 QA): SCROLL도 MOVE처럼 드래그 중 연속으로 나가는 고빈도 이벤트라,
+        // 실패해도 heartbeat watchdog이 이미 세팅한 Error 메시지를 덮어쓰면 안 된다.
+        connectSuccessfully()
+        coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
+
+        repository.sendEvent(TrackpadEvent.Scroll(dx = 1, dy = 1))
 
         assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
     }

@@ -115,6 +115,17 @@ class TrackpadRepositoryImpl @Inject constructor(
                     _connectionState.value = ConnectionState.Error(e.message ?: "Send failed")
                 }
             }
+
+            is TrackpadEvent.Scroll -> {
+                // 이동 좌표가 아니므로 TCP. dx/dy는 이미 정수 스텝이라 CLICK과 같은 평문 이벤트로
+                // 보낸다 (session 필드 없음, AGENTS.md 섹션 4).
+                // MOVE와 마찬가지로 고빈도 이벤트라 실패해도 연결 상태를 덮어쓰지 않는다(F-1) —
+                // 드래그 도중 큐에 남은 SCROLL 전송 실패가 heartbeat watchdog이 이미 세팅한
+                // "Heartbeat timeout" 같은 원인 메시지를 지워버리는 것을 막는다.
+                runCatching {
+                    tcpClient.send("""{"type":"SCROLL","dx":${event.dx},"dy":${event.dy}}""")
+                }
+            }
         }
     }
 

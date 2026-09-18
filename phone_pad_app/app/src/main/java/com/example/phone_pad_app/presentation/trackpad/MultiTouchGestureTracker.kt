@@ -7,14 +7,28 @@ import kotlin.math.hypot
 data class MoveDelta(val dx: Float, val dy: Float)
 
 /**
+ * 트래커가 방출하기로 결정한 휠 스크롤 델타.
+ *
+ * 단위는 픽셀이 아니라 **정수 스텝(휠 노치 개수)** — `{"type":"SCROLL","dx":0,"dy":-3}`의
+ * `dx`/`dy`와 같은 값이다 (AGENTS.md 섹션 4). 둘 다 0인 [ScrollDelta]는 만들지 않는다
+ * (서버가 불필요한 SendInput을 호출하지 않도록).
+ *
+ * 부호: [dy] 양수 = 손가락이 아래로, [dx] 양수 = 손가락이 오른쪽으로 이동.
+ */
+data class ScrollDelta(val dx: Int, val dy: Int)
+
+/**
  * 포인터 이벤트 한 건에 대한 판정 결과.
  *
  * @param move null이 아니면 그대로 `onMove(dx, dy)`를 호출하고 포인터 변화를 consume 한다.
+ * @param scroll null이 아니면 그대로 `onScroll(dx, dy)`를 호출한다. [move]와 동시에 non-null이 되는
+ *        일은 없다 — MOVE는 1손가락 구간, SCROLL은 2손가락 구간 전용이기 때문이다.
  * @param segmentStarted 이 이벤트에서 새 구간이 시작됐는지 (최초 down 또는 손가락 개수 변화에 의한 재시작).
  * @param pointerCount 이 이벤트 시점에 눌려 있던 포인터 개수.
  */
 data class GestureDecision(
     val move: MoveDelta? = null,
+    val scroll: ScrollDelta? = null,
     val segmentStarted: Boolean = false,
     val pointerCount: Int = 0,
 )
@@ -42,7 +56,9 @@ data class GestureEndDecision(
  *
  * 판정 규칙 (AGENTS.md 섹션 5):
  * - 손가락 개수가 바뀌면 진행 중이던 구간을 취소하고 그 시점 좌표/시각으로 새 구간을 시작한다.
- * - MOVE는 1손가락 구간에서만 방출한다. 2손가락 이상 구간은 내부 추적만 한다 (스크롤 연결은 후속 작업).
+ * - MOVE는 1손가락 구간에서만 방출한다.
+ * - SCROLL은 2손가락 구간에서, 그 구간이 `isDrag`(누적 이동이 [GestureConfig.TAP_MAX_DISTANCE_PX] 초과)가
+ *   된 이후에만 방출한다. 3손가락 이상 구간은 여전히 추적만 한다.
  * - 제스처 종료 시 탭 분류는 마지막 구간의 손가락 개수를 기준으로 한다:
  *   1손가락 탭 → 좌클릭, 2손가락 탭 → 우클릭, 그 외 → 클릭 없음.
  * - 단, 마지막 구간이 **포인터 개수 감소**로 시작됐고 [GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS]
@@ -66,8 +82,19 @@ class MultiTouchGestureTracker {
     private var lastX = 0f
     private var lastY = 0f
 
-    /** 현재 구간에서 탭 최대 이동 거리를 넘겼는지. */
+    /** 현재 구간에서 탭 최대 이동 거리를 넘겼는지. 2손가락 구간에서는 스크롤 시작 조건이기도 하다. */
     private var isDrag = false
+
+    /**
+     * 아직 정수 스텝으로 방출되지 못한 스크롤 잔차 (스텝 단위, |값| < 1).
+     *
+     * 픽셀→스텝 변환에서 남는 소수부를 버리지 않고 **구간이 끝날 때까지** 들고 있다가 다음 프레임에
+     * 더한다. 이게 없으면 손가락을 천천히 움직일 때(프레임당 이동 < 1스텝) 모든 프레임이 0스텝으로
+     * 잘려나가 스크롤이 아예 먹지 않는다. 구간이 새로 시작되면 0으로 리셋한다 — 다른 손가락 개수의
+     * 이전 제스처에서 남은 잔차가 새 스크롤의 첫 스텝을 앞당기면 안 되기 때문이다.
+     */
+    private var scrollRemainderX = 0f
+    private var scrollRemainderY = 0f
 
     /** 아직 한 번도 구간이 시작되지 않았으면 false. */
     private var hasSegment = false
@@ -105,6 +132,7 @@ class MultiTouchGestureTracker {
             startSegment(pointerCount, x, y, timestampMs)
             return GestureDecision(
                 move = null,
+                scroll = null,
                 segmentStarted = true,
                 pointerCount = pointerCount,
             )
@@ -137,7 +165,32 @@ class MultiTouchGestureTracker {
             null
         }
 
-        return GestureDecision(move = move, pointerCount = pointerCount)
+        // 2손가락 구간이 드래그로 확정된 뒤부터 centroid 이동을 휠 스텝으로 방출한다.
+        // isDrag를 기준으로 삼으므로 2손가락 탭(우클릭, isDrag=false로 끝남)과 상호 배타적이다.
+        val scroll = if (pointerCount == GestureConfig.DOUBLE_POINTER_COUNT && isDrag) {
+            accumulateScroll(dx, dy)
+        } else {
+            null
+        }
+
+        return GestureDecision(move = move, scroll = scroll, pointerCount = pointerCount)
+    }
+
+    /**
+     * 픽셀 델타를 정수 스텝으로 바꾸고, 소수부 잔차는 구간 상태에 남겨 다음 프레임으로 넘긴다.
+     * 방출할 스텝이 하나도 없으면 null을 돌려준다.
+     */
+    private fun accumulateScroll(dx: Float, dy: Float): ScrollDelta? {
+        scrollRemainderX += dx / GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP
+        scrollRemainderY += dy / GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP
+
+        // toInt()는 0 방향으로 버리므로 음수 잔차도 대칭으로 처리된다 (-1.7 → -1, 잔차 -0.7).
+        val stepsX = scrollRemainderX.toInt()
+        val stepsY = scrollRemainderY.toInt()
+        scrollRemainderX -= stepsX
+        scrollRemainderY -= stepsY
+
+        return if (stepsX == 0 && stepsY == 0) null else ScrollDelta(dx = stepsX, dy = stepsY)
     }
 
     /**
@@ -161,6 +214,12 @@ class MultiTouchGestureTracker {
      */
     private fun resolveClickButton(timestampMs: Long, lastPointerCount: Int): String? {
         if (!hasSegment) return null
+
+        // F-2: 직전 구간이 이미 드래그/스크롤이었다면, 손가락을 마저 떼는 짧은 꼬리는
+        // 새 탭으로 재해석하지 않는다 — 유예 시간 안에 끝났는지와 무관하게 무조건 무시.
+        // 이게 없으면 2손가락 스크롤 직후 손가락을 어긋나게 떼기만 해도(50~200ms 사이)
+        // 좌클릭이 튀어나온다("스크롤하고 손 뗐을 뿐인데 링크가 클릭됨").
+        if (hasPrevSegment && prevIsDrag) return null
 
         val elapsed = timestampMs - segmentStartTimeMs
         val isReleaseTail = hasPrevSegment &&
@@ -199,6 +258,8 @@ class MultiTouchGestureTracker {
         lastX = 0f
         lastY = 0f
         isDrag = false
+        scrollRemainderX = 0f
+        scrollRemainderY = 0f
         hasPrevSegment = false
         prevPointerCount = 0
         prevStartTimeMs = 0L
@@ -220,6 +281,8 @@ class MultiTouchGestureTracker {
         lastX = x
         lastY = y
         isDrag = false
+        scrollRemainderX = 0f
+        scrollRemainderY = 0f
     }
 
     companion object {

@@ -104,23 +104,26 @@ class MultiTouchGestureTrackerTest {
     }
 
     @Test
-    fun `2에서 1손가락으로 바뀌면 그 시점부터 새 1손가락 구간이 시작되어 탭으로 판정된다`() {
+    fun `2손가락 드래그 후 1손가락으로 바뀌어도 구간은 새로 시작되지만 클릭은 나지 않는다`() {
+        // F-2 이후 동작: 손가락 개수가 바뀌면 구간 자체는 여전히 새로 시작되지만(회귀 확인 대상),
+        // 직전 2손가락 구간이 드래그(스크롤)였다면 이후 1손가락 꼬리가 아무리 조용히 오래
+        // 이어지다 끝나도 클릭으로 승격되지 않는다 — 스크롤 뒤에 예기치 않은 클릭이 나가는
+        // 사고를 막기 위함(F-2). "손가락을 하나 떼고 그 손가락으로 새로 탭"하는 의도는
+        // 터치 데이터만으로는 "드래그의 잔여 접촉"과 구분할 수 없으므로 보수적으로 막는다.
         val liftTimeMs = GestureConfig.TAP_MAX_DURATION_MS * 5
 
         tracker.onPointerEvent(2, 0f, 0f, 0L)
         tracker.onPointerEvent(2, dragPx, dragPx, liftTimeMs / 2)
 
-        // 손가락 하나가 먼저 떨어짐 → 남은 손가락 좌표/시각으로 새 구간 시작
+        // 손가락 하나가 먼저 떨어짐 → 남은 손가락 좌표/시각으로 새 구간 시작 (구간 재시작 자체는 유지)
         val restart = tracker.onPointerEvent(one, 300f, 300f, liftTimeMs)
         assertTrue(restart.segmentStarted)
         assertNull(restart.move)
 
         assertNull(tracker.onPointerEvent(one, 300f + jitterPx, 300f, liftTimeMs + 10).move)
 
-        // 제스처 전체 길이는 탭 한계를 한참 넘지만, 마지막 1손가락 구간 기준이므로 탭이다.
-        // 꼬리 유예(MULTI_TOUCH_RELEASE_GRACE_MS)보다 훨씬 오래 이어졌으므로 우클릭으로 승격되지 않는다.
         val end = tracker.onGestureEnd(liftTimeMs + tapDurationMs)
-        assertEquals("마지막 1손가락 구간 기준으로 좌클릭 판정되어야 한다", left, end.clickButton)
+        assertNull("직전 구간이 드래그였으므로 클릭이 나가면 안 된다", end.clickButton)
         assertEquals(one, end.pointerCount)
     }
 
@@ -220,11 +223,177 @@ class MultiTouchGestureTrackerTest {
     }
 
     @Test
+    fun `F-2 회귀 - 2손가락 스크롤 직후 유예 시간을 넘겨 손을 떼도 좌클릭이 튀지 않는다`() {
+        // 실제 버그 재현 조건: 1손가락 꼬리가 "유예 시간보다 길게" 이어진 경우.
+        // 이 경우 isReleaseTail 분기 자체를 안 타므로, prevIsDrag를 별도로 확인하지 않으면
+        // 꼬리 구간(1손가락, 정지)만 보고 좌클릭으로 오판한다 — 스크롤 직후 손을 뗐을 뿐인데
+        // 화면의 링크가 눌리는 실사용 버그였다.
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        tracker.onPointerEvent(2, dragPx, dragPx, 20L) // 2손가락 스크롤
+
+        val tail = tracker.onPointerEvent(one, 500f, 500f, 40L)
+        assertTrue(tail.segmentStarted)
+
+        // 유예 시간을 넘겨서 끝난다 — 예전 코드라면 isReleaseTail=false가 되어
+        // "손가락 하나 떼고 남은 손가락으로 탭"한 것으로 오판하고 좌클릭을 냈다.
+        val end = tracker.onGestureEnd(40L + GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS + 10L)
+        assertNull("스크롤 직후 꼬리가 유예 시간을 넘겨도 좌클릭이 나오면 안 된다", end.clickButton)
+    }
+
+    @Test
     fun `3손가락 탭은 어느 버튼으로도 판정되지 않는다`() {
         tracker.onPointerEvent(3, 0f, 0f, 0L)
         tracker.onPointerEvent(3, jitterPx, 0f, 10L)
 
         assertNull(tracker.onGestureEnd(tapDurationMs).clickButton)
+    }
+
+    // ---------------------------------------------------------------- 2손가락 드래그 → 스크롤
+
+    /** 스크롤 1스텝(휠 노치)에 해당하는 centroid 이동 거리 */
+    private val stepPx = GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP
+
+    @Test
+    fun `2손가락이 탭 한계 안에서 움직이는 동안에는 스크롤을 방출하지 않고 우클릭이 유지된다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+
+        // 탭 한계(TAP_MAX_DISTANCE_PX)까지 잘게 나눠 이동 — isDrag로 전환되지 않는다
+        val frames = 10
+        repeat(frames) { i ->
+            val y = GestureConfig.TAP_MAX_DISTANCE_PX * (i + 1) / frames
+            val decision = tracker.onPointerEvent(2, 0f, y, (i + 1).toLong())
+            assertNull("isDrag 전환 전에는 스크롤이 나가면 안 된다", decision.scroll)
+        }
+
+        // 스크롤과 우클릭은 상호 배타적 — 여기서는 여전히 2손가락 탭이다
+        assertEquals(right, tracker.onGestureEnd(tapDurationMs).clickButton)
+    }
+
+    @Test
+    fun `isDrag로 전환된 2손가락 구간은 centroid 이동을 정수 스텝 스크롤로 방출한다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+
+        val decision = tracker.onPointerEvent(2, 0f, stepPx * 3f, 10L)
+        assertEquals(ScrollDelta(dx = 0, dy = 3), decision.scroll)
+        assertNull("2손가락 구간은 여전히 MOVE를 방출하지 않는다", decision.move)
+    }
+
+    @Test
+    fun `스크롤 부호는 손가락 진행 방향을 그대로 따른다`() {
+        // AGENTS.md 섹션 4: dy 양수 = 손가락이 아래로, dx 양수 = 손가락이 오른쪽으로
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        assertEquals(ScrollDelta(dx = 2, dy = -3), tracker.onPointerEvent(2, stepPx * 2f, -stepPx * 3f, 10L).scroll)
+
+        tracker.onGestureEnd(20L)
+
+        tracker.onPointerEvent(2, 0f, 0f, 100L)
+        assertEquals(ScrollDelta(dx = -2, dy = 3), tracker.onPointerEvent(2, -stepPx * 2f, stepPx * 3f, 110L).scroll)
+    }
+
+    @Test
+    fun `1스텝 미만 프레임이 이어져도 잔차가 누적되어 스텝이 손실되지 않는다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+
+        // 탭 한계를 넘겨 스크롤을 개시한다 (정확히 1스텝, 잔차 0)
+        val startY = stepPx
+        assertEquals(ScrollDelta(dx = 0, dy = 1), tracker.onPointerEvent(2, 0f, startY, 10L).scroll)
+
+        // 이후 프레임당 0.25스텝씩 40프레임 = 정확히 10스텝.
+        // 잔차를 버리면 모든 프레임이 0으로 잘려 스크롤이 아예 먹지 않는다.
+        val frameDy = stepPx / 4f
+        var totalSteps = 0
+        for (i in 1..40) {
+            val scroll = tracker.onPointerEvent(2, 0f, startY + frameDy * i, 10L + i).scroll
+            totalSteps += scroll?.dy ?: 0
+            assertEquals("수평 이동이 없으면 dx 스텝도 없어야 한다", 0, scroll?.dx ?: 0)
+        }
+        assertEquals(10, totalSteps)
+    }
+
+    @Test
+    fun `잔차 누적은 음의 방향에서도 대칭으로 동작한다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        assertEquals(ScrollDelta(dx = 0, dy = -1), tracker.onPointerEvent(2, 0f, -stepPx, 10L).scroll)
+
+        val frameDy = -stepPx / 4f
+        var totalSteps = 0
+        for (i in 1..8) {
+            totalSteps += tracker.onPointerEvent(2, 0f, -stepPx + frameDy * i, 10L + i).scroll?.dy ?: 0
+        }
+        assertEquals(-2, totalSteps)
+    }
+
+    @Test
+    fun `스텝이 하나도 차지 않은 프레임은 스크롤을 방출하지 않는다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        val openY = stepPx * 3f
+        assertNotNull(tracker.onPointerEvent(2, 0f, openY, 10L).scroll)
+
+        // 0.1스텝짜리 미세 이동 — 서버가 헛도는 SendInput을 하지 않도록 null이어야 한다
+        assertNull(tracker.onPointerEvent(2, 0f, openY + stepPx * 0.1f, 20L).scroll)
+    }
+
+    @Test
+    fun `스크롤로 끝난 2손가락 구간은 우클릭으로 판정되지 않는다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        assertNotNull(tracker.onPointerEvent(2, 0f, stepPx * 3f, 10L).scroll)
+
+        // 탭 지속 시간 안에 끝나도 isDrag이므로 클릭이 아니다 (스크롤/우클릭 상호 배타)
+        assertNull(tracker.onGestureEnd(tapDurationMs).clickButton)
+    }
+
+    @Test
+    fun `1손가락 구간은 스크롤을 방출하지 않는다`() {
+        tracker.onPointerEvent(one, 0f, 0f, 0L)
+
+        val decision = tracker.onPointerEvent(one, 0f, stepPx * 5f, 10L)
+        assertNotNull("1손가락은 기존대로 MOVE를 방출한다", decision.move)
+        assertNull("1손가락 드래그가 스크롤로 새면 안 된다", decision.scroll)
+    }
+
+    @Test
+    fun `3손가락 구간은 스크롤을 방출하지 않는다`() {
+        tracker.onPointerEvent(3, 0f, 0f, 0L)
+        assertNull(tracker.onPointerEvent(3, stepPx * 4f, stepPx * 4f, 10L).scroll)
+    }
+
+    @Test
+    fun `손가락 개수가 바뀌면 스크롤 잔차가 새 구간으로 새지 않는다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        tracker.onPointerEvent(2, 0f, stepPx, 10L)             // 개시 (잔차 0)
+        tracker.onPointerEvent(2, 0f, stepPx * 1.75f, 20L)     // 0.75스텝 잔차가 남는다
+
+        // 3손가락을 거쳐 다시 2손가락으로 → 구간이 두 번 재시작된다
+        tracker.onPointerEvent(3, 0f, 0f, 30L)
+        tracker.onPointerEvent(2, 0f, 0f, 40L)
+
+        // 새 구간에서 0.75스텝만 움직인다. 잔차가 넘어왔다면 1.5스텝 → 1스텝이 나가버린다.
+        assertNull(
+            "이전 구간의 잔차가 새 스크롤의 첫 스텝을 앞당기면 안 된다",
+            tracker.onPointerEvent(2, 0f, stepPx * 0.75f, 50L).scroll,
+        )
+    }
+
+    @Test
+    fun `제스처가 끝나면 스크롤 잔차도 초기화된다`() {
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        tracker.onPointerEvent(2, 0f, stepPx, 10L)
+        tracker.onPointerEvent(2, 0f, stepPx * 1.75f, 20L)     // 0.75스텝 잔차
+        tracker.onGestureEnd(30L)
+
+        tracker.onPointerEvent(2, 0f, 0f, 1_000L)
+        assertNull(
+            "직전 제스처의 잔차가 다음 제스처로 넘어가면 안 된다",
+            tracker.onPointerEvent(2, 0f, stepPx * 0.75f, 1_010L).scroll,
+        )
+    }
+
+    @Test
+    fun `스크롤 개시 시점은 탭 한계 초과 프레임이며 그 프레임의 이동도 버리지 않는다`() {
+        // isDrag를 만든 바로 그 프레임의 델타부터 스크롤 계산에 포함된다 (경계 손실 없음)
+        tracker.onPointerEvent(2, 0f, 0f, 0L)
+        val crossing = tracker.onPointerEvent(2, 0f, stepPx * 2f, 10L)
+        assertEquals(ScrollDelta(dx = 0, dy = 2), crossing.scroll)
     }
 
     @Test

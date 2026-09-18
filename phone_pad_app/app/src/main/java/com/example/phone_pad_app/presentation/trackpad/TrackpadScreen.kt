@@ -55,6 +55,7 @@ fun TrackpadScreen(viewModel: TrackpadViewModel = hiltViewModel()) {
         is ConnectionState.Connected -> TrackpadSurface(
             host = state.host,
             onMove = viewModel::sendMove,
+            onScroll = viewModel::sendScroll,
             onClick = viewModel::sendClick,
             onRightClick = viewModel::sendRightClick,
             onDisconnect = viewModel::disconnect,
@@ -132,6 +133,7 @@ private fun ConnectingPanel() {
 private fun TrackpadSurface(
     host: String,
     onMove: (Float, Float) -> Unit,
+    onScroll: (Int, Int) -> Unit,
     onClick: () -> Unit,
     onRightClick: () -> Unit,
     onDisconnect: () -> Unit,
@@ -178,6 +180,12 @@ private fun TrackpadSurface(
                         val move = decision.move
                         if (move != null) {
                             onMove(move.dx, move.dy)
+                        }
+                        val scroll = decision.scroll
+                        if (scroll != null) {
+                            onScroll(scroll.dx, scroll.dy)
+                        }
+                        if (move != null || scroll != null) {
                             pressed.forEach { it.consume() }
                         }
                     }
@@ -207,7 +215,7 @@ private fun TrackpadSurface(
         }
 
         Text(
-            text = "터치하여 커서 이동\n탭으로 클릭\n두 손가락 탭으로 우클릭",
+            text = "터치하여 커서 이동\n탭으로 클릭\n두 손가락 탭으로 우클릭\n두 손가락 드래그로 스크롤",
             color = Color.White.copy(alpha = 0.15f),
             modifier = Modifier.align(Alignment.Center),
             fontSize = 16.sp,

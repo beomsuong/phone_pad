@@ -57,6 +57,16 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `스크롤 1스텝 거리는 탭 최대 이동 거리보다 크다`() {
+        // 스크롤은 isDrag(= 탭 최대 이동 거리 초과) 이후에만 시작된다. 스텝 단위가 그보다 작으면
+        // 스크롤이 걸리는 순간 이미 1스텝 이상이 쌓여 있어 첫 프레임에 툭 튄다.
+        assertTrue(GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP > 0f)
+        assertTrue(
+            GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP > GestureConfig.TAP_MAX_DISTANCE_PX
+        )
+    }
+
+    @Test
     fun `멀티터치 해제 유예는 탭 최대 지속 시간의 절반보다 짧다`() {
         // 이 여유가 없으면 "손가락 하나를 떼고 남은 손가락으로 탭"하는 동작까지
         // 2손가락 탭으로 삼켜버린다 (MultiTouchGestureTracker의 꼬리 보정 전제 조건)
