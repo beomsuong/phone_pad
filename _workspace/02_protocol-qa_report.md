@@ -1,291 +1,242 @@
-# protocol-qa 검증 리포트 — 2손가락 드래그 → 스크롤 (SCROLL)
+# protocol-qa 리포트 — 1손가락 더블탭 → DOUBLE_CLICK (Phase 3)
 
-검증일: 2026-09-18
-검증 방식: 양쪽 동시 읽기(Android 송신부 ↔ 서버 소비부) + 양쪽 테스트 실제 실행 + 와이어 리터럴 실증
+검증 방식: Android 송신부와 서버 소비부를 **동시에 읽고 비교**. 추가로 양쪽 테스트를 직접 실행하고,
+서버 `_double_click`은 `SendInput`을 모킹해 **실측**했다.
+
+**결론 요약: 경계면 계약 불일치 0건.** 실패 4건은 전부 Android 단일 사이드의 제스처 타이밍 semantics이며,
+와이어 포맷·필드·채널·타입은 양쪽이 정확히 맞물린다.
 
 | 구분 | 개수 |
-|------|-----:|
-| 통과 (P) | 14 |
-| 실패 (F) | 4 |
-| 관찰/권고 (O) | 4 |
-| 미검증 (U) | 5 |
-
-**심각한(치명적) 실패 없음.** 경계면 계약(타입 문자열·필드명·타입·채널·부호)은 완전히 일치한다.
-실패 4건은 전부 경계면 "바깥"의 상태/견고성/문서 문제이며, 스크롤 기능 자체는 정상 동작한다.
-다만 **F-1과 F-2는 실기기에서 사용자가 체감하는 오동작**이라 릴리스 전 수정을 권한다.
+|------|------|
+| 통과 | 18 |
+| 실패 | 4 (심각 0 / 중 2 / 하 2) |
+| 미검증 | 3 |
 
 ---
 
 ## 1. 통과 (PASS)
 
-### P-1. 이벤트 타입 문자열 일치
-- Android: `TrackpadRepositoryImpl.kt:123` → `"type":"SCROLL"`
-- Server: `input_controller.py:48` → `elif t == "SCROLL":`
-- 대소문자·철자 동일.
+### 경계면 정합성 (최우선)
 
-### P-2. 필드명·타입 일치 (camelCase/snake_case 혼용 없음)
-- Android가 내보내는 키: `type`, `dx`, `dy` (전부 소문자). `session` 없음.
-- Server가 읽는 키: `event.get("type")`, `event.get("dx", 0)`, `event.get("dy", 0)`.
-- `TrackpadEvent.Scroll(val dx: Int, val dy: Int)` — Int이므로 Kotlin 문자열 템플릿이 소수점을 붙이지 않는다.
-  `TrackpadRepositoryImplTest.kt:124`가 `contains(".")`를 명시적으로 금지해 회귀를 막고 있다.
+| # | 항목 | 왼쪽 (Android) | 오른쪽 (Server) | 결과 |
+|---|------|----------------|-----------------|------|
+| P-1 | `type` 문자열 | `TrackpadRepositoryImpl.kt:125` → `"DOUBLE_CLICK"` | `input_controller.py:48` → `elif t == "DOUBLE_CLICK"` | 완전 일치 (대소문자·언더스코어 포함) |
+| P-2 | `button` 필드명/타입 | `TrackpadEvent.kt:20` `val button: String = "left"` → `:125` 문자열로 직렬화 | `input_controller.py:49` `event.get("button", "left")` → `_double_click(button: str)` | 이름·타입 일치. snake/camel 혼용 없음 |
+| P-3 | 필드 누락 시 기본값 | ViewModel이 항상 `BUTTON_LEFT` 명시(`TrackpadViewModel.kt:76`) | `event.get("button", "left")` 기본값 존재 | 누락돼도 안전 |
+| P-4 | 채널 원칙 (MOVE만 UDP) | `TrackpadRepositoryImpl.kt:119-129`에서 `tcpClient.send` 사용, `udpClient` 미접촉 | `server.py:72` `handle_udp_packet`이 `type != "MOVE"`를 전부 드롭 | TCP 전송이 코드+테스트로 고정됨(`TrackpadRepositoryImplTest.kt:112` `udpClient.send` 0회 검증). UDP로 새더라도 서버가 무시하므로 이중 안전 |
+| P-5 | session 필드 부재 | 평문 `{"type":"DOUBLE_CLICK","button":"left"}` | TCP 경로는 session을 요구하지 않음 (`server.py:152-157`) | CLICK/SCROLL과 동일 등급, 일치 |
+| P-6 | 프레이밍 | `TcpClient.kt:73` `PrintWriter.println` → 개행 종료, `println(String)`이 락을 잡아 줄 단위 원자성 보장 | `server.py:137-141` `"\n"` 기준 split + strip | newline-delimited 규약 일치 |
+| P-7 | 와이어 리터럴 고정 | `TrackpadRepositoryImplTest.kt:110` 문자열 완전 일치 단언 | `test_input_controller.py:174-185` `handle_event` → `SendInput` 종단 검증 | 양쪽 모두 리터럴/플래그로 계약을 잠금 |
 
-### P-3. 와이어 바이트 실증 (직접 교차 실행)
-Android가 만드는 **리터럴 문자열 그대로**를 `server.py`의 버퍼 분리 로직(`split("\n") → strip() → json.loads → isinstance(dict)`)과
-실제 `InputController.handle_event`에 통과시켜 확인함:
+### 서버 4-INPUT 원자성 (실측)
 
-```
-'{"type":"SCROLL","dx":0,"dy":-3}'  -> {'type':'SCROLL','dx':0,'dy':-3} -> _scroll(0, -3)
-'{"type":"SCROLL","dx":2,"dy":5}'   -> ...                              -> _scroll(2, 5)
-'{"type":"SCROLL","dx":-1,"dy":0}'  -> ...                              -> _scroll(-1, 0)
-'{"type":"SCROLL","dx":0,"dy":0}'   -> ...                              -> 호출 없음
-```
-양쪽 테스트가 각각 "문자열"과 "dict"만 고정하고 있어 **이 연결 고리 자체는 어느 테스트도 검증하지 않는다**(→ O-3 참고).
-수동으로는 통과 확인.
-
-### P-4. 정수 변환 무손실
-Android `Int` → JSON 정수 리터럴 → Python `int(round(float(x)))`. 정수 입력에서 왕복 손실 없음.
-`float()` 경유는 `-2.0`/`"1"` 같은 관용 입력 방어용이며 정상 경로에 영향 없음
-(`test_handle_scroll_accepts_float_and_string_numbers`).
-
-### P-5. 라인 프레이밍
-`TcpClient.send` → `PrintWriter(autoFlush=true).println` (Android 개행 `\n`).
-서버는 `buffer.split("\n", 1)` 후 `line.strip()` — `\r`가 섞여도 안전. CLICK/HEARTBEAT와 동일 경로.
-
-### P-6. 부호 격리가 실제로 한 곳뿐임 (요청 #3)
-전 저장소에서 스크롤 부호를 건드리는 코드를 추적한 결과, **부호 변환은 `input_controller.py:81,83` 두 줄에만 존재**한다.
-- `MultiTouchGestureTracker.accumulateScroll` (184-193행): 양수 상수(`40f`)로 나누기만 하고 부정(negation) 없음. `toInt()`는 0 방향 절사라 양/음 대칭.
-- `TrackpadViewModel.sendScroll` (72-76행): 그대로 전달.
-- `TrackpadRepositoryImpl` (123행): 그대로 직렬화.
-- `InputController.handle_event` (52-55행): `round`만, 부호 조작 없음.
-→ 두 요약의 "뒤집을 거면 `_scroll` 한 곳만" 주장은 **사실**이다.
-
-### P-7. 스크롤 ↔ 2손가락 탭(우클릭) 상호 배타 (요청 #4)
-android-dev의 "isDrag로 구조적 상호 배타" 주장은 **코드상 성립**한다.
-- `isDrag`는 구간 내에서 **sticky**다 (`MultiTouchGestureTracker.kt:151-153` — true가 된 뒤 구간 종료 전까지 false로 돌아가지 않음).
-- `buttonForTap` (237행)이 `if (drag ...) return null` 이므로, 한 번이라도 스크롤이 나간 구간은 우클릭이 될 수 없다.
-- 경계 케이스 검증: **"스크롤 방출 후 멈췄다가 다시 짧게 움직이는" 경우** → `isDrag`가 유지되므로 (a) 우클릭 오발동 없음, (b) 잔차가 살아 있어 짧은 이동도 누적되어 새지 않음. 정상.
-- `totalMoved`는 누적 경로 길이가 아니라 **구간 시작점으로부터의 직선 거리**라서, 크게 움직였다가 원위치로 돌아와도 `isDrag` sticky 덕분에 스크롤이 끊기지 않는다.
-- 단, 손가락을 어긋나게 떼는 꼬리 구간에는 별도의 구멍이 있다 → **F-2**.
-
-### P-8. 0-스텝 SCROLL 미전송 (요청 #5)
-- Android: `accumulateScroll`이 `stepsX == 0 && stepsY == 0`이면 `null` 반환(193행) → `TrackpadScreen.kt:184-187`에서 `onScroll` 자체를 호출하지 않음. **0/0 SCROLL은 전송 불가능**하다. 테스트로도 고정됨(`스텝이 하나도 차지 않은 프레임은...`).
-- 서버 가드는 **죽은 코드가 아니다**: `{"type":"SCROLL"}` 처럼 필드가 누락된 입력, 다른 클라이언트/수동 테스트 입력을 막는 실제 방어선이며 `test_handle_scroll_missing_fields_defaults_to_zero`가 커버한다. 유지 권장.
-
-### P-9. 채널 원칙 준수 + 서버측 이중 방어 (요청 #6)
-- Android: `sendEvent`의 `Scroll` 분기는 `tcpClient.send`만 호출(123행). `udpClient`를 전혀 건드리지 않음. `TrackpadRepositoryImplTest`가 `coVerify(exactly = 0) { udpClient.send(any()) }`로 고정.
-- Server: `handle_udp_packet`이 `event.get("type") != "MOVE"`를 즉시 거부(`server.py:72-73`) → SCROLL이 UDP로 새더라도 무시된다(`test_udp_non_move_type_is_ignored_on_udp_channel`).
-
-### P-10. 기존 MOVE(UDP)/CLICK(TCP) 회귀 없음
-- `sendEvent`의 Move/Click 분기 로직 변경 없음. `MOUSEINPUT`/`INPUT` 구조체 정의 변경 없음(`mouseData`는 원래부터 `c_ulong`).
-- `_move`/`_click` 본문 변경 없음. `server.py`는 전혀 손대지 않음.
-- 기존 Android 회귀 테스트(1손가락 MOVE/CLICK, 손가락 개수 전환, 꼬리 보정) 19개 + 서버 MOVE/CLICK 테스트 전부 통과.
-
-### P-11. 알 수 없는 type 무시
-`handle_event`는 if/elif만으로 구성되어 미지의 타입에서 조용히 반환한다.
-`test_handle_unknown_type_does_not_raise`가 `_scroll` 미호출까지 검증하도록 갱신됨.
-
-### P-12. 필드 누락 기본값
-`event.get("dx", 0)` / `event.get("dy", 0)` 존재. 누락 시 0/0 → `_scroll` 미호출.
-
-### P-13. 양쪽 테스트 존재 및 보고 수치 재현 (요청 #7)
-직접 실행 결과 — **두 보고 수치 모두 정확히 재현됨.**
+`ctypes.windll.user32.SendInput`을 패치해 `handle_event({"type":"DOUBLE_CLICK","button":"left"})`를 실행한 결과:
 
 ```
-cd pc_server && python -m pytest -q
-56 passed in 0.18s
+SendInput call_count = 1
+count arg = 4 | len(inputs) = 4 | size = 40 | sizeof(INPUT) = 40
+  [0] flags=LEFTDOWN  dx=0 dy=0 mouseData=0 MOVEbit=False
+  [1] flags=LEFTUP    dx=0 dy=0 mouseData=0 MOVEbit=False
+  [2] flags=LEFTDOWN  dx=0 dy=0 mouseData=0 MOVEbit=False
+  [3] flags=LEFTUP    dx=0 dy=0 mouseData=0 MOVEbit=False
+button 필드 생략 시: ['LEFTDOWN','LEFTUP','LEFTDOWN','LEFTUP']
+```
+
+- **P-8** `SendInput` 정확히 1회 — `_click`을 두 번 부르지 않음 (`input_controller.py:136-145`)
+- **P-9** 순서 `[LEFTDOWN, LEFTUP, LEFTDOWN, LEFTUP]` 정확
+- **P-10** 커서 이동 요소 없음 — 4개 INPUT 전부 `dx=dy=mouseData=0`, `MOUSEEVENTF_MOVE` 비트 0.
+  Windows 더블클릭 판정 사각형(기본 4px) 문제 발생 여지 없음
+- **P-11** `count` 인자와 배열 길이, `sizeof(INPUT)`(40) 일치 — ctypes 호출 규약상 정상
+
+### 개별 CLICK으로 쪼개지지 않는가 (요청 항목 2)
+
+- **P-12** 데이터 계층: `DoubleClick` 한 건 → TCP 한 줄. `TrackpadRepositoryImplTest.kt:127-135`가
+  `tcpClient.send` 1회 + `"type":"CLICK"` 포함 전송 0회를 단언
+- **P-13** ViewModel 계층: `sendDoubleClick()`은 `DoubleClick`만 발사, `Click` 미발사 (`TrackpadViewModelTest.kt:81-87`)
+- **P-14** 대기 중 CLICK job 취소: `TrackpadScreen.kt:217-218`이 더블탭 판정 **이전에** 무조건
+  `pendingClickJob?.cancel()`을 호출한다. `pendingClickJob`은 `awaitEachGesture` 바깥
+  (`TrackpadScreen.kt:164`, `coroutineScope` 스코프)에 선언돼 제스처를 가로질러 취소 가능하다.
+  `delay(300)` 대기 중인 job은 취소되어 `onClick()`에 도달하지 못한다 → **정상 경로에서 좀비 CLICK 없음**.
+  (단 한 지점의 경합은 F-2 참조)
+- **P-15** 더블탭 확정 시 detector 즉시 리셋(`DoubleTapDetector.kt:42-47`) → 3연타에서 `A+B`, `B+C`가
+  겹쳐 더블클릭 2회가 나가지 않음. `DoubleTapDetectorTest`가 `[false,true,false,true]`로 고정
+
+### 알 수 없는 type / 회귀
+
+- **P-16** 알 수 없는 `type` 무시 (실측): `DOUBLE-CLICK`, `double_click`, `DOUBLECLICK`, `{}`, `SESSION`
+  → `SendInput` 호출 0회, 예외 없음. `handle_event`는 if/elif만 있고 else가 없어 조용히 통과.
+  추가로 `server.py:147-151`이 non-dict JSON을, `:156-162`가 개별 이벤트 예외를 격리 (기존 F-4/F-5 수정 유지)
+- **P-17** 기존 이벤트 회귀 없음: `input_controller.py`의 MOVE/CLICK/SCROLL 분기와 `_click`/`_move`/`_scroll`
+  본문은 이번 변경에서 **손대지 않았다**(`_double_click` 추가와 `elif` 한 줄만 삽입).
+  `MultiTouchGestureTracker`의 판정식(`buttonForTap`, `resolveTap` 조건, 스크롤 잔차 누적)도 불변이며
+  `GestureEndDecision`에 `x`/`y`를 **기본값과 함께 뒤에 추가**해 기존 호출부/테스트가 깨지지 않았다.
+  2손가락 우클릭·스크롤 경로는 `TrackpadScreen.kt:198-208, 233`에서 이전과 동일
+- **P-18** 상수 분리 규약 준수: `DOUBLE_TAP_INTERVAL_MS`/`DOUBLE_TAP_DISTANCE_PX`가 `GestureConfig`에만
+  존재하고 `DoubleTapDetector`/`TrackpadScreen`이 참조. 테스트도 상수에서 파생 (하드코딩 없음)
+
+### 테스트 실측 재현 (요청 항목 6)
+
+보고된 수치 **양쪽 다 재현됨**.
+
+```
+$ cd pc_server && python -m pytest
+collected 67 items ... 67 passed in 0.20s
+  test_input_controller.py 27 / test_server_heartbeat.py 19 / test_server_udp_session.py 21
 ```
 
 ```
-cd phone_pad_app && ./gradlew :app:cleanTestDebugUnitTest :app:testDebugUnitTest
-BUILD SUCCESSFUL
+$ cd phone_pad_app && ./gradlew :app:cleanTestDebugUnitTest :app:testDebugUnitTest
+BUILD SUCCESSFUL — TOTAL 114, failures 0, skipped 0
+  DoubleTapDetectorTest 13 / MultiTouchGestureTrackerTest 36 / TrackpadRepositoryImplTest 18
+  TrackpadRepositoryHeartbeatTest 12 / GestureConfigTest 11 / TrackpadViewModelTest 10
+  SessionHandshakeTest 8 / TcpClientTest 4 / SendEventUseCaseTest 1 / ExampleUnitTest 1
 ```
-| 테스트 클래스 | tests | fail | err |
-|---|---:|---:|---:|
-| ExampleUnitTest | 1 | 0 | 0 |
-| data.network.SessionHandshakeTest | 8 | 0 | 0 |
-| data.network.TcpClientTest | 4 | 0 | 0 |
-| data.repository.TrackpadRepositoryHeartbeatTest | 12 | 0 | 0 |
-| data.repository.TrackpadRepositoryImplTest | 13 | 0 | 0 |
-| domain.usecase.SendEventUseCaseTest | 1 | 0 | 0 |
-| presentation.trackpad.MultiTouchGestureTrackerTest | 32 | 0 | 0 |
-| presentation.trackpad.TrackpadViewModelTest | 7 | 0 | 0 |
-| presentation.util.GestureConfigTest | 8 | 0 | 0 |
-| **합계** | **86** | **0** | **0** |
 
-(주의: 첫 실행은 `UP-TO-DATE`로 스킵됐다. `cleanTestDebugUnitTest`를 함께 걸어 실제 재실행 후 XML 결과를 집계한 수치다.)
-
-### P-14. 잔차 누적의 정확성
-`scrollRemainderX/Y`는 구간 수명 동안 유지되고 `startSegment()`/`reset()`에서만 0으로 초기화된다(278-279, 255-256행).
-`toInt()`가 0 방향 절사이므로 `|잔차| < 1`이 항상 보장되어 무한 누적이 없고, 양/음 대칭이다.
-`GestureConfigTest`가 `SCROLL_SENSITIVITY_PX_PER_STEP > TAP_MAX_DISTANCE_PX` 부등식을 회귀로 고정해
-"스크롤 개시 순간 툭 튀는" 사각지대를 막는다. 설계·구현·테스트가 일관됨.
+> 주의: 처음 `./gradlew :app:testDebugUnitTest`만 돌렸을 때 `testDebugUnitTest UP-TO-DATE`로
+> **실제 실행 없이 BUILD SUCCESSFUL**이 떴다. `cleanTestDebugUnitTest`를 앞에 붙여 강제 재실행한 뒤
+> XML 결과(`app/build/test-results/`)로 개수를 센 값이 위 수치다. 앞으로 수치를 보고할 때는
+> UP-TO-DATE 여부를 반드시 확인할 것.
 
 ---
 
 ## 2. 실패 (FAIL)
 
-### F-1 [중] 고빈도 SCROLL이 heartbeat의 연결 해제 사유를 덮어쓴다 — 지난 F-2 수정의 회귀
+> 4건 모두 **경계면(Android↔서버 계약) 문제가 아니다.** 전부 Android 쪽 제스처 타이밍이며,
+> 서버는 받은 이벤트를 스펙대로 정확히 처리한다. 수정은 하지 않았다.
 
-**파일:라인** — `phone_pad_app/.../data/repository/TrackpadRepositoryImpl.kt:119-127`
+### F-1 (중) 대기 중인 CLICK이 후속 드래그 도중에 발사되어 엉뚱한 좌표에서 클릭된다
 
-**기대값 vs 실제값**
-- 기대: SCROLL은 한 번의 2손가락 드래그에서 수십 회 발생하는 **고빈도 이벤트**다. 바로 위 `Move` 분기(98-109행)에 명시된 프로젝트 규약대로 — *"MOVE는 고빈도 이벤트여서 연결 상태를 Error로 덮어쓰지 않는다(F-2). 실패는 조용히 버린다. 여기서 상태를 덮어쓰면 (watchdog이 넣은) 원인 메시지만 지워진다"* — 전송 실패를 조용히 버려야 한다.
-- 실제: `Click` 분기를 그대로 복사해 `catch` 안에서 `_connectionState.value = ConnectionState.Error(e.message ?: "Send failed")`로 상태를 덮어쓴다.
+**`TrackpadScreen.kt:211-235`**
 
-**왜 실제로 터지는가 (추정이 아님)**
-`TcpClient.send`는 `checkNotNull(writer) { "Not connected" }`이므로, `cleanUp()`이 writer를 null로 만든 직후의 전송이 `IllegalStateException("Not connected")`를 던진다. 그런데 `reportConnectionLost()`(211-218행)는 **`cleanUp()`을 먼저 호출하고 그 다음에** `Error("Heartbeat timeout")`을 넣는다. `sendScroll`은 `viewModelScope.launch`로 코루틴을 개별 발사하므로, 스크롤 중 연결이 죽으면 큐에 남아 있던 SCROLL 코루틴들이 곧바로 `Error("Not connected")`로 덮어쓴다.
-→ 사용자는 `Heartbeat timeout` / `Connection lost` 대신 **의미 없는 "Not connected"** 를 보게 되고, Phase 4 재연결이 이 메시지를 트리거로 쓰기로 되어 있어(AGENTS.md 섹션 6) 후속 기능까지 오염된다.
-연결 해제(`disconnect()`) 직후에도 같은 이유로 `Disconnected` 화면이 `Error("Not connected")` 화면으로 뒤집힌다.
+- 기대값: 탭 A 직후 사용자가 곧바로 1손가락 드래그를 시작하면, 탭 A의 클릭은 **탭 A의 위치**에서 일어난다
+  (이번 변경 이전 동작 — 탭이 끝나는 즉시 CLICK 전송).
+- 실제값: `when (end.clickButton)`에서 `BUTTON_LEFT` 분기만 `pendingClickJob`을 취소한다.
+  드래그로 끝난 제스처는 `else -> Unit`(`:234`)이라 **대기 중인 CLICK을 건드리지 않는다.**
+  따라서 탭 A 종료 + 300ms 시점에, 그사이 UDP MOVE로 커서가 이미 이동한 상태에서 CLICK이 나간다.
+  → "탭하고 바로 스와이프했더니 이동 중간 지점이 클릭됨".
+- 왜 회귀인가: 이번 변경 전에는 CLICK이 탭 종료 즉시 나가서 MOVE보다 항상 앞섰다. 300ms 지연이
+  생기면서 CLICK과 후속 MOVE의 **순서가 뒤집힐 수 있는 창**이 새로 열렸다. 요청 항목 5(1손가락
+  MOVE/CLICK 회귀)에 해당한다.
+- 수정 제안: 새 제스처에서 **첫 MOVE/SCROLL이 방출되는 순간** 대기 클릭을 즉시 flush 한다.
+  `TrackpadScreen.kt:198-208` 블록에서 `move != null || scroll != null`일 때
+  `pendingClickJob?.cancel(); pendingClickJob = null;` 후 `onClick()`을 직접 호출.
+  `MOVE_MIN_DISTANCE_PX`(5px) 임계 덕분에 이 시점의 커서 오차는 무시할 수준이고, 두 번째 탭은
+  MOVE를 방출하지 않으므로 더블탭 병합을 깨지 않는다. (스펙 변경이므로 리더 판단 필요)
 
-**수정 제안** — SCROLL을 CLICK이 아니라 MOVE와 같은 등급으로 취급한다:
-```kotlin
-is TrackpadEvent.Scroll -> {
-    // 고빈도 이벤트 — 실패해도 연결 상태를 덮어쓰지 않는다 (F-2와 동일한 이유).
-    // 실제 연결 유실은 heartbeat watchdog이 판정한다.
-    runCatching {
-        tcpClient.send("""{"type":"SCROLL","dx":${event.dx},"dy":${event.dy}}""")
-    }
-}
-```
-`TrackpadRepositoryImplTest`에 "전송 실패해도 connectionState가 Error로 바뀌지 않는다" 테스트를 추가할 것
-(`TrackpadRepositoryHeartbeatTest`의 F-2 테스트와 같은 패턴).
-담당: **android-dev** (서버 변경 불필요)
+### F-2 (하) 300ms 경계에서 CLICK과 DOUBLE_CLICK이 둘 다 나간다 — 개발자 보고 이슈 ① 실재 확인
 
----
+**`TrackpadScreen.kt:217-229` × `DoubleTapDetector.kt:63-69`**
 
-### F-2 [중] 스크롤 종료 시 손가락을 어긋나게 떼면 좌클릭이 오발동한다
+- 기대값: 어떤 경우에도 두 탭은 `CLICK 2개` 또는 `DOUBLE_CLICK 1개` 중 하나로만 번역된다.
+- 실제값: 경합이 **실재한다.** 판정은 `System.currentTimeMillis()` 차이로 `elapsed <= 300`(경계 포함,
+  `DoubleTapDetector.kt:65`), 전송은 코루틴 `delay(300)`(`TrackpadScreen.kt:227`)이라 시간축이 다르다.
+  두 번째 탭의 UP 이벤트가 `t1+300` 직전/직후에 들어오면, `delay`의 재개가 먼저 디스패치되어
+  `onClick()`이 이미 실행된 뒤 `:217`의 `cancel()`이 도착할 수 있다. `onClick()`은
+  `viewModelScope.launch`(`TrackpadViewModel.kt:60-64`)라 job 취소로 되돌릴 수 없다.
+  결과: 서버에 `CLICK` + `DOUBLE_CLICK`이 연달아 도착.
+- **영향도 평가(요청 항목 4-①): 낮음. 수정 불필요 수준.**
+  - 창의 폭: pointerInput 코루틴과 지연 job이 **같은 메인 디스패처**에서 돌기 때문에 진짜 병렬은 아니고,
+    "어느 continuation이 먼저 큐에 들어갔나"만 문제가 된다. 실질 창은 `t1+300` 근처 한 프레임(~16ms)
+    이내이며, 그것도 300ms 구간의 **맨 끝**에서만 발생한다. 더블탭을 의도한 사용자는 보통 100~250ms에
+    떨어지고, 두 번 클릭을 의도한 사용자는 400ms 이상이므로 실사용 히트율이 매우 낮다.
+  - 결과의 파괴력: `CLICK → DOUBLE_CLICK`은 대부분의 앱에서 "클릭 후 단어 선택/열기"가 되어
+    사용자가 의도했던 더블클릭 결과와 크게 다르지 않다. 파괴적 오동작이 아니다.
+  - 다만 두 이벤트가 각각 별도 코루틴에서 `Dispatchers.IO`로 넘어가므로(`TcpClient.kt:72`)
+    **와이어 순서가 보장되지 않는다** — 드물게 `DOUBLE_CLICK → CLICK` 순으로 도착할 수도 있다.
+    (줄 단위 원자성은 `PrintWriter.println`이 보장하므로 JSON이 깨지지는 않는다.)
+- 수정 제안(원한다면): `DoubleTapDetector.kt:65`를 `elapsed >= GestureConfig.DOUBLE_TAP_INTERVAL_MS`로
+  좁혀 경계를 배제하면 창이 줄지만 없어지지는 않는다. 근본 해결은 판정 시각도 `delay`와 같은 시간축
+  (`SystemClock.uptimeMillis()` 또는 코루틴 스코프 내 측정)으로 통일하는 것. **현재로선 그대로 두는 것을 권장.**
 
-**파일:라인** — `phone_pad_app/.../presentation/trackpad/MultiTouchGestureTracker.kt:219-232` (`resolveClickButton`)
+### F-3 (중) 좌클릭 직후 우클릭 시 순서가 역전된다 — 개발자 보고 이슈 ② 실재 확인
 
-**기대값 vs 실제값**
-- 기대: 스크롤로 끝난 제스처는 어떤 클릭도 발생시키지 않는다(현재 `스크롤로 끝난 2손가락 구간은 우클릭으로 판정되지 않는다` 테스트가 담보하는 의도).
-- 실제: **좌클릭이 발생한다.** 조건은 "2손가락을 뗄 때 남은 한 손가락이 50ms~200ms 사이로 화면에 남아 있는 경우".
+**`TrackpadScreen.kt:233`**
 
-**판정 경로 추적 (결정적)**
-```
-t=0    2손가락 down                         → segment(2)
-t=..   드래그 → isDrag=true, SCROLL 방출
-t=300  손가락 1개 뗌                        → startSegment(1): prevPointerCount=2, prevIsDrag=true,
-                                              새 구간 isDrag=false, segmentStartTimeMs=300
-t=360  마지막 손가락 뗌 → onGestureEnd(360)
-       elapsed = 60
-       isReleaseTail = prev(2) > last(1) && !isDrag(true) && 60 < MULTI_TOUCH_RELEASE_GRACE_MS(50)
-                     = false            ← 유예 시간을 넘겨 꼬리 보정이 꺼진다
-       → buttonForTap(pointerCount=1, drag=false, elapsed=60)
-       → 60 < TAP_MAX_DURATION_MS(200) → BUTTON_LEFT  ⚠ 스크롤 직후 좌클릭
-```
-`isReleaseTail`은 **현재(꼬리) 구간의 `isDrag`** 만 보고 `prevIsDrag`는 보지 않으며, 유예 시간을 넘긴 순간 직전 구간이 스크롤이었다는 사실 자체가 판정에서 완전히 사라진다.
-기존 테스트 `꼬리 구간이 유예 시간을 넘기면 남은 손가락의 좌클릭으로 판정된다`(196-209행)가 정확히 이 분기를 "정상"으로 고정하고 있다 — 2손가락 **탭**에는 맞는 규칙이지만, 2손가락 **스크롤**에는 틀렸다. 위험 창은 꼬리 길이 **[50ms, 200ms)** 로, 사람이 손가락을 어긋나게 떼는 전형적 구간과 정확히 겹친다.
+- 기대값: 사용자가 [1손가락 탭 → 2손가락 탭]을 하면 서버는 `CLICK(left)` → `CLICK(right)` 순으로 받는다.
+- 실제값: `BUTTON_RIGHT -> onRightClick()`이 `pendingClickJob`을 전혀 건드리지 않는다.
+  탭 A 후 300ms 안에 2손가락 탭을 하면 우클릭이 먼저 나가고, 좌클릭이 그 뒤에 도착한다.
+- **영향도 평가(요청 항목 4-②): F-2보다 위험하지만, 발생 조건이 좁아 "허용 가능한 트레이드오프"로 판단.**
+  - 위험한 이유: 우클릭은 Windows에서 **컨텍스트 메뉴를 띄운다.** 그 직후 도착하는 좌클릭은 커서가
+    메뉴 원점에 있는 상태에서 발사되므로, 메뉴를 그냥 닫는 데 그칠 수도 있지만 **메뉴 첫 항목을
+    눌러버릴 가능성**이 (DPI·메뉴 스타일에 따라) 있다. F-2와 달리 "사용자가 지시하지 않은 명령 실행"이
+    될 수 있다는 점에서 질적으로 더 나쁘다.
+  - 그럼에도 허용 가능하다고 보는 근거:
+    1. 조건이 좁다 — 좌탭이 끝난 뒤 **300ms 안에 두 손가락을 내려놓고 200ms 이내에 떼는**(탭 조건)
+       연속 동작이어야 한다. 트랙패드에서 좌클릭 직후 곧바로 우클릭하는 조작 자체가 드물고,
+       보통은 "클릭 → 대상 확인 → 우클릭"으로 사이에 수백 ms가 들어간다.
+    2. 커서가 움직이지 않으므로 좌클릭이 메뉴 **바깥**을 누를 일은 없고, 최악이라도 메뉴 원점
+       (테두리~첫 항목 경계)이라 항상 항목이 실행되는 것도 아니다.
+    3. 사용자가 즉시 알아차릴 수 있는(무음 실패가 아닌) 오동작이라 데이터 손실형 위험이 아니다.
+  - 결론: **지금 고치지 않아도 되지만, 고칠 때 비용이 매우 싸다(한 줄)** — Phase 3 마무리나
+    실기기 검증 때 함께 처리하기를 권장. 우선순위는 F-1보다 낮다.
+- 수정 제안: `BUTTON_RIGHT` 분기에서 대기 클릭을 **취소가 아니라 flush**한다.
+  ```kotlin
+  MultiTouchGestureTracker.BUTTON_RIGHT -> {
+      pendingClickJob?.cancel(); pendingClickJob = null
+      onClick()        // 미뤄둔 좌클릭을 먼저 내보내 순서를 보존
+      doubleTapDetector.reset()
+      onRightClick()
+  }
+  ```
+  취소(drop)가 아니라 flush여야 하는 이유: 사용자가 실제로 한 좌클릭을 삼키면 안 된다.
+  2손가락 탭은 1손가락 탭과 절대 더블탭으로 병합될 수 없으므로 flush는 의미 손실이 없다.
+  (스펙이 "우클릭은 이 로직과 완전히 무관"이라고 못박았으므로 **스펙 변경 사항** — 리더 결정 필요)
 
-**영향** — 웹페이지를 스크롤한 뒤 손을 떼는 것만으로 커서 위치의 링크/버튼이 클릭된다. 이전에는 2손가락 드래그가 아무 기능도 없어 드물게만 노출됐지만, SCROLL이 상시 사용 제스처가 되면서 노출 빈도가 급증한다(엄밀히는 선존재 결함이나 이번 기능이 실사용 위험으로 승격시켰다).
+### F-4 (하) 우클릭이 DoubleTapDetector 상태를 리셋하지 않아 우클릭을 사이에 낀 두 좌탭이 병합된다
 
-**수정 제안** — 꼬리 보정 여부와 무관하게 "직전 구간이 드래그였으면 클릭 없음"을 관철한다:
-```kotlin
-private fun resolveClickButton(timestampMs: Long, lastPointerCount: Int): String? {
-    if (!hasSegment) return null
+**`TrackpadScreen.kt:232-233`**
 
-    val elapsed = timestampMs - segmentStartTimeMs
-    val startedByRelease = hasPrevSegment && prevPointerCount > lastPointerCount
-
-    // 직전 구간이 드래그(=스크롤/이동)였다면, 그 뒤에 붙은 짧은 꼬리는 탭이 아니다.
-    if (startedByRelease && prevIsDrag && elapsed < GestureConfig.TAP_MAX_DURATION_MS) return null
-
-    val isReleaseTail = startedByRelease && !isDrag &&
-        elapsed < GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS
-    ...
-}
-```
-(임계값은 `GestureConfig` 상수로 분리 — AGENTS.md 섹션 9 규약)
-추가 테스트: `2손가락 스크롤 후 꼬리가 유예 시간을 넘겨도 좌클릭하지 않는다`(꼬리 60ms), 그리고 회귀 보호용으로 `2손가락 탭 후 남은 손가락으로 다시 탭하면 좌클릭한다`(직전 구간 `isDrag=false`)를 함께 둘 것.
-담당: **android-dev** (서버 변경 불필요)
-
----
-
-### F-3 [하] AGENTS.md 섹션 4/5/6/7이 구현과 어긋남 (요청 #8)
-
-**파일:라인 — 기대값 vs 실제값 — 수정 제안** (전부 문서만 갱신하면 되는 항목. 코드가 최신이고 문서가 낡음)
-
-| # | AGENTS.md 위치 | 문서 내용 (현재) | 실제 코드 | 수정 제안 |
-|---|---|---|---|---|
-| 1 | 99-100행 (§4) | `// 스크롤 (Phase 2, 미구현)` | 구현 완료 | `// 스크롤 — ✅ 구현됨. dx/dy는 픽셀이 아니라 정수 휠 스텝(노치). px→스텝 변환과 잔차 누적은 Android(MultiTouchGestureTracker)가 끝낸 뒤 보낸다. 서버는 steps×WHEEL_DELTA(120)만 곱한다. 부호: dy 양수 = 손가락이 아래로, dx 양수 = 오른쪽. session 필드 없음.` |
-| 2 | 137행 (§5 표) | `2손가락 상하좌우 드래그 \| SCROLL(dx,dy) \| Phase 2 \| ⬜ 미구현` | 구현 완료 | `✅ 완료` |
-| 3 | 146-160행 (§5 감도 상수) | `SCROLL_SENSITIVITY_PX_PER_STEP` 누락 | `GestureConfig.kt:42`에 `40f` | `SCROLL_SENSITIVITY_PX_PER_STEP = 40f  // 휠 1스텝에 해당하는 centroid 이동 거리. 반드시 TAP_MAX_DISTANCE_PX보다 커야 함` 추가 |
-| 4 | 141-144행 (§5 엣지 케이스) | 스크롤/탭 경계 규칙 없음 | `isDrag` sticky 재사용 | "2손가락 구간은 `isDrag`(탭 한계 초과) 이후부터만 SCROLL을 방출하며, `isDrag`가 곧 우클릭 배제 조건이라 탭/스크롤 사각지대가 없다" 추가. **F-2 수정 후** 꼬리 보정과 스크롤의 상호작용도 함께 명문화 |
-| 5 | 180행 (§6 Phase 2) | `- [ ] 2손가락 드래그 → 스크롤 — ...계산은 해두고 버리는 중이라...교차 경계면 작업` | 완료 | `- [x] 2손가락 드래그 → 스크롤 — TCP + 정수 스텝. px→스텝 변환과 잔차 누적은 Android가 전담하고 서버는 steps×120만 수행. 감도 40px/스텝(탭 한계 20px의 2배로 사각지대 제거)` |
-| 6 | 188행 (§6 핵심 파일) | `...스크롤(GestureDecision에 필드 추가)이 다음 확장 지점` | 이미 추가됨 | "스크롤까지 완료(`GestureDecision.scroll`/`ScrollDelta`). 다음 확장 지점은 더블탭/탭홀드 드래그" 로 교체 |
-| 7 | 190행 (§6) / 297행 (§10) | sub-pixel 잔차 이슈가 전 범위처럼 읽힘 | SCROLL은 Android가 잔차를 완전 처리 | "`_move`에 한정된 이슈다. SCROLL은 앱이 잔차를 누적해 보내므로 해당 없음" 로 범위 명시 |
-| 8 | 225행 (§7 세션 흐름) | `\|-- TCP: SCROLL --> \| (Phase 2 예정, 미구현)` | 구현 완료 | `✅ 구현됨 (정수 스텝, session 없음)` |
-| 9 | 174행 (§6 헤더) | `🔶 Phase 2 — ... (일부 완료)` | 남은 항목은 DOUBLE_CLICK 하나 | 유지하되 잔여 항목이 더블탭뿐임을 명시 |
-
-담당: **리더/문서 파트** (`docs(harness):` 커밋)
+- 기대값: [좌탭 A] → [우탭] → [좌탭 C] 는 `CLICK(left)`, `CLICK(right)`, `CLICK(left)` 세 개.
+- 실제값: 우클릭 분기가 `doubleTapDetector`를 건드리지 않으므로 A의 기록이 살아남는다.
+  C가 A로부터 300ms·40px 이내면 `onTap`이 `true`를 반환해 **`DOUBLE_CLICK`이 나간다**
+  (게다가 A의 대기 클릭은 C 시점에 취소되어 사라진다). 실제 와이어: `CLICK(right)`, `DOUBLE_CLICK`.
+- 영향도: F-3과 같은 조건(300ms 안에 3연속 조작)이라 실사용 빈도는 매우 낮다. F-3 수정에
+  `doubleTapDetector.reset()` 한 줄을 같이 넣으면 동시에 해소된다.
+- 수정 제안: 위 F-3 스니펫의 `doubleTapDetector.reset()` 참조.
 
 ---
 
-### F-4 [하] 숫자로 파싱 불가능한 dx/dy가 TCP 세션 전체를 끊는다
+## 3. 미검증 (NOT VERIFIED)
 
-**파일:라인** — `pc_server/input_controller.py:52-53` (+ `pc_server/server.py:119-157`)
+실패로 간주하지 않는다.
 
-**기대값 vs 실제값**
-- 기대: 잘못된 이벤트 한 건은 무시하고 다음 줄을 계속 처리한다 (UDP 경로 `handle_udp_packet`은 `try/except`로 이미 이렇게 동작하며, 서버는 "크래시하지 않는다"를 원칙으로 명시하고 있다 — AGENTS.md §4 123행).
-- 실제: `float(event.get("dx", 0))`가 `{"type":"SCROLL","dx":"abc"}` 또는 `{"type":"SCROLL","dx":null}`에서 `ValueError`/`TypeError`를 던지고, `server.py`의 `try/except Exception`은 **`while True` 루프 바깥**(119행 try / 157행 except)이라 예외가 루프를 탈출해 `finally`에서 **세션 회수 + 소켓 close**로 이어진다. 잘못된 필드 하나에 연결이 통째로 끊긴다.
-
-**영향** — 현재 Android 클라이언트는 항상 Int만 보내므로 정상 경로에서는 발생하지 않는다(그래서 심각도 "하"). 다만 MOVE에도 동일하게 존재하는 구조적 구멍이고, SCROLL이 표면적을 넓혔다. server-dev도 "별개 이슈"로 인지했으나 **연결이 끊긴다**는 점은 요약에 빠져 있다.
-
-**수정 제안** — `server.py`에서 이벤트 단위로 격리한다 (UDP 경로와 대칭):
-```python
-try:
-    controller.handle_event(event)
-except Exception as e:      # 이벤트 한 건의 오류로 세션을 끊지 않는다
-    print(f"[!] Event handling failed: {event!r}: {e}")
-```
-또는 `handle_event`의 MOVE/SCROLL 공통 숫자 변환 헬퍼(`_as_int(event, key)`)에서 파싱 실패 시 0으로 폴백.
-테스트: `test_handle_client_survives_malformed_scroll_field`.
-담당: **server-dev**
+- **N-1 실기기 더블클릭 인식** — `SendInput`을 모킹한 단위 테스트라 "시각차 0으로 주입한 4개 INPUT을
+  실제 Windows 앱들이 더블클릭으로 받아들이는가"는 확인 불가. `GetDoubleClickTime`(기본 500ms) 안에
+  들어가는 것은 확실하나, down-up 간 최소 간격을 요구하는 앱이 있을 가능성은 배제 못 함.
+  탐색기/메모장 등에서 실기기 확인 필요.
+- **N-2 체감 상수** — `DOUBLE_TAP_INTERVAL_MS=300L`(모든 좌클릭에 붙는 지연), `DOUBLE_TAP_DISTANCE_PX=40f`
+  는 실기기 미검증. 특히 300ms 지연이 답답하게 느껴지는지는 사람이 만져봐야 안다.
+- **N-3 Compose 계층 동작** — `TrackpadScreen`의 지연/취소 로직은 Compose `pointerInput` 의존이라
+  단위 테스트가 없다. F-1~F-4는 전부 **코드 독해로 확인**한 것이며 자동 테스트로 고정돼 있지 않다.
+  `DoubleTapDetector`(순수 로직)만 13종으로 커버됨. Compose UI 테스트나, 지연/취소 로직을 별도
+  순수 클래스(`PendingClickScheduler` 같은)로 추출해 `runTest` 가상 시간으로 검증하는 방안 권장.
 
 ---
 
-## 3. 관찰 / 권고 (수정 필수 아님)
+## 4. AGENTS.md 실제 구현과 어긋나는 부분 (요청 항목 7 — 목록만, 수정 안 함)
 
-### O-1. 현재 부호 규약은 "자연 스크롤"(macOS 기본)이며 Windows 기본값과 반대다
-`dy` 양수(손가락 아래로) → `MOUSEEVENTF_WHEEL` 양수 delta → 휠 앞으로 굴림 → 뷰포트가 문서 앞쪽으로 이동 → **화면의 콘텐츠가 손가락을 따라 아래로** 움직인다.
-이는 request.md의 문구("dy 양수 = 손가락이 아래로 = 콘텐츠를 아래로 스크롤")와는 **일치**하지만, Windows 정밀 터치패드 기본 설정("아래로 움직이면 아래로 스크롤")과는 **반대**다.
-실기기에서 "거꾸로다"라는 피드백이 나올 가능성이 높다. 수정 지점은 `input_controller.py:81` 한 줄(`dy_steps` 앞 `-`)로 격리돼 있으므로 대응은 1줄이며, **Android는 절대 건드리지 말 것**(두 사이드가 동시에 뒤집으면 원위치된다).
-
-### O-2. 경계면 연결 고리를 고정하는 테스트가 양쪽 어디에도 없다
-Android 테스트는 리터럴 **문자열**만, 서버 테스트는 **dict**만 고정한다. 그 사이(문자열 → `json.loads` → dict)를 검증하는 테스트가 없어, 한쪽이 키 순서/철자를 바꿔도 양쪽 테스트는 초록으로 남는다.
-권고: `pc_server/tests/`에 Android 와이어 리터럴을 **하드코딩 문자열 상수**로 두고 `handle_client`의 파싱 경로에 통과시키는 테스트를 1개 추가
-(`test_handle_client_still_processes_tcp_click_over_newline_json`의 SCROLL 판.)
-
-### O-3. `handle_event`와 `_scroll`의 0 가드가 중복
-`input_controller.py:54`(`if dx != 0 or dy != 0`)와 `:84`(`if not deltas: return`)가 같은 일을 한다. 무해하며 `_scroll` 직접 호출도 보호하므로 유지해도 되지만, 의도(이중 방어)를 주석으로 남기면 나중에 한쪽이 "죽은 코드"로 오해받아 지워지는 걸 막을 수 있다.
-
-### O-4. SCROLL 전송 순서가 보장되지 않는다
-`TrackpadViewModel.sendScroll`이 이벤트마다 `viewModelScope.launch`를 새로 띄우고, `TcpClient.send`가 `withContext(Dispatchers.IO)`로 넘어가므로 IO 풀의 서로 다른 스레드에서 `println`이 실행된다(개별 `println`은 `PrintWriter` 락으로 원자적이라 문자열이 섞이지는 않는다).
-스크롤 델타는 가산적이라 순서가 바뀌어도 **총량은 동일**하므로 실사용 영향은 미미하다. 다만 Phase 3의 `DRAG_START`/`DRAG_END`처럼 순서가 의미를 갖는 이벤트를 추가할 때는 이 구조가 곧바로 버그가 되므로, 그 시점에 단일 송신 큐(Channel) 도입을 검토할 것.
-
-(android-dev가 이미 기록한 "축 잠금 없음 → 대각선 드래그에서 수평 휠 동시 발생"도 유효한 관찰이다. 경계면 문제는 아님.)
+| 위치 | 현재 문서 | 실제 구현 |
+|------|-----------|-----------|
+| `AGENTS.md:96-97` (§4) | `// 더블클릭 (Phase 2, 미구현)` | 구현 완료. 또한 §6은 이 항목을 **Phase 3**로 분류 — 문서 내부에서 Phase 번호가 어긋남 |
+| `AGENTS.md:96-97` (§4) | 부가 설명 없음 | SCROLL 항목처럼 "session 필드 없음 / TCP / 서버는 SendInput 1회로 down-up-down-up 4개를 원자 전송 / 커서 이동 없음" 주석 추가 필요 |
+| `AGENTS.md:137` (§5 표) | `1손가락 더블탭 \| DOUBLE_CLICK \| Phase 2 \| ⬜ 미구현` | `✅ 완료`. 단계 표기도 Phase 3으로 통일 필요 |
+| `AGENTS.md:149-164` (§5 감도 상수) | `DOUBLE_TAP_INTERVAL_MS`, `DOUBLE_TAP_DISTANCE_PX` 누락 | `GestureConfig.kt:66, 76`에 존재 (300L / 40f, 후자는 `TAP_MAX_DISTANCE_PX`의 2배) |
+| `AGENTS.md:143-147` (§5 엣지 케이스) | 언급 없음 | **모든 1손가락 CLICK이 300ms 지연된다**는 구조적 트레이드오프가 문서에 전혀 없다. 새 엣지 케이스 항목으로 명시 필요 (+ F-1/F-3 순서 이슈도 함께) |
+| `AGENTS.md:178` (§6 Phase 2 헤더) | `🔶 Phase 2 — ... (남은 항목은 더블탭 하나)` | 더블탭이 Phase 3으로 옮겨 구현 완료 → Phase 2는 `✅` 전량 완료 표기 가능 |
+| `AGENTS.md:192` (§6 핵심 파일) | `다음 확장 지점은 더블탭/탭홀드 드래그` | 더블탭 완료 → `탭홀드 드래그`만 남음 |
+| `AGENTS.md:197` (§6 Phase 3) | `[ ] 1손가락 더블탭 → DOUBLE_CLICK (타이머 기반 판정)` | `[x]`. "타이머 기반"은 맞으나 실제 방식은 **"지연 후 확정"**(단일 클릭을 300ms 미뤘다가 두 번째 탭이 없을 때 전송) — 이 한 줄 설명을 넣어두면 이후 작업자가 지연의 존재를 놓치지 않는다 |
+| `AGENTS.md:36-37` (§2 구조) | trackpad 패키지에 `DoubleTapDetector.kt` 누락 | 신규 파일 존재 |
+| `AGENTS.md:228-233` (§7 세션 흐름) | `TCP: DOUBLE_CLICK` 줄 없음 | 추가 권장 (선택) |
+| `AGENTS.md:294-306` (§10 미결 사항) | 해당 항목 없음 | "300ms 클릭 지연 체감", "지연 클릭 vs 후속 드래그/우클릭 순서"(F-1/F-3)를 미결 항목으로 올릴 것 권장 |
 
 ---
 
-## 4. 미검증 (UNVERIFIED)
+## 5. 종합 판단
 
-| # | 항목 | 사유 |
-|---|------|------|
-| U-1 | 실기기 스크롤 방향 체감 | 실제 Android 기기 + Windows 조합 미보유. O-1의 예측은 코드 기반 추론이며 실측 아님 |
-| U-2 | `SCROLL_SENSITIVITY_PX_PER_STEP = 40f`의 체감 적정성 | request.md가 범위 밖으로 명시. 계산 근거는 타당하나 실측 아님 |
-| U-3 | 실제 `SendInput` 휠 주입 동작 | 테스트는 `SendInput`을 모킹한다. `mouseData`의 2의 보수 인코딩(`delta & 0xFFFFFFFF`)이 Windows에서 실제 음수 휠로 해석되는지는 실행 미확인 (표준 관행상 올바른 구현) |
-| U-4 | 고빈도 SCROLL의 TCP 처리량/지연 | 한 드래그당 수십 이벤트가 TCP로 나가지만 부하 측정 없음. `AGENTS.md §10`의 "바이너리 프로토콜 전환 — Phase 2 성능 테스트 후 결정" 판단 자료가 아직 없음 |
-| U-5 | 실제 통합(앱↔서버 소켓) 동작 | 본 검증은 정적 대조 + 단위 테스트 + 와이어 리터럴 수동 통과까지다. 실제 소켓 연결로 스크롤이 움직이는지는 미확인 |
-
-참고: 서버측 heartbeat 카운터는 **어떤 상향 데이터로도 리셋**되므로(`server.py:135`), 스크롤 중에는 서버가 세션을 타임아웃시킬 위험이 없다 — 이 부분은 문제없음으로 확인했다.
-
----
-
-## 5. 후속 조치 요약
-
-| 대상 | 항목 |
-|------|------|
-| **android-dev** | F-1 (SCROLL 실패가 연결 상태를 덮어쓰지 않도록), F-2 (스크롤 후 좌클릭 오발동) |
-| **server-dev** | F-4 (이벤트 단위 예외 격리), O-1 대비(부호 뒤집기는 `_scroll` 한 줄 — 피드백 수신 시에만) |
-| **리더/문서** | F-3 (AGENTS.md §4/5/6/7 갱신, 표 그대로 적용 가능) |
-| **양쪽** | O-2 (경계면 연결 고리 테스트 1개 추가 — 서버 쪽에 두는 것을 권장) |
+- **경계면은 깨끗하다.** `type`·`button`·채널·프레이밍·기본값·알 수 없는 타입 처리까지 Android 송신부와
+  서버 소비부가 정확히 맞물린다. 양쪽 모두 와이어 리터럴/플래그 시퀀스를 테스트로 잠갔다.
+- 서버 구현은 이번 스펙의 핵심(**SendInput 1회 + 4-INPUT + 커서 이동 없음**)을 실측으로 만족한다.
+- 남은 4건은 전부 Android 쪽 **시간 축** 문제다. 이 중 실사용에서 먼저 체감될 것은 F-1(탭 후 즉시
+  드래그)이고, F-3은 위험도는 높지만 발생 조건이 좁아 지금은 트레이드오프로 수용 가능하다.
+- 우선순위 제안: **F-1 > F-3(+F-4 동시 해결) > F-2(보류 권장)**. 셋 다 스펙 변경을 수반하므로
+  리더 결정이 필요하다.

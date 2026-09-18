@@ -1,78 +1,85 @@
-# server-dev 작업 요약 — SCROLL (2손가락 드래그 → 스크롤)
+# server-dev 요약 — DOUBLE_CLICK (Phase 3)
+
+> **주의:** 이 작업은 원래 android-dev 에이전트로 기동된 세션이 코디네이터 지시에 따라
+> 이어받아 수행했습니다. 구현부(`input_controller.py`)는 이미 디스크에 존재했고,
+> 이 세션이 추가한 것은 **테스트뿐**입니다.
 
 ## 변경 파일
-- `pc_server/input_controller.py` — 휠 상수 추가, `handle_event`에 `SCROLL` 분기 추가, `_scroll` 신규 구현
-- `pc_server/tests/test_input_controller.py` — SCROLL 테스트 11개 추가, 기존 unknown-type 테스트에 `_scroll` 미호출 검증 추가
 
-건드리지 않은 것: `server.py`(TCP/UDP 소켓, `SessionRegistry`, heartbeat), 기존 `_move`/`_click` 로직.
+| 파일 | 변경 내용 | 작성자 |
+|------|----------|--------|
+| `pc_server/input_controller.py` | `handle_event`에 `DOUBLE_CLICK` 분기 + `_double_click(button)` 신규 | 이전 세션 (검토만 수행) |
+| `pc_server/tests/test_input_controller.py` | DOUBLE_CLICK 테스트 9종 + CLICK 회귀 2종 추가 | 이 세션 |
 
-## 처리하는 이벤트와 기대 필드
-```jsonc
-{"type":"SCROLL","dx":0,"dy":-3}   // TCP 9000, newline-delimited JSON, session 필드 없음
-```
-- `dx`/`dy`: 정수 스크롤 스텝(휠 노치 개수). 픽셀 아님. 누락 시 0.
-- 채널: TCP (AGENTS.md 섹션 4 원칙 — UDP는 MOVE 전용). `server.py`는 이미 TCP 라인을 `handle_event`로 넘기므로 소켓 쪽 변경 불필요.
+## 구현부 검토 결과 (스펙 준수 확인)
 
-## 실제 구현한 변환 로직
+`_double_click(button)`은 request.md 확정 스펙을 그대로 따르고 있음을 확인했습니다:
 
-### `handle_event` 분기
-```python
-elif t == "SCROLL":
-    dx = int(round(float(event.get("dx", 0))))
-    dy = int(round(float(event.get("dy", 0))))
-    if dx != 0 or dy != 0:
-        self._scroll(dx, dy)
-```
-스펙상 정수지만 MOVE와 동일하게 `float() → int(round())`로 방어 변환 (JSON이 `-2.0`이나 `"1"`로 와도 크래시하지 않음). 둘 다 0이면 `_scroll` 자체를 호출하지 않음.
+- `flags = (down_flag, up_flag, down_flag, up_flag)` 4개를 `(INPUT * 4)` 배열로 만들어
+  **`SendInput(4, inputs, ...)` 단 1회**로 전송 — `_click`을 두 번 호출(SendInput 2회)하지 않음
+- 버튼 분기는 기존 `_click`과 동일한 규약(`button == "left"`가 아니면 우클릭 플래그)
+- `MOUSEINPUT(dwFlags=flag)`만 세팅하므로 `dx`/`dy`/`mouseData`가 모두 0 —
+  커서를 움직이는 요소가 없어 Windows 더블클릭 판정 사각형(기본 4px) 문제가 발생하지 않음
+- `handle_event`의 분기 위치는 `CLICK` 바로 뒤, `event.get("button", "left")` 기본값도 CLICK과 동일
 
-### `_scroll(dx_steps, dy_steps)`
-- 새 상수: `MOUSEEVENTF_WHEEL = 0x0800`, `MOUSEEVENTF_HWHEEL = 0x1000`, `WHEEL_DELTA = 120`
-- 수직: `dy_steps != 0`일 때만 `(MOUSEEVENTF_WHEEL, dy_steps * 120)` INPUT 생성
-- 수평: `dx_steps != 0`일 때만 `(MOUSEEVENTF_HWHEEL, dx_steps * 120)` INPUT 생성
-- 두 축 모두 0이면 즉시 return — `SendInput` 미호출
-- 두 축 모두 0이 아니면 **INPUT 배열 1개로 묶어 `SendInput(2, ...)` 한 번 호출** (기존 `_click`이 down/up 2개를 한 번에 보내는 패턴과 동일). 축별로 두 번 호출하지 않음 — 한 제스처 프레임의 수직/수평 델타가 원자적으로 주입된다.
-- `mouseData`는 기존 `MOUSEINPUT` 구조체를 그대로 재사용하며 `c_ulong`(DWORD)이므로, 음수 delta는 `delta & 0xFFFFFFFF`로 2의 보수 인코딩해서 넣는다 (휠에서는 signed로 해석됨). 구조체 정의는 변경하지 않아 `_move`/`_click`에 영향 없음.
+## 추가한 테스트 (11종)
 
-### 부호 규약 (뒤집기 지점)
-Windows 표준 그대로, 추가 반전 없음:
-- `dy_steps` 양수 → WHEEL 양수 delta = 휠 앞으로 굴림
-- `dx_steps` 양수 → HWHEEL 양수 delta = 오른쪽
+### DOUBLE_CLICK 디스패치
+1. `test_handle_double_click_defaults_to_left` — `button` 필드 없으면 `"left"`로 위임
+2. `test_handle_double_click_passes_explicit_button` — 명시된 `button`을 그대로 전달
+3. `test_handle_double_click_does_not_reuse_click` — `_click`이 호출되지 않고 `SendInput`이 정확히 1회.
+   **이번 스펙의 핵심(원자성)을 고정하는 테스트**
 
-**변환은 `_scroll` 내부의 `deltas.append(...)` 두 줄에만 존재**한다. 실기기에서 방향이 반대로 느껴지면 그 두 줄에서 `dy_steps`/`dx_steps` 앞에 `-`만 붙이면 되고 `handle_event`나 Android 스펙은 손댈 필요 없다.
+### SendInput 시퀀스
+4. `test_double_click_sends_down_up_down_up_in_single_send_input` —
+   `[LEFTDOWN, LEFTUP, LEFTDOWN, LEFTUP]` 순서 + SendInput 1회 + `count == len(inputs)` + `size == sizeof(INPUT)`
+5. `test_double_click_right_button_uses_right_flags` —
+   `[RIGHTDOWN, RIGHTUP, RIGHTDOWN, RIGHTUP]` (이번 범위 외지만 재사용성 확인)
+6. `test_double_click_does_not_move_cursor` —
+   4개 INPUT 전부 `dx == dy == mouseData == 0`이고 `dwFlags & MOUSEEVENTF_MOVE == 0`.
+   "커서가 안 움직여야 더블클릭이 성립한다"는 설계 근거를 직접 검증
+7. `test_handle_double_click_end_to_end_flags` — `handle_event` → `_double_click` → `SendInput` 전 구간
 
-## 테스트 (`pc_server/tests/test_input_controller.py`)
-SCROLL 관련 11개:
+### 회귀 (DOUBLE_CLICK 추가가 단일 클릭을 건드리지 않았는지)
+8. `test_single_click_still_sends_exactly_two_inputs` — `_click("left")` → `[LEFTDOWN, LEFTUP]` 2개, SendInput 1회
+9. `test_single_right_click_still_sends_exactly_two_inputs` — `_click("right")` → `[RIGHTDOWN, RIGHTUP]`
 
-`handle_event` 레벨 (`_scroll` 모킹):
-1. `test_handle_scroll_passes_integer_steps` — `{"dx":0,"dy":-3}` → `_scroll(0, -3)`
-2. `test_handle_scroll_horizontal` — `{"dx":2,"dy":0}` → `_scroll(2, 0)`
-3. `test_handle_scroll_accepts_float_and_string_numbers` — `{"dx":"1","dy":-2.0}` → `_scroll(1, -2)`
-4. `test_handle_scroll_zero_does_not_call_scroll` — 둘 다 0 → 미호출
-5. `test_handle_scroll_missing_fields_defaults_to_zero` — 필드 누락 → 미호출
+`_click`의 SendInput 레벨 테스트는 기존에 없었습니다(디스패치 테스트만 존재) — 이번에 신규로 추가해
+"CLICK은 2개, DOUBLE_CLICK은 4개"라는 구분을 코드로 고정했습니다.
 
-`_scroll` 레벨 (`input_controller.ctypes.windll.user32.SendInput` 모킹, 실제 OS 호출 없음):
+### 기존 테스트 보강 (이전 세션 작업, 그대로 유지)
+- `test_handle_unknown_type_does_not_raise`에 `_double_click` 미호출 검증 추가 —
+  `SESSION`/`UNKNOWN`/`{}` 가 실수로 더블클릭을 유발하지 않음
 
-6. `test_scroll_vertical_sends_wheel_with_step_times_wheel_delta` — INPUT 1개, flag=WHEEL, mouseData=-360
-7. `test_scroll_vertical_positive_step` — mouseData=+120
-8. `test_scroll_horizontal_sends_hwheel_only` — INPUT 1개, flag=HWHEEL, mouseData=240 (WHEEL INPUT 없음)
-9. `test_scroll_both_axes_sends_two_inputs` — INPUT 2개 [WHEEL -240, HWHEEL +120], `SendInput` 호출은 1회
-10. `test_scroll_zero_does_not_call_send_input` — `SendInput` 미호출
-11. `test_handle_scroll_end_to_end_mouse_data` — `handle_event` → `SendInput`까지 mouseData=-360
+## 헬퍼
 
-헬퍼 `_signed32()`로 `c_ulong`에 실린 mouseData를 다시 signed로 해석해 비교하고, `SendInput` 인자의 `count`/`sizeof(INPUT)`도 함께 검증한다.
-
-회귀: 기존 MOVE/CLICK/unknown-type 테스트 전부 유지. `test_handle_unknown_type_does_not_raise`에 `_scroll` 미호출 검증을 추가해, 정의되지 않은 타입이 스크롤을 유발하지 않음을 보장.
+`_sent_flags(mock_send_input)` 신규 — SendInput 1회 호출을 단언하고 `dwFlags` 목록을 뽑습니다.
+기존 `_sent_wheel_events`는 `mouseData`까지 필요한 휠 전용이라 분리했습니다.
 
 ## 테스트 실행 결과
+
 ```
 $ cd pc_server && python -m pytest
-platform win32 -- Python 3.13.1, pytest-9.0.3
-56 passed in 0.20s
-```
-(SCROLL만: `-k scroll` → 11 passed)
+platform win32 -- Python 3.13.1, pytest-9.0.3, pluggy-1.6.0
+collected 67 items
 
-## 남은 이슈 / 인수인계
-- **부호 방향 실기기 미검증.** 사용자 기대(자연 스크롤 vs 전통 스크롤)와 다를 수 있음. 수정 지점은 `_scroll` 한 곳으로 격리해 두었다.
-- **잔차 누적은 Android 책임.** 서버는 정수 스텝만 받으므로 sub-pixel 누적 로직을 두지 않았다. Android가 잔차를 잘라 보내면 서버에서 복구 불가.
-- `handle_event`의 `float()` 변환은 숫자로 파싱 불가능한 값(`"abc"`, `null`)에서 `ValueError`/`TypeError`를 던진다 — MOVE와 동일한 기존 동작이며 이번 범위에서 바꾸지 않았다. 프로토콜 관용성을 높이려면 MOVE/SCROLL 공통으로 별도 처리 필요(별개 이슈).
-- `AGENTS.md` 섹션 4의 "스크롤 (Phase 2, 미구현)" 주석과 섹션 6 로드맵 갱신은 리더/문서 담당 몫으로 남겨둠 (서버 코드만 변경).
+tests\test_input_controller.py ...........................               [ 40%]
+tests\test_server_heartbeat.py ...................                       [ 68%]
+tests\test_server_udp_session.py .....................                   [100%]
+
+============================= 67 passed in 0.20s ==============================
+```
+
+`test_input_controller.py` 27개(기존 16 + 신규 11), 전체 67개 전부 통과. MOVE/CLICK/SCROLL/HEARTBEAT/UDP 세션 회귀 없음.
+
+## 남은 이슈
+
+1. **실기기(실제 Windows 입력) 미검증** — `SendInput`을 모킹한 단위 테스트라 "실제로 더블클릭으로
+   인식되는지"는 확인하지 못했습니다. 특히 4개 INPUT을 시각차 0으로 주입하는 방식이 모든
+   애플리케이션에서 더블클릭으로 받아들여지는지는 실기기 확인이 필요합니다.
+   (`GetDoubleClickTime` 기본 500ms 안에는 확실히 들어가지만, 일부 앱이 down-up 간
+   최소 간격을 요구할 가능성은 배제 못 함)
+2. **`AGENTS.md` 갱신 필요** — 섹션 4의 `// 더블클릭 (Phase 2, 미구현)` 주석과 섹션 5 표의
+   `1손가락 더블탭 → ⬜ 미구현`, 섹션 6 Phase 3 체크박스를 구현 완료로 바꿔야 합니다.
+   이 세션은 소스/테스트만 건드렸습니다.
+3. `_move`의 sub-pixel 잔차 누적 이슈(기존 별도 이슈)는 이번 작업과 무관하게 그대로 남아 있습니다.
