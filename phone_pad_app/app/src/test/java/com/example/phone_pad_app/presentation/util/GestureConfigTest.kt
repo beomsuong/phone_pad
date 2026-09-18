@@ -42,4 +42,10 @@ class GestureConfigTest {
         assertTrue(GestureConfig.MOVE_SENSITIVITY > 0f)
         assertTrue(GestureConfig.TAP_MAX_DURATION_MS > 0L)
     }
+
+    @Test
+    fun `단일 포인터 구간 기준은 1손가락이다`() {
+        // MultiTouchGestureTracker가 MOVE/CLICK을 방출하는 유일한 구간 조건
+        assertEquals(1, GestureConfig.SINGLE_POINTER_COUNT)
+    }
 }

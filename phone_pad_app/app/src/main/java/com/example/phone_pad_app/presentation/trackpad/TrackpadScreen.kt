@@ -24,10 +24,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -141,36 +139,48 @@ private fun TrackpadSurface(
             .fillMaxSize()
             .background(Color(0xFF1A1A2E))
             .pointerInput(Unit) {
+                // 판정은 전부 순수 Kotlin 트래커가 담당하고, 여기서는
+                // "눌린 포인터 개수 + 중심 좌표 + 타임스탬프"만 넘기고 결정대로 콜백을 호출한다.
                 awaitEachGesture {
+                    val tracker = MultiTouchGestureTracker()
                     val down = awaitFirstDown(requireUnconsumed = false)
-                    val startPosition: Offset = down.position
-                    val startTime = System.currentTimeMillis()
-                    var isDrag = false
+                    var lastTimestamp = System.currentTimeMillis()
+                    tracker.onPointerEvent(
+                        pointerCount = GestureConfig.SINGLE_POINTER_COUNT,
+                        x = down.position.x,
+                        y = down.position.y,
+                        timestampMs = lastTimestamp,
+                    )
 
                     while (true) {
                         val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull() ?: break
+                        lastTimestamp = System.currentTimeMillis()
 
-                        if (change.positionChange() != Offset.Zero) {
-                            val totalMoved = (change.position - startPosition).getDistance()
-                            if (totalMoved > GestureConfig.MOVE_MIN_DISTANCE_PX) {
-                                val delta = change.positionChange()
-                                onMove(
-                                    delta.x * GestureConfig.MOVE_SENSITIVITY,
-                                    delta.y * GestureConfig.MOVE_SENSITIVITY,
-                                )
-                                change.consume()
-                            }
-                            if (totalMoved > GestureConfig.TAP_MAX_DISTANCE_PX) {
-                                isDrag = true
-                            }
+                        val pressed = event.changes.filter { it.pressed }
+                        if (pressed.isEmpty()) break
+
+                        var sumX = 0f
+                        var sumY = 0f
+                        pressed.forEach {
+                            sumX += it.position.x
+                            sumY += it.position.y
                         }
 
-                        if (!change.pressed) break
+                        val decision = tracker.onPointerEvent(
+                            pointerCount = pressed.size,
+                            x = sumX / pressed.size,
+                            y = sumY / pressed.size,
+                            timestampMs = lastTimestamp,
+                        )
+
+                        val move = decision.move
+                        if (move != null) {
+                            onMove(move.dx, move.dy)
+                            pressed.forEach { it.consume() }
+                        }
                     }
 
-                    val elapsed = System.currentTimeMillis() - startTime
-                    if (!isDrag && elapsed < GestureConfig.TAP_MAX_DURATION_MS) {
+                    if (tracker.onGestureEnd(lastTimestamp).click) {
                         onClick()
                     }
                 }

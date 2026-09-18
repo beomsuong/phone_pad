@@ -13,6 +13,13 @@ object GestureConfig {
     /** 커서 이동 이벤트를 발생시킬 최소 이동 거리 (px) — 탭 중 미세 떨림 억제 */
     const val MOVE_MIN_DISTANCE_PX = 5f
 
+    /**
+     * 단일 포인터(1손가락) 구간으로 판정할 동시 포인터 개수.
+     * 이 개수인 구간에서만 MOVE/CLICK을 방출하며, 그보다 많으면 멀티터치 구간으로 본다
+     * (2손가락 우클릭/스크롤은 Phase 2 후속 작업에서 연결).
+     */
+    const val SINGLE_POINTER_COUNT = 1
+
     /** PC 서버 기본 포트 (TCP — CLICK/SCROLL/DRAG/HEARTBEAT 및 세션 핸드셰이크) */
     const val DEFAULT_PORT = 9000
 
