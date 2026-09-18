@@ -1,35 +1,39 @@
-# 요청: PointerInfo 기반 멀티터치 제스처 감지 기반 구축 (AGENTS.md Phase 2)
+# 요청: 2손가락 탭 → 우클릭 (AGENTS.md Phase 2)
 
-**범위 판단:** 단일 사이드 (Android만) — 새 이벤트 타입이나 프로토콜 필드를 추가하지 않는다. 순수하게 제스처 감지 계층의 내부 구조를 확장하는 작업이며, 서버(pc_server)는 전혀 건드리지 않는다.
-**실행 경로:** Phase 2A(서브 에이전트 1명, android-dev). protocol-qa는 생략 — 검증할 경계면이 없다.
+**범위 판단:** 단일 사이드 (Android만). 새 이벤트 타입이나 프로토콜 필드를 추가하지 않는다 — **기존 CLICK 이벤트를 `button:"right"`로 재사용**한다.
 
-## 배경 및 목표
+**서버는 이미 지원한다 (확인 완료, 변경 불필요):** `pc_server/input_controller.py`의 `_click(button)`이
+```python
+down_flag = MOUSEEVENTF_LEFTDOWN if button == "left" else MOUSEEVENTF_RIGHTDOWN
+up_flag = MOUSEEVENTF_LEFTUP if button == "left" else MOUSEEVENTF_RIGHTUP
+```
+로 `"left"`가 아닌 모든 button 값을 우클릭으로 처리한다(Phase 1부터 있던 코드). 즉 Android가 `{"type":"CLICK","button":"right"}`을 TCP로 보내기만 하면 서버는 이미 우클릭을 수행한다. **서버는 건드리지 않는다.**
 
-현재 `TrackpadScreen.kt`의 제스처 루프는 `event.changes.firstOrNull()`로 **첫 번째 포인터만** 보고, 두 번째 손가락이 닿아도 완전히 무시한다. 이번 작업은 향후 "2손가락 탭 → 우클릭", "2손가락 드래그 → 스크롤"을 얹을 수 있는 **기반**을 만드는 것이다 — 이번 작업 자체에서는 2손가락에 대해 새 이벤트를 발생시키지 않는다(우클릭/스크롤은 다음 작업).
+**실행 경로:** Phase 2A(서브 에이전트 1명, android-dev). protocol-qa/server-dev 불필요.
 
 ## 확정 스펙
 
-1. **동시에 눌린 포인터 개수를 추적**한다 (`event.changes.count { it.pressed }`).
-2. **손가락 개수가 바뀌면 진행 중이던 제스처 분류를 취소하고 그 시점부터 새로 시작**한다 (AGENTS.md 섹션 5 엣지 케이스: "드래그 도중 손가락 개수 변화(1→2) → 현재 제스처 취소 후 새 제스처로 재시작"). 즉 시작 위치/시작 시각/드래그 여부를 그 시점 값으로 리셋한다.
-3. **1손가락 구간**: 기존 동작을 정확히 그대로 유지한다 — `MOVE_MIN_DISTANCE_PX` 초과 이동 시 `onMove(dx * MOVE_SENSITIVITY, dy * MOVE_SENSITIVITY)` 호출, `TAP_MAX_DISTANCE_PX` 초과 이동 시 드래그로 표시, 제스처 종료 시 드래그가 아니고 `TAP_MAX_DURATION_MS` 이내면 `onClick()` 호출. **이 회귀는 절대 깨지면 안 된다.**
-4. **2손가락(이상) 구간**: `onMove`/`onClick`을 전혀 호출하지 않는다 (foundation만 — 다음 작업에서 우클릭/스크롤 콜백을 여기에 연결할 예정). 시작 위치/시각은 내부적으로 계속 추적해도 되지만 외부로 아무것도 방출하지 않는다.
-5. 제스처가 완전히 끝났을 때(모든 손가락이 떨어졌을 때) 분류는 **마지막(가장 최근) 구간이 몇 손가락이었는지**를 기준으로 한다 — 예: 2손가락으로 시작해서 한 손가락이 먼저 떨어져 1손가락 구간으로 전환된 뒤 짧게 탭처럼 끝나면, 그 마지막 1손가락 구간 기준으로 탭 판정을 한다.
+1. 지난 작업(`MultiTouchGestureTracker`)이 이미 `GestureEndDecision.pointerCount`로 마지막 구간의 손가락 개수를 반환한다. `onGestureEnd()`에 **2손가락 탭 판정**을 추가한다: `pointerCount == 2 && !isDrag && elapsed < TAP_MAX_DURATION_MS` → 우클릭으로 판정
+2. `GestureEndDecision`을 확장해 "탭이 일어났다면 어느 버튼인지"를 표현한다 (예: `click: Boolean` 대신 `clickButton: String?` — `"left"`/`"right"`/`null`). 기존 1손가락 탭 판정 로직·임계값은 그대로 유지
+3. `TrackpadScreen.kt`의 어댑터가 이 결과에 따라 `onClick()`(좌클릭, 기존) 또는 새 `onRightClick()` 콜백을 호출하도록 분기
+4. `TrackpadViewModel.kt`에 우클릭 전송 메서드 추가 (예: `sendRightClick()` → `sendEventUseCase(TrackpadEvent.Click(button = "right"))`) — `TrackpadEvent.Click`은 이미 `button: String = "left"` 파라미터가 있으므로 도메인 모델 변경 불필요
+5. `TrackpadSurface`(Composable)가 `onRightClick: () -> Unit` 파라미터를 받아 `TrackpadScreen`에서 `viewModel::sendRightClick`으로 연결
 
 ## 구현 대상
 
-- `presentation/trackpad/TrackpadScreen.kt`의 `awaitEachGesture` 블록을 리팩터링해 포인터 개수 인식이 가능하도록 확장
-- **순수 Kotlin으로 판정 로직을 분리**할 것 (예: `presentation/trackpad/MultiTouchGestureTracker.kt` 같은 클래스/함수) — Compose의 `PointerInputScope`/`awaitPointerEvent()`에 의존하지 않는 형태로 만들어서 JUnit 단위 테스트로 검증 가능하게 한다. `TrackpadScreen.kt`는 이 트래커에 매 이벤트의 "포인터 개수 + 대표 포인터 위치 + 타임스탬프"를 넘기고, 트래커가 반환하는 결정(이동 델타 방출 여부, 탭 판정 여부, 리셋 여부)에 따라 `onMove`/`onClick`을 호출하는 얇은 어댑터 역할만 한다
-- `android-trackpad-dev` 스킬의 "제스처 감지 패턴" 절과 AGENTS.md 섹션 5(제스처 설계, 엣지 케이스)를 먼저 읽을 것
+- `presentation/trackpad/MultiTouchGestureTracker.kt`
+- `presentation/trackpad/TrackpadScreen.kt`
+- `presentation/trackpad/TrackpadViewModel.kt`
+- (도메인 모델 `TrackpadEvent.kt`, 데이터 계층 `TrackpadRepositoryImpl.kt`, 서버는 변경 불필요 — 손대지 말 것)
 
-## 테스트 (JUnit, Compose 의존성 없이 순수 로직 테스트)
+작업 착수 전 `android-trackpad-dev` 스킬을 Skill 도구로 호출하고, AGENTS.md 섹션 4(통신 프로토콜의 CLICK 우클릭 예시)와 섹션 5(제스처 설계 표의 "2손가락 탭" 행)를 읽을 것.
 
-- 1손가락 탭 → 클릭 판정
-- 1손가락 드래그 → 이동 델타 방출, 종료 시 클릭 없음 (기존 회귀 그대로 유지되는지)
-- 1→2손가락 전환 도중 → 이전 1손가락 구간이 취소되어 클릭/이동이 방출되지 않음, 2손가락 구간에서도 아무것도 방출되지 않음
-- 2→1손가락 전환(손가락 하나가 먼저 떨어짐) → 그 시점부터 새 1손가락 구간이 시작되어, 이후 움직임/시간에 따라 정상적으로 탭/드래그 판정됨
-- 2손가락만으로 시작해서 끝까지 진행 → onMove/onClick 둘 다 호출되지 않음
-- 기존 `TrackpadScreen.kt` 관련 테스트가 있다면 함께 재검토
+## 테스트 (JUnit)
+
+- `MultiTouchGestureTrackerTest`: 2손가락 탭 → `clickButton == "right"` 반환, 2손가락 드래그(이동 많음) → 우클릭 아님, 1손가락 탭은 기존처럼 `"left"` 그대로 유지(회귀)
+- `TrackpadViewModelTest`(신규 또는 기존 확장): `sendRightClick()` 호출 시 `TrackpadEvent.Click(button="right")`가 UseCase로 전달되는지
+- 기존 관련 테스트 전부 회귀 없이 통과할 것
 
 ## 참고 문서
-- `AGENTS.md` 섹션 5(제스처 설계) — 엣지 케이스 표
-- `.claude/skills/android-trackpad-dev/SKILL.md` — 제스처 감지 패턴
+- `AGENTS.md` 섹션 4/5
+- `_workspace_20260918_210759/01_android-dev_summary.md` (직전 멀티터치 기반 작업 요약)

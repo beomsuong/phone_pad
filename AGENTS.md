@@ -88,7 +88,9 @@ phone_pad/
 // 좌클릭
 {"type":"CLICK","button":"left"}
 
-// 우클릭 (Phase 2, 미구현)
+// 우클릭 — ✅ 구현됨. 새 이벤트 타입이 아니라 기존 CLICK을 button="right"로 재사용.
+// 서버 input_controller.py의 _click(button)이 Phase 1부터 "left"가 아니면 전부
+// 우클릭으로 처리하고 있어서 서버 변경은 없었다.
 {"type":"CLICK","button":"right"}
 
 // 더블클릭 (Phase 2, 미구현)
@@ -131,13 +133,14 @@ phone_pad/
 | 1손가락 드래그 | MOVE(dx, dy) | Phase 1 | ✅ 완료 |
 | 1손가락 탭 | CLICK(left) | Phase 1 | ✅ 완료 |
 | 1손가락 더블탭 | DOUBLE_CLICK | Phase 2 | ⬜ 미구현 |
-| 2손가락 탭 | CLICK(right) | Phase 2 | ⬜ 미구현 |
+| 2손가락 탭 | CLICK(right) | Phase 2 | ✅ 완료 |
 | 2손가락 상하좌우 드래그 | SCROLL(dx, dy) | Phase 2 | ⬜ 미구현 |
 | 탭홀드 + 드래그 | DRAG_START → MOVE → DRAG_END | Phase 3 | ⬜ 미구현 |
 | 3손가락 스와이프 | 가상 데스크톱 전환 등 | Phase 4 | ⬜ 미구현 |
 
 ### 엣지 케이스 (구현 시 주의)
-- 드래그 도중 손가락 개수 변화(1→2) → 현재 제스처 취소 후 새 제스처로 재시작
+- 드래그 도중 손가락 개수 변화(1→2) → 현재 제스처 취소 후 새 제스처로 재시작 (`MultiTouchGestureTracker`가 구간 단위로 구현)
+- 2손가락 탭 종료 시 "동시에 손가락 떼기"는 물리적으로 불가능해서 실제로는 `2→1→0` 순으로 이벤트가 들어옴 → 마지막 구간(짧은 1손가락 꼬리)만 보면 우클릭이 좌클릭으로 뒤집힌다. `MULTI_TOUCH_RELEASE_GRACE_MS`(50ms) 안에 끝난 "개수 감소로 시작된" 짧은 꼬리는 무시하고 직전(더 많은 손가락) 구간 기준으로 판정한다 — 이 값은 반드시 `TAP_MAX_DURATION_MS`보다 충분히 작아야 함(안 그러면 "손가락 하나 떼고 남은 손가락으로 탭"하는 정상 동작까지 삼킴)
 - 화면 밖으로 나간 손가락 → pointerInfo 변화 감지 후 DRAG_END 전송
 
 ### 감도 상수 (`GestureConfig.kt`)
@@ -146,6 +149,9 @@ MOVE_SENSITIVITY       = 1.5f   // 이동 배율
 TAP_MAX_DISTANCE_PX    = 20f    // 탭 판정 최대 이동 거리
 TAP_MAX_DURATION_MS    = 200L   // 탭 판정 최대 지속 시간
 MOVE_MIN_DISTANCE_PX   = 5f     // 커서 이동 최소 거리 (떨림 억제)
+SINGLE_POINTER_COUNT   = 1      // 1손가락 구간 판정 기준 (탭 → 좌클릭, MOVE 방출)
+DOUBLE_POINTER_COUNT   = 2      // 2손가락 구간 판정 기준 (탭 → 우클릭)
+MULTI_TOUCH_RELEASE_GRACE_MS = 50L  // 손가락 어긋나게 떼기 보정 유예 시간
 DEFAULT_PORT           = 9000
 UDP_PORT               = 9001   // MOVE 전용 UDP 포트
 SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대 시간
@@ -170,8 +176,8 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - [x] Python 서버에 UDP 소켓 추가 (TCP 세션과 매핑) — `SessionRegistry` (threading.Lock 보호)
 - [x] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제) — 카운터 기반, 양쪽 5초 창 × 3회로 판정. Android가 핸드셰이크 이후 TCP를 읽지 않던 공백이 해소되어, 서버가 세션을 회수하면 앱도 `Error`로 전환된다
 - [x] Android: `PointerInfo` 기반 멀티터치 제스처 감지 — **기반만 구축, 우클릭/스크롤 연결은 아직**. 손가락 개수 변화 시 진행 중이던 구간을 취소하고 새로 시작(AGENTS.md 섹션 5 엣지 케이스), 1손가락 구간만 MOVE/CLICK 방출, 2손가락 이상은 추적만 하고 아무것도 방출하지 않음
-- [ ] 2손가락 탭 → 우클릭 — `MultiTouchGestureTracker.onGestureEnd()`가 이미 마지막 구간의 `pointerCount`를 반환하므로, `pointerCount == 2 && !isDrag && elapsed < TAP_MAX_DURATION_MS` 분기 추가 + 서버 `button:"right"` 처리 확인이면 됨 (Android 단일 사이드로 가능해 보이나 서버 쪽 CLICK(right) 동작 확인 필요)
-- [ ] 2손가락 드래그 → 스크롤 — `MultiTouchGestureTracker.onPointerEvent()`의 2손가락 분기에서 centroid 델타를 계산은 해두고 버리는 중이라 `GestureDecision`에 `scroll` 필드만 추가하면 되지만, SCROLL은 TCP+정수 스텝(`{"type":"SCROLL","dx":0,"dy":-3}`)이라 px→스텝 변환/잔차 누적 설계와 서버 구현이 함께 필요한 **교차 경계면 작업** — 단일 사이드로 진행하지 말 것
+- [x] 2손가락 탭 → 우클릭 — Android 단일 사이드로 완료. 서버는 Phase 1부터 `button != "left"`를 전부 우클릭으로 처리하고 있어 변경 없음. 손가락을 어긋나게 떼는 실기기 특성 보정(`MULTI_TOUCH_RELEASE_GRACE_MS`) 포함
+- [ ] 2손가락 드래그 → 스크롤 — `MultiTouchGestureTracker.onPointerEvent()`의 2손가락 분기에서 centroid 델타를 계산은 해두고 버리는 중이라 `GestureDecision`에 `scroll` 필드만 추가하면 되지만, SCROLL은 TCP+정수 스텝(`{"type":"SCROLL","dx":0,"dy":-3}`)이라 px→스텝 변환/잔차 누적 설계와 서버 구현이 함께 필요한 **교차 경계면 작업** — 단일 사이드로 진행하지 말 것. 스크롤 시작 이동 임계값이 `TAP_MAX_DISTANCE_PX`(20px)보다 크면 탭/스크롤 사이 사각지대가 생기므로 함께 설계할 것
 
 **Phase 2 구현 시 핵심 파일:**
 - `data/network/TcpClient.kt` — 세션 핸드셰이크 + heartbeat 수신용 `readLine()`/`applyHeartbeatTimeout()` 완료
@@ -179,7 +185,7 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - `data/network/SessionHandshake.kt` — 완료 (세션 라인 파서)
 - `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조
 - `di/DispatcherModule.kt` — heartbeat 루프용 `@IoDispatcher` 제공(테스트에서 가상 시간 디스패처로 교체 가능)
-- `presentation/trackpad/MultiTouchGestureTracker.kt` — 완료. Compose에 의존하지 않는 순수 판정기(구간 기반 상태 머신). `TrackpadScreen.kt`는 이 트래커를 호출하는 얇은 어댑터
+- `presentation/trackpad/MultiTouchGestureTracker.kt` — 완료(좌/우클릭 판정 포함). Compose에 의존하지 않는 순수 판정기(구간 기반 상태 머신). `TrackpadScreen.kt`는 이 트래커를 호출하는 얇은 어댑터. 스크롤(`GestureDecision`에 필드 추가)이 다음 확장 지점
 - `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료
 - `pc_server/input_controller.py` — sub-pixel 잔차 누적 없음(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장
 
