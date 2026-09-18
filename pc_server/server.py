@@ -153,7 +153,13 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
                     # 마우스 명령이 아니므로 handle_event 로 넘기지 않고 즉시 ACK
                     conn.sendall(HEARTBEAT_ACK_LINE)
                     continue
-                controller.handle_event(event)
+                try:
+                    controller.handle_event(event)
+                except Exception as e:
+                    # 필드값이 깨진 이벤트 하나(예: dx/dy가 숫자로 변환 안 되는 값) 때문에
+                    # TCP 세션 전체가 끊기면 안 된다 — UDP 경로(handle_udp_packet)와
+                    # 동일하게 이 이벤트만 무시하고 계속 진행한다 (F-4)
+                    print(f"[!] handle_event failed for {event!r}: {e}")
     except Exception as e:
         print(f"[!] Error from {addr}: {e}")
     finally:

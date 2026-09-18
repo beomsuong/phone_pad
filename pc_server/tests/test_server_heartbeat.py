@@ -189,6 +189,46 @@ def test_non_dict_json_line_is_ignored_not_passed_to_handle_event():
     assert [json.loads(l)["type"] for l in conn.sent_lines()] == ["SESSION"]
 
 
+def test_handle_event_error_does_not_drop_the_connection():
+    # F-4: dx/dy가 숫자로 변환되지 않는 값(예: "abc")이면 InputController.handle_event가
+    # float()에서 ValueError를 던진다. 예전에는 이게 handle_client의 바깥 except까지
+    # 전파되어 finally에서 세션을 통째로 끊었다 — 이벤트 하나 때문에 TCP 연결 전체가
+    # 죽으면 안 되므로(UDP 경로는 이미 이렇게 격리돼 있음), 이 이벤트만 무시하고
+    # 이후 이벤트는 계속 처리되어야 한다.
+    conn = FakeConn(chunks=[
+        b'{"type":"MOVE","dx":"abc","dy":0}\n',
+        b'{"type":"SCROLL","dx":"abc","dy":0}\n',
+        b'{"type":"CLICK","button":"left"}\n',
+    ])
+    controller = make_controller()  # 실제 InputController
+
+    with patch.object(controller, "_click") as mock_click, \
+         patch.object(controller, "_move") as mock_move, \
+         patch.object(controller, "_scroll") as mock_scroll:
+        run_client(conn, controller=controller)
+
+    mock_move.assert_not_called()
+    mock_scroll.assert_not_called()
+    mock_click.assert_called_once_with("left")
+    assert [json.loads(l)["type"] for l in conn.sent_lines()] == ["SESSION"]
+
+
+def test_handle_client_processes_android_scroll_wire_literal():
+    # O-2: Android 테스트는 문자열만, 서버 테스트는 dict만 고정하고 있어 그 사이(문자열 →
+    # json.loads → dict) 연결 고리를 검증하는 테스트가 없었다. TrackpadRepositoryImplTest.kt의
+    # "Scroll 이벤트는 정수 스텝을 담아 TCP로 전송된다" 테스트가 고정한 리터럴을 그대로
+    # 하드코딩해서 handle_client의 실제 파싱 경로(버퍼 분리 → json.loads → handle_event)에
+    # 통과시킨다 — 한쪽이 키 이름/철자를 바꿔도 이 테스트가 잡아낸다.
+    android_wire_literal = b'{"type":"SCROLL","dx":0,"dy":-3}\n'
+    conn = FakeConn(chunks=[android_wire_literal])
+    controller = make_controller()
+
+    with patch.object(controller, "_scroll") as mock_scroll:
+        run_client(conn, controller=controller)
+
+    mock_scroll.assert_called_once_with(0, -3)
+
+
 # --------------------------------------------------------------------------
 # 미응답 카운트 / 연결 해제
 # --------------------------------------------------------------------------
