@@ -45,6 +45,8 @@ class InputController:
                 self._move(dx, dy)
         elif t == "CLICK":
             self._click(event.get("button", "left"))
+        elif t == "DOUBLE_CLICK":
+            self._double_click(event.get("button", "left"))
         elif t == "SCROLL":
             # dx/dy 는 정수 스크롤 스텝(휠 노치 개수). 픽셀 값이 아니다.
             # Android 가 Int 로 보내지만 JSON 파싱 결과가 float/문자열일 수 있어
@@ -114,3 +116,30 @@ class InputController:
             ),
         )
         ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+
+    def _double_click(self, button: str):
+        """더블클릭: down-up-down-up 4개 INPUT 을 SendInput 1회로 원자적으로 전송.
+
+        `_click` 을 두 번 호출하면 SendInput 이 두 번 나가고 그 사이에 다른
+        입력(특히 MOVE)이 끼어들 수 있다. Windows 의 네이티브 더블클릭 판정은
+        두 클릭이 좁은 사각형(기본 4px) 안에서 일어나야 성립하므로, 커서를
+        움직이는 요소가 전혀 없는 4-INPUT 시퀀스를 한 번에 밀어넣는다.
+
+        클릭 간 간격(delay)을 따로 주지 않는 이유: SendInput 은 큐에 동시 주입
+        하므로 두 클릭의 시각차가 사실상 0이며, 이는 시스템 더블클릭 시간
+        (GetDoubleClickTime, 기본 500ms) 안에 항상 들어간다.
+        """
+        down_flag = MOUSEEVENTF_LEFTDOWN if button == "left" else MOUSEEVENTF_RIGHTDOWN
+        up_flag = MOUSEEVENTF_LEFTUP if button == "left" else MOUSEEVENTF_RIGHTUP
+
+        flags = (down_flag, up_flag, down_flag, up_flag)
+        inputs = (INPUT * 4)(
+            *[
+                INPUT(
+                    type=INPUT_MOUSE,
+                    _input=_INPUTunion(mi=MOUSEINPUT(dwFlags=flag)),
+                )
+                for flag in flags
+            ]
+        )
+        ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(INPUT))
