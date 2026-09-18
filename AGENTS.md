@@ -96,7 +96,9 @@ phone_pad/
 // 더블클릭 (Phase 2, 미구현)
 {"type":"DOUBLE_CLICK","button":"left"}
 
-// 스크롤 (Phase 2, 미구현)
+// 스크롤 — ✅ 구현됨. dx/dy는 픽셀이 아니라 정수 휠 스텝(노치). px→스텝 변환과 잔차
+// 누적은 Android(MultiTouchGestureTracker)가 끝낸 뒤 보낸다. 서버는 steps×WHEEL_DELTA(120)만
+// 곱한다. 부호: dy 양수 = 손가락이 아래로, dx 양수 = 오른쪽. session 필드 없음.
 {"type":"SCROLL","dx":0,"dy":-3}
 
 // 드래그 (Phase 3, 미구현)
@@ -134,13 +136,14 @@ phone_pad/
 | 1손가락 탭 | CLICK(left) | Phase 1 | ✅ 완료 |
 | 1손가락 더블탭 | DOUBLE_CLICK | Phase 2 | ⬜ 미구현 |
 | 2손가락 탭 | CLICK(right) | Phase 2 | ✅ 완료 |
-| 2손가락 상하좌우 드래그 | SCROLL(dx, dy) | Phase 2 | ⬜ 미구현 |
+| 2손가락 상하좌우 드래그 | SCROLL(dx, dy) | Phase 2 | ✅ 완료 |
 | 탭홀드 + 드래그 | DRAG_START → MOVE → DRAG_END | Phase 3 | ⬜ 미구현 |
 | 3손가락 스와이프 | 가상 데스크톱 전환 등 | Phase 4 | ⬜ 미구현 |
 
 ### 엣지 케이스 (구현 시 주의)
 - 드래그 도중 손가락 개수 변화(1→2) → 현재 제스처 취소 후 새 제스처로 재시작 (`MultiTouchGestureTracker`가 구간 단위로 구현)
 - 2손가락 탭 종료 시 "동시에 손가락 떼기"는 물리적으로 불가능해서 실제로는 `2→1→0` 순으로 이벤트가 들어옴 → 마지막 구간(짧은 1손가락 꼬리)만 보면 우클릭이 좌클릭으로 뒤집힌다. `MULTI_TOUCH_RELEASE_GRACE_MS`(50ms) 안에 끝난 "개수 감소로 시작된" 짧은 꼬리는 무시하고 직전(더 많은 손가락) 구간 기준으로 판정한다 — 이 값은 반드시 `TAP_MAX_DURATION_MS`보다 충분히 작아야 함(안 그러면 "손가락 하나 떼고 남은 손가락으로 탭"하는 정상 동작까지 삼킴)
+- **스크롤 뒤 클릭 오발동 방지**: 2손가락 구간은 `isDrag`(탭 한계 초과) 이후부터만 SCROLL을 방출하며, `isDrag`는 구간 내내 sticky해서 우클릭 배제 조건과 그대로 겹치므로 탭/스크롤 사각지대가 없다. 단, **직전 구간이 드래그(스크롤)였다면 그 뒤에 붙는 어떤 짧은 꼬리도 탭으로 재해석하지 않는다** — 꼬리 보정(`MULTI_TOUCH_RELEASE_GRACE_MS`)의 유예 시간 안이든 밖이든 무조건 클릭 없음. 이게 없으면 "스크롤하고 손을 뗐을 뿐인데 커서 위치가 클릭되는" 사고가 난다
 - 화면 밖으로 나간 손가락 → pointerInfo 변화 감지 후 DRAG_END 전송
 
 ### 감도 상수 (`GestureConfig.kt`)
@@ -152,6 +155,7 @@ MOVE_MIN_DISTANCE_PX   = 5f     // 커서 이동 최소 거리 (떨림 억제)
 SINGLE_POINTER_COUNT   = 1      // 1손가락 구간 판정 기준 (탭 → 좌클릭, MOVE 방출)
 DOUBLE_POINTER_COUNT   = 2      // 2손가락 구간 판정 기준 (탭 → 우클릭)
 MULTI_TOUCH_RELEASE_GRACE_MS = 50L  // 손가락 어긋나게 떼기 보정 유예 시간
+SCROLL_SENSITIVITY_PX_PER_STEP = 40f  // 휠 1스텝에 해당하는 centroid 이동 거리. 반드시 TAP_MAX_DISTANCE_PX보다 커야 함(사각지대 방지)
 DEFAULT_PORT           = 9000
 UDP_PORT               = 9001   // MOVE 전용 UDP 포트
 SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대 시간
@@ -171,23 +175,23 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - [x] Python 서버: TCP 수신 + SendInput 커서/클릭 제어
 - [x] Android 연결 UI (IP 입력 → 연결 중 → 트랙패드 서페이스)
 
-### 🔶 Phase 2 — 하이브리드 통신 + 추가 제스처 (일부 완료)
+### 🔶 Phase 2 — 하이브리드 통신 + 추가 제스처 (남은 항목은 더블탭 하나)
 - [x] MOVE를 UDP(9001)로 분리, 세션 토큰 기반 매칭
 - [x] Python 서버에 UDP 소켓 추가 (TCP 세션과 매핑) — `SessionRegistry` (threading.Lock 보호)
 - [x] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제) — 카운터 기반, 양쪽 5초 창 × 3회로 판정. Android가 핸드셰이크 이후 TCP를 읽지 않던 공백이 해소되어, 서버가 세션을 회수하면 앱도 `Error`로 전환된다
-- [x] Android: `PointerInfo` 기반 멀티터치 제스처 감지 — **기반만 구축, 우클릭/스크롤 연결은 아직**. 손가락 개수 변화 시 진행 중이던 구간을 취소하고 새로 시작(AGENTS.md 섹션 5 엣지 케이스), 1손가락 구간만 MOVE/CLICK 방출, 2손가락 이상은 추적만 하고 아무것도 방출하지 않음
+- [x] Android: `PointerInfo` 기반 멀티터치 제스처 감지 — 손가락 개수 변화 시 진행 중이던 구간을 취소하고 새로 시작(AGENTS.md 섹션 5 엣지 케이스)
 - [x] 2손가락 탭 → 우클릭 — Android 단일 사이드로 완료. 서버는 Phase 1부터 `button != "left"`를 전부 우클릭으로 처리하고 있어 변경 없음. 손가락을 어긋나게 떼는 실기기 특성 보정(`MULTI_TOUCH_RELEASE_GRACE_MS`) 포함
-- [ ] 2손가락 드래그 → 스크롤 — `MultiTouchGestureTracker.onPointerEvent()`의 2손가락 분기에서 centroid 델타를 계산은 해두고 버리는 중이라 `GestureDecision`에 `scroll` 필드만 추가하면 되지만, SCROLL은 TCP+정수 스텝(`{"type":"SCROLL","dx":0,"dy":-3}`)이라 px→스텝 변환/잔차 누적 설계와 서버 구현이 함께 필요한 **교차 경계면 작업** — 단일 사이드로 진행하지 말 것. 스크롤 시작 이동 임계값이 `TAP_MAX_DISTANCE_PX`(20px)보다 크면 탭/스크롤 사이 사각지대가 생기므로 함께 설계할 것
+- [x] 2손가락 드래그 → 스크롤 — TCP + 정수 스텝. px→스텝 변환과 잔차 누적은 Android가 전담하고 서버는 `steps × WHEEL_DELTA(120)`만 수행. 감도 40px/스텝(탭 한계 20px의 2배로 사각지대 제거)
 
 **Phase 2 구현 시 핵심 파일:**
 - `data/network/TcpClient.kt` — 세션 핸드셰이크 + heartbeat 수신용 `readLine()`/`applyHeartbeatTimeout()` 완료
 - `data/network/UdpClient.kt` — 완료
 - `data/network/SessionHandshake.kt` — 완료 (세션 라인 파서)
-- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조
+- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조. MOVE/SCROLL은 고빈도라 전송 실패 시 연결 상태를 덮어쓰지 않는다(CLICK은 저빈도라 그대로 Error로 알림)
 - `di/DispatcherModule.kt` — heartbeat 루프용 `@IoDispatcher` 제공(테스트에서 가상 시간 디스패처로 교체 가능)
-- `presentation/trackpad/MultiTouchGestureTracker.kt` — 완료(좌/우클릭 판정 포함). Compose에 의존하지 않는 순수 판정기(구간 기반 상태 머신). `TrackpadScreen.kt`는 이 트래커를 호출하는 얇은 어댑터. 스크롤(`GestureDecision`에 필드 추가)이 다음 확장 지점
-- `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료
-- `pc_server/input_controller.py` — sub-pixel 잔차 누적 없음(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장
+- `presentation/trackpad/MultiTouchGestureTracker.kt` — 좌/우클릭 + 스크롤 판정까지 완료. Compose에 의존하지 않는 순수 판정기(구간 기반 상태 머신). `TrackpadScreen.kt`는 이 트래커를 호출하는 얇은 어댑터. 다음 확장 지점은 더블탭/탭홀드 드래그
+- `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료. TCP 이벤트 처리(`handle_event` 호출)는 이벤트 단위로 예외를 격리해 필드값이 깨진 이벤트 하나가 세션 전체를 끊지 않는다
+- `pc_server/input_controller.py` — `_move`에 한정된 sub-pixel 잔차 누적 이슈(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장. SCROLL은 Android가 잔차를 완전히 처리해 보내므로 해당 없음
 
 ### ⬜ Phase 3 — 제스처 확장
 - [ ] 1손가락 더블탭 → DOUBLE_CLICK (타이머 기반 판정)
@@ -222,7 +226,7 @@ Android                                          PC Server
    |<-- {"type":"SESSION","session":"<32hex>"} ---   |   ✅ 구현됨 (연결 직후 첫 줄)
    |                                                 |
    |-- TCP: CLICK -------------------------------->  |   ✅ 구현됨
-   |-- TCP: SCROLL -------------------------------->  |   (Phase 2 예정, 미구현)
+   |-- TCP: SCROLL -------------------------------->  |   ✅ 구현됨 (정수 스텝, session 없음)
    |-- UDP: {session, type:MOVE, dx, dy} --------->  |   ✅ 구현됨
    |                                                 |
    |-- TCP: HEARTBEAT (첫 전송은 연결 후 5s) ----->  |   ✅ 구현됨 (이후 5초 주기)
@@ -294,6 +298,9 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | PC 서버 배포 | PyInstaller — Phase 4에서 |
 | PIN 인증 | Phase 5 선택 사항 — UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않아 동일 WiFi 내 스푸핑이 가능함. PIN 인증 설계 시 함께 재검토 |
 | 다중 기기 연결 | 정책 미정 — 서버는 현재 활성 세션 전부를 동시에 처리 가능한 구조(집합 기반)라, 여러 기기가 동시에 연결하면 전부 커서를 움직일 수 있음 |
-| sub-pixel 이동 정밀도 | `InputController`가 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음 — 별도 이슈로 개선 검토 |
+| sub-pixel 이동 정밀도 | `InputController._move`에 한정된 이슈 — 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음. SCROLL은 Android가 잔차를 완전히 처리해 보내므로 해당 없음 — 별도 이슈로 개선 검토 |
 | heartbeat 리셋 비대칭 | 서버는 CLICK 등 어떤 상향 데이터로도 미응답 카운터가 리셋되지만, 서버→클라이언트 하향 트래픽은 ACK뿐이라 Android 쪽은 사실상 ACK만이 유일한 리셋 수단. 한쪽 방향만 끊기는 비대칭 시나리오가 가능하므로 Phase 4 재연결 설계 시 전제로 고려 |
 | Android 절전/도즈 환경의 heartbeat | 화면 꺼짐·도즈·Wi-Fi 절전으로 5초 주기 전송이 지연되면 서버가 먼저 15초 타임아웃으로 끊는 오탐 가능성 — 실기기 미검증, Phase 4 재연결/wake lock 검토 시 함께 다룰 것 |
+| 스크롤 방향 규약 | 현재는 "자연 스크롤"(macOS 기본, 손가락과 콘텐츠가 같은 방향)로 구현됨 — Windows 정밀 터치패드 기본값("아래로 움직이면 아래로 스크롤")과는 반대일 수 있음. 실기기 미검증. 뒤집을 경우 `input_controller.py`의 `_scroll()` 한 곳만 수정하면 됨(Android는 절대 동시 수정 금지 — 두 사이드가 같이 뒤집으면 원위치됨) |
+| SCROLL_SENSITIVITY_PX_PER_STEP 체감 | 기본값 40px/스텝은 계산 근거(휠 1노치≈3줄, 400px 스와이프≈10스텝≈한 화면)는 있으나 실기기 미검증 — Phase 3 감도 설정 UI 작업 시 함께 튜닝 |
+| 축 잠금(axis lock) 없음 | 2손가락 대각선 드래그 시 수직/수평 휠이 동시에 나감 — 실기기에서 거슬리면 별도 이슈로 축 고정 로직 검토 |
