@@ -33,7 +33,8 @@ phone_pad/
 │       ├── di/                AppModule.kt, DispatcherModule.kt
 │       └── presentation/
 │           ├── util/          GestureConfig.kt
-│           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt
+│           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt,
+│                               MultiTouchGestureTracker.kt
 └── pc_server/                 ← Windows Python 서버
     ├── server.py
     ├── input_controller.py
@@ -168,9 +169,9 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - [x] MOVE를 UDP(9001)로 분리, 세션 토큰 기반 매칭
 - [x] Python 서버에 UDP 소켓 추가 (TCP 세션과 매핑) — `SessionRegistry` (threading.Lock 보호)
 - [x] TCP heartbeat (주기: 5초, 미응답 3회 → 연결 해제) — 카운터 기반, 양쪽 5초 창 × 3회로 판정. Android가 핸드셰이크 이후 TCP를 읽지 않던 공백이 해소되어, 서버가 세션을 회수하면 앱도 `Error`로 전환된다
-- [ ] 2손가락 탭 → 우클릭
-- [ ] 2손가락 드래그 → 스크롤
-- [ ] Android: `PointerInfo` 기반 멀티터치 제스처 감지
+- [x] Android: `PointerInfo` 기반 멀티터치 제스처 감지 — **기반만 구축, 우클릭/스크롤 연결은 아직**. 손가락 개수 변화 시 진행 중이던 구간을 취소하고 새로 시작(AGENTS.md 섹션 5 엣지 케이스), 1손가락 구간만 MOVE/CLICK 방출, 2손가락 이상은 추적만 하고 아무것도 방출하지 않음
+- [ ] 2손가락 탭 → 우클릭 — `MultiTouchGestureTracker.onGestureEnd()`가 이미 마지막 구간의 `pointerCount`를 반환하므로, `pointerCount == 2 && !isDrag && elapsed < TAP_MAX_DURATION_MS` 분기 추가 + 서버 `button:"right"` 처리 확인이면 됨 (Android 단일 사이드로 가능해 보이나 서버 쪽 CLICK(right) 동작 확인 필요)
+- [ ] 2손가락 드래그 → 스크롤 — `MultiTouchGestureTracker.onPointerEvent()`의 2손가락 분기에서 centroid 델타를 계산은 해두고 버리는 중이라 `GestureDecision`에 `scroll` 필드만 추가하면 되지만, SCROLL은 TCP+정수 스텝(`{"type":"SCROLL","dx":0,"dy":-3}`)이라 px→스텝 변환/잔차 누적 설계와 서버 구현이 함께 필요한 **교차 경계면 작업** — 단일 사이드로 진행하지 말 것
 
 **Phase 2 구현 시 핵심 파일:**
 - `data/network/TcpClient.kt` — 세션 핸드셰이크 + heartbeat 수신용 `readLine()`/`applyHeartbeatTimeout()` 완료
@@ -178,7 +179,7 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - `data/network/SessionHandshake.kt` — 완료 (세션 라인 파서)
 - `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조
 - `di/DispatcherModule.kt` — heartbeat 루프용 `@IoDispatcher` 제공(테스트에서 가상 시간 디스패처로 교체 가능)
-- `presentation/trackpad/TrackpadScreen.kt` — 멀티터치 제스처 감지 (미착수)
+- `presentation/trackpad/MultiTouchGestureTracker.kt` — 완료. Compose에 의존하지 않는 순수 판정기(구간 기반 상태 머신). `TrackpadScreen.kt`는 이 트래커를 호출하는 얇은 어댑터
 - `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료
 - `pc_server/input_controller.py` — sub-pixel 잔차 누적 없음(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장
 

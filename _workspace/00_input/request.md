@@ -1,42 +1,35 @@
-# 요청: TCP Heartbeat 구현 (AGENTS.md Phase 2)
+# 요청: PointerInfo 기반 멀티터치 제스처 감지 기반 구축 (AGENTS.md Phase 2)
 
-**범위 판단:** 교차 경계면 (새 이벤트 타입 HEARTBEAT/HEARTBEAT_ACK 추가 + 연결 유지/해제 로직 변경)
-**실행 경로:** 리더가 스펙 사전 확정 → android-dev/server-dev 병렬 호출 → protocol-qa 사후 검증 (TeamCreate 미사용, `.claude/skills/phone-pad-orchestrator/SKILL.md` Phase 2B 참조)
+**범위 판단:** 단일 사이드 (Android만) — 새 이벤트 타입이나 프로토콜 필드를 추가하지 않는다. 순수하게 제스처 감지 계층의 내부 구조를 확장하는 작업이며, 서버(pc_server)는 전혀 건드리지 않는다.
+**실행 경로:** Phase 2A(서브 에이전트 1명, android-dev). protocol-qa는 생략 — 검증할 경계면이 없다.
 
-## 배경
-지난 MOVE UDP 분리 작업의 QA 리포트(`_workspace/02_protocol-qa_report.md`)에서 F-1으로 지적된 문제: Android가 세션 핸드셰이크 이후 TCP를 전혀 읽지 않아서, 서버가 세션을 회수해도(재시작, Wi-Fi 이탈 등) 앱은 `Connected` 상태로 남고 커서만 조용히 멈춘다. 이번 heartbeat 구현이 이 문제를 직접 해소한다 — Android가 TCP 읽기 루프를 갖게 되므로 서버 쪽 이상을 감지할 수 있다.
+## 배경 및 목표
+
+현재 `TrackpadScreen.kt`의 제스처 루프는 `event.changes.firstOrNull()`로 **첫 번째 포인터만** 보고, 두 번째 손가락이 닿아도 완전히 무시한다. 이번 작업은 향후 "2손가락 탭 → 우클릭", "2손가락 드래그 → 스크롤"을 얹을 수 있는 **기반**을 만드는 것이다 — 이번 작업 자체에서는 2손가락에 대해 새 이벤트를 발생시키지 않는다(우클릭/스크롤은 다음 작업).
 
 ## 확정 스펙
 
-### 상수
-- Android `GestureConfig.kt`: `HEARTBEAT_INTERVAL_MS = 5000L`, `HEARTBEAT_MISS_LIMIT = 3`
-- Server `server.py`: `HEARTBEAT_INTERVAL_S = 5.0`, `HEARTBEAT_MISS_LIMIT = 3`
+1. **동시에 눌린 포인터 개수를 추적**한다 (`event.changes.count { it.pressed }`).
+2. **손가락 개수가 바뀌면 진행 중이던 제스처 분류를 취소하고 그 시점부터 새로 시작**한다 (AGENTS.md 섹션 5 엣지 케이스: "드래그 도중 손가락 개수 변화(1→2) → 현재 제스처 취소 후 새 제스처로 재시작"). 즉 시작 위치/시작 시각/드래그 여부를 그 시점 값으로 리셋한다.
+3. **1손가락 구간**: 기존 동작을 정확히 그대로 유지한다 — `MOVE_MIN_DISTANCE_PX` 초과 이동 시 `onMove(dx * MOVE_SENSITIVITY, dy * MOVE_SENSITIVITY)` 호출, `TAP_MAX_DISTANCE_PX` 초과 이동 시 드래그로 표시, 제스처 종료 시 드래그가 아니고 `TAP_MAX_DURATION_MS` 이내면 `onClick()` 호출. **이 회귀는 절대 깨지면 안 된다.**
+4. **2손가락(이상) 구간**: `onMove`/`onClick`을 전혀 호출하지 않는다 (foundation만 — 다음 작업에서 우클릭/스크롤 콜백을 여기에 연결할 예정). 시작 위치/시각은 내부적으로 계속 추적해도 되지만 외부로 아무것도 방출하지 않는다.
+5. 제스처가 완전히 끝났을 때(모든 손가락이 떨어졌을 때) 분류는 **마지막(가장 최근) 구간이 몇 손가락이었는지**를 기준으로 한다 — 예: 2손가락으로 시작해서 한 손가락이 먼저 떨어져 1손가락 구간으로 전환된 뒤 짧게 탭처럼 끝나면, 그 마지막 1손가락 구간 기준으로 탭 판정을 한다.
 
-### 와이어 포맷 (TCP 9000, 기존 newline-delimited JSON 그대로)
-- 클라이언트 → 서버: `{"type":"HEARTBEAT"}` — 연결된 동안 5000ms(`HEARTBEAT_INTERVAL_MS`)마다 전송
-- 서버 → 클라이언트: `{"type":"HEARTBEAT_ACK"}` — HEARTBEAT 줄을 받으면 즉시 응답. **`InputController.handle_event`로 넘기지 않는다** (마우스 명령이 아님)
+## 구현 대상
 
-### 연결 해제 판정 방식 (양쪽 대칭 — "카운터 기반", 둘 다 동일한 원리)
-- **서버**: 핸드셰이크 직후 `conn.settimeout(HEARTBEAT_INTERVAL_S)`를 건다. `recv()`가 `socket.timeout`을 던지면 미응답 카운트 +1, **어떤 데이터든(꼭 HEARTBEAT가 아니어도) 성공적으로 받으면 카운트를 0으로 리셋**. 카운트가 `HEARTBEAT_MISS_LIMIT`(3)에 도달하면 로그 남기고 연결을 끊는다 (기존 `finally`의 세션 회수/소켓 종료 재사용).
-- **클라이언트(Android)**: 핸드셰이크 성공 직후 소켓 `soTimeout`을 `HEARTBEAT_INTERVAL_MS`로 바꾼다. 이후 읽기 루프에서 한 줄 읽기를 반복 시도 — 타임아웃이면 미응답 카운트 +1, 아무 줄이나 성공적으로 읽으면 카운트를 0으로 리셋. 카운트가 3에 도달하면 `ConnectionState.Error("Heartbeat timeout")`로 전환하고 정리(cleanUp). EOF나 다른 IOException을 만나면(서버가 먼저 끊은 경우) 카운트를 기다리지 않고 즉시 `ConnectionState.Error("Connection lost")`로 전환한다.
-- 두 판정 모두 "5초 간격 × 3회 무응답 ≈ 15초"라는 AGENTS.md 스펙을 만족하되, 구현은 카운터 기반으로 통일한다.
+- `presentation/trackpad/TrackpadScreen.kt`의 `awaitEachGesture` 블록을 리팩터링해 포인터 개수 인식이 가능하도록 확장
+- **순수 Kotlin으로 판정 로직을 분리**할 것 (예: `presentation/trackpad/MultiTouchGestureTracker.kt` 같은 클래스/함수) — Compose의 `PointerInputScope`/`awaitPointerEvent()`에 의존하지 않는 형태로 만들어서 JUnit 단위 테스트로 검증 가능하게 한다. `TrackpadScreen.kt`는 이 트래커에 매 이벤트의 "포인터 개수 + 대표 포인터 위치 + 타임스탬프"를 넘기고, 트래커가 반환하는 결정(이동 델타 방출 여부, 탭 판정 여부, 리셋 여부)에 따라 `onMove`/`onClick`을 호출하는 얇은 어댑터 역할만 한다
+- `android-trackpad-dev` 스킬의 "제스처 감지 패턴" 절과 AGENTS.md 섹션 5(제스처 설계, 엣지 케이스)를 먼저 읽을 것
 
-## Android 변경 대상
-- `presentation/util/GestureConfig.kt`: `HEARTBEAT_INTERVAL_MS`, `HEARTBEAT_MISS_LIMIT` 상수 추가
-- `data/network/TcpClient.kt`:
-  - 핸드셰이크 성공 후 소켓 `soTimeout`을 `HEARTBEAT_INTERVAL_MS`로 설정하는 기능 추가 (현재는 핸드셰이크용 3000ms만 있고 이후 원래 타임아웃으로 되돌림 — 이제는 heartbeat 타임아웃으로 바꿔야 함)
-  - `suspend fun readLine(): String?` 같은, 커넥션 유지 중 한 줄씩 읽을 수 있는 함수 노출 (`SocketTimeoutException`은 호출자가 판단하도록 그대로 던진다)
-- `data/repository/TrackpadRepositoryImpl.kt`:
-  - connect() 성공 시 이 리포지토리가 소유하는 코루틴 스코프에서 두 개의 루프를 시작: (1) 5초마다 HEARTBEAT 전송하는 sender, (2) 위에서 정의한 카운터 기반 판정을 수행하는 reader/watchdog
-  - disconnect()/재연결 시작 시(F-2 패턴과 동일하게) 반드시 이전 루프를 취소하고 나서 진행 — 옛 루프가 새 연결에 대해 계속 돌면 안 됨
-  - 두 루프 다 예외를 자체적으로 처리해서 앱을 죽이지 않아야 함
-- 테스트: 5초 간격 전송(가상 시간), ACK 수신 시 카운터 리셋, 3회 연속 타임아웃 시 Error+cleanUp, EOF 시 즉시 Error, 재연결 시 이전 루프가 취소되는지
+## 테스트 (JUnit, Compose 의존성 없이 순수 로직 테스트)
 
-## Server(pc_server) 변경 대상
-- `server.py`: `HEARTBEAT_INTERVAL_S`, `HEARTBEAT_MISS_LIMIT` 상수 추가. `handle_client`에서 핸드셰이크 직후 `conn.settimeout(HEARTBEAT_INTERVAL_S)` 설정. 메인 수신 루프에서 `socket.timeout`을 잡아 미응답 카운트 관리(3회 시 연결 종료), 정상 수신 시 카운트 리셋. 파싱된 이벤트의 `type`이 `"HEARTBEAT"`이면 `handle_event`로 넘기지 않고 `{"type":"HEARTBEAT_ACK"}\n`을 즉시 응답
-- 기존 buffer/newline 파싱 로직과 `input_controller.py`는 최대한 그대로 유지 (HEARTBEAT는 `handle_client` 레벨에서 가로챈다)
-- 테스트: HEARTBEAT 수신 시 ACK 응답 + handle_event 미호출, 연속 3회 timeout 시 세션 회수/소켓 종료, 중간에 정상 데이터가 오면 카운트가 리셋되어 3회를 못 채우면 연결 유지
+- 1손가락 탭 → 클릭 판정
+- 1손가락 드래그 → 이동 델타 방출, 종료 시 클릭 없음 (기존 회귀 그대로 유지되는지)
+- 1→2손가락 전환 도중 → 이전 1손가락 구간이 취소되어 클릭/이동이 방출되지 않음, 2손가락 구간에서도 아무것도 방출되지 않음
+- 2→1손가락 전환(손가락 하나가 먼저 떨어짐) → 그 시점부터 새 1손가락 구간이 시작되어, 이후 움직임/시간에 따라 정상적으로 탭/드래그 판정됨
+- 2손가락만으로 시작해서 끝까지 진행 → onMove/onClick 둘 다 호출되지 않음
+- 기존 `TrackpadScreen.kt` 관련 테스트가 있다면 함께 재검토
 
 ## 참고 문서
-- `AGENTS.md` 섹션 4(통신 프로토콜), 섹션 6(로드맵 Phase 2), 섹션 7(세션 흐름 다이어그램) — 구현 후 갱신 필요
-- 지난 QA 리포트 F-1: `_workspace/02_protocol-qa_report.md`
+- `AGENTS.md` 섹션 5(제스처 설계) — 엣지 케이스 표
+- `.claude/skills/android-trackpad-dev/SKILL.md` — 제스처 감지 패턴

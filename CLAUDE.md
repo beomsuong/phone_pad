@@ -15,3 +15,4 @@
 | 2026-09-17 | MOVE 이벤트 UDP(9001) 분리 + TCP 세션 핸드셰이크 구현 (android-dev/server-dev 병렬 + protocol-qa 검증, F-2 재연결 토큰 누수 수정) | phone_pad_app, pc_server, AGENTS.md | AGENTS.md Phase 2 로드맵 항목 진행 |
 | 2026-09-17 | TCP heartbeat 구현 (카운터 기반 5초×3회 판정, android-dev/server-dev 병렬 + protocol-qa 검증). QA 발견 F-3(겹친 connect() 경합)을 Mutex 직렬화로 수정, F-2(Move 실패가 Error 덮어씀)·F-4(비원자적 필드)·서버 F-1(정상 연결 오탐 로그)·F-5(TCP 경로 non-dict 크래시 방지) 수정 | phone_pad_app, pc_server, AGENTS.md | AGENTS.md Phase 2 로드맵 항목 진행, 지난 F-1(세션 회수를 앱이 모름) 해소 |
 | 2026-09-18 | Phase 5(정리)에 "커밋은 파트별로 나눈다" 규칙 명문화 — `feat(android):`/`feat(server):`/`docs(harness):` 3개로 분리, 실제 변경 없는 파트는 생략. AGENTS.md 섹션 9에도 동일 컨벤션 추가 | skills/phone-pad-orchestrator, AGENTS.md | 사용자가 매번 "나눠서 커밋해줘"를 반복 요청하지 않도록 기본 동작으로 고정해달라는 피드백 |
+| 2026-09-18 | PointerInfo 기반 멀티터치 제스처 감지 기반 구축 (Android 단일 사이드, `MultiTouchGestureTracker` 순수 Kotlin 판정기 도입). 우클릭/스크롤 연결은 후속 작업 | phone_pad_app, AGENTS.md | AGENTS.md Phase 2 로드맵 항목 진행. 2손가락 탭/드래그의 선행 작업 |
