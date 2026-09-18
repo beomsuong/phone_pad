@@ -1,0 +1,95 @@
+package com.example.phone_pad_app.presentation.trackpad
+
+import com.example.phone_pad_app.domain.model.ConnectionState
+import com.example.phone_pad_app.domain.model.TrackpadEvent
+import com.example.phone_pad_app.domain.repository.TrackpadRepository
+import com.example.phone_pad_app.domain.usecase.SendEventUseCase
+import io.mockk.coVerify
+import io.mockk.every
+import io.mockk.mockk
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Before
+import org.junit.Test
+
+/**
+ * ViewModel은 네트워크 계층을 직접 호출하지 않고 [SendEventUseCase]에만 의존한다.
+ * 여기서는 "어떤 제스처 콜백이 어떤 [TrackpadEvent]로 번역되는지"만 검증한다 —
+ * 채널(TCP/UDP) 선택은 repository 책임이므로 이 계층의 관심사가 아니다.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+class TrackpadViewModelTest {
+
+    private val dispatcher = UnconfinedTestDispatcher()
+
+    private val repository: TrackpadRepository = mockk(relaxed = true)
+    private val sendEventUseCase: SendEventUseCase = mockk(relaxed = true)
+
+    private lateinit var viewModel: TrackpadViewModel
+
+    @Before
+    fun setUp() {
+        Dispatchers.setMain(dispatcher)
+        every { repository.connectionState } returns MutableStateFlow(ConnectionState.Disconnected)
+        viewModel = TrackpadViewModel(sendEventUseCase, repository)
+    }
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
+
+    @Test
+    fun `sendRightClick은 button이 right인 CLICK 이벤트를 UseCase로 보낸다`() {
+        viewModel.sendRightClick()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Click(button = "right")) }
+    }
+
+    @Test
+    fun `sendClick은 여전히 button이 left인 CLICK 이벤트를 보낸다`() {
+        viewModel.sendClick()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Click(button = "left")) }
+        coVerify(exactly = 0) { sendEventUseCase(TrackpadEvent.Click(button = "right")) }
+    }
+
+    @Test
+    fun `좌우 클릭은 서로 다른 이벤트로 구분되어 전달된다`() {
+        viewModel.sendClick()
+        viewModel.sendRightClick()
+        viewModel.sendRightClick()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Click(button = "left")) }
+        coVerify(exactly = 2) { sendEventUseCase(TrackpadEvent.Click(button = "right")) }
+    }
+
+    @Test
+    fun `sendMove는 MOVE 이벤트를 보낸다 - 클릭 경로와 섞이지 않는다`() {
+        viewModel.sendMove(1.5f, -2f)
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Move(1.5f, -2f)) }
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Click::class)) }
+    }
+
+    @Test
+    fun `제스처 판정기가 돌려주는 버튼 문자열과 도메인 이벤트의 button 값이 같다`() {
+        // MultiTouchGestureTracker의 판정 결과 → TrackpadScreen 분기 → ViewModel 전송까지
+        // 같은 어휘를 쓰는지 고정한다 (AGENTS.md 섹션 4)
+        assertEquals(
+            MultiTouchGestureTracker.BUTTON_LEFT,
+            TrackpadEvent.Click(MultiTouchGestureTracker.BUTTON_LEFT).button,
+        )
+        assertEquals(
+            MultiTouchGestureTracker.BUTTON_RIGHT,
+            TrackpadEvent.Click(MultiTouchGestureTracker.BUTTON_RIGHT).button,
+        )
+        assertEquals("left", TrackpadEvent.Click().button)
+    }
+}

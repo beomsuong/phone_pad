@@ -56,9 +56,17 @@ class TrackpadViewModel @Inject constructor(
         }
     }
 
+    /** 1손가락 탭 → 좌클릭. `{"type":"CLICK","button":"left"}` (TCP) */
     fun sendClick() {
         viewModelScope.launch {
-            runCatching { sendEventUseCase(TrackpadEvent.Click()) }
+            runCatching { sendEventUseCase(TrackpadEvent.Click(MultiTouchGestureTracker.BUTTON_LEFT)) }
+        }
+    }
+
+    /** 2손가락 탭 → 우클릭. `{"type":"CLICK","button":"right"}` (TCP) */
+    fun sendRightClick() {
+        viewModelScope.launch {
+            runCatching { sendEventUseCase(TrackpadEvent.Click(MultiTouchGestureTracker.BUTTON_RIGHT)) }
         }
     }
 }

@@ -48,4 +48,21 @@ class GestureConfigTest {
         // MultiTouchGestureTracker가 MOVE/CLICK을 방출하는 유일한 구간 조건
         assertEquals(1, GestureConfig.SINGLE_POINTER_COUNT)
     }
+
+    @Test
+    fun `2손가락 구간 기준은 2손가락이며 단일 포인터와 다르다`() {
+        // 우클릭(CLICK button="right") 판정의 유일한 구간 조건 (AGENTS.md 섹션 5)
+        assertEquals(2, GestureConfig.DOUBLE_POINTER_COUNT)
+        assertTrue(GestureConfig.DOUBLE_POINTER_COUNT > GestureConfig.SINGLE_POINTER_COUNT)
+    }
+
+    @Test
+    fun `멀티터치 해제 유예는 탭 최대 지속 시간의 절반보다 짧다`() {
+        // 이 여유가 없으면 "손가락 하나를 떼고 남은 손가락으로 탭"하는 동작까지
+        // 2손가락 탭으로 삼켜버린다 (MultiTouchGestureTracker의 꼬리 보정 전제 조건)
+        assertTrue(GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS > 0L)
+        assertTrue(
+            GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS < GestureConfig.TAP_MAX_DURATION_MS / 2
+        )
+    }
 }

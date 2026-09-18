@@ -56,6 +56,7 @@ fun TrackpadScreen(viewModel: TrackpadViewModel = hiltViewModel()) {
             host = state.host,
             onMove = viewModel::sendMove,
             onClick = viewModel::sendClick,
+            onRightClick = viewModel::sendRightClick,
             onDisconnect = viewModel::disconnect,
         )
     }
@@ -132,6 +133,7 @@ private fun TrackpadSurface(
     host: String,
     onMove: (Float, Float) -> Unit,
     onClick: () -> Unit,
+    onRightClick: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     Box(
@@ -180,8 +182,10 @@ private fun TrackpadSurface(
                         }
                     }
 
-                    if (tracker.onGestureEnd(lastTimestamp).click) {
-                        onClick()
+                    when (tracker.onGestureEnd(lastTimestamp).clickButton) {
+                        MultiTouchGestureTracker.BUTTON_LEFT -> onClick()
+                        MultiTouchGestureTracker.BUTTON_RIGHT -> onRightClick()
+                        else -> Unit
                     }
                 }
             },
@@ -203,7 +207,7 @@ private fun TrackpadSurface(
         }
 
         Text(
-            text = "터치하여 커서 이동\n탭으로 클릭",
+            text = "터치하여 커서 이동\n탭으로 클릭\n두 손가락 탭으로 우클릭",
             color = Color.White.copy(alpha = 0.15f),
             modifier = Modifier.align(Alignment.Center),
             fontSize = 16.sp,
