@@ -24,13 +24,15 @@ phone_pad/
 │       ├── PhonePadApplication.kt
 │       ├── MainActivity.kt
 │       ├── domain/
-│       │   ├── model/         TrackpadEvent.kt, ConnectionState.kt, GestureSettings.kt
+│       │   ├── model/         TrackpadEvent.kt, ConnectionState.kt, GestureSettings.kt,
+│       │   │                   ReconnectPolicy.kt
 │       │   ├── repository/    TrackpadRepository.kt, SettingsRepository.kt (interface)
 │       │   └── usecase/       SendEventUseCase.kt
 │       ├── data/
 │       │   ├── network/       TcpClient.kt, UdpClient.kt, SessionHandshake.kt
 │       │   └── repository/    TrackpadRepositoryImpl.kt, DataStoreSettingsRepository.kt
-│       ├── di/                AppModule.kt, DispatcherModule.kt, DataStoreModule.kt
+│       ├── di/                AppModule.kt, DispatcherModule.kt, DataStoreModule.kt,
+│       │                       ReconnectModule.kt
 │       └── presentation/
 │           ├── util/          GestureConfig.kt
 │           ├── settings/      SettingsScreen.kt, SettingsViewModel.kt, SettingsUiState.kt,
@@ -189,6 +191,9 @@ UDP_PORT               = 9001   // MOVE 전용 UDP 포트
 SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대 시간
 HEARTBEAT_INTERVAL_MS  = 5000L  // heartbeat 전송 주기 (서버 HEARTBEAT_INTERVAL_S=5.0과 반드시 동시 갱신)
 HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MISS_LIMIT=3과 반드시 동시 갱신)
+RECONNECT_MAX_ATTEMPTS = 8      // 자동 재연결 총 시도 횟수 (Android 전용 — 서버와 동기화 불필요)
+RECONNECT_BASE_DELAY_MS = 1000L // 1회차 시도 전 대기. 이후 2배씩: 1→2→4→8→10s 상한 (총 ≈55초)
+RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 ```
 
 ---
@@ -215,7 +220,7 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - `data/network/TcpClient.kt` — 세션 핸드셰이크 + heartbeat 수신용 `readLine()`/`applyHeartbeatTimeout()` 완료
 - `data/network/UdpClient.kt` — 완료
 - `data/network/SessionHandshake.kt` — 완료 (세션 라인 파서)
-- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조. MOVE/SCROLL은 고빈도라 전송 실패 시 연결 상태를 덮어쓰지 않는다(CLICK은 저빈도라 그대로 Error로 알림)
+- `data/repository/TrackpadRepositoryImpl.kt` — UDP 채널 분기 + heartbeat sender/watchdog 루프 완료. `TcpClient`는 한 줄 읽기만 제공하고, 루프 자체(전송 주기·미응답 판정)는 이 클래스가 소유하는 책임 분리 구조. MOVE/SCROLL은 고빈도라 전송 실패 시 연결 상태를 덮어쓰지 않는다(CLICK/DOUBLE_CLICK/DRAG_START/DRAG_END는 저빈도라 실패를 연결 유실로 취급 — Phase 4부터는 `reportConnectionLost`와 같은 경로로 합류해 자동 재연결을 트리거한다. 자세한 내용은 아래 Phase 4 항목)
 - `di/DispatcherModule.kt` — heartbeat 루프용 `@IoDispatcher` 제공(테스트에서 가상 시간 디스패처로 교체 가능)
 - `presentation/trackpad/MultiTouchGestureTracker.kt` — 좌/우클릭 + 스크롤 판정까지 완료. Compose에 의존하지 않는 순수 판정기(구간 기반 상태 머신). `TrackpadScreen.kt`는 이 트래커를 호출하는 얇은 어댑터
 - `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료. TCP 이벤트 처리(`handle_event` 호출)는 이벤트 단위로 예외를 격리해 필드값이 깨진 이벤트 하나가 세션 전체를 끊지 않는다
@@ -242,12 +247,19 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - `pc_server/input_controller.py` — `_double_click(button)`, `_drag_start()`/`_drag_end()`/`force_release_drag()` 완료. 드래그 상태는 프로세스 전역(현재 컨트롤러가 프로세스당 하나)
 - `pc_server/server.py` — `handle_client`의 `finally`에서 연결 종료 시 드래그 강제 해제 호출
 
-### ⬜ Phase 4 — 완성도
+### 🔶 Phase 4 — 완성도 (재연결 완료, 나머지 진행 전)
 - [ ] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료
 - [ ] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지)
-- [ ] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — heartbeat가 만드는 `ConnectionState.Error("Heartbeat timeout")`/`Error("Connection lost")`를 재시도 트리거로 사용
+- [x] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — Android 단일 사이드(프로토콜/서버 무변경: 재연결은 기존 핸드셰이크를 그대로 다시 수행할 뿐이라 서버에는 "새 클라이언트 접속"과 구분되지 않음). **"Connected였던 세션이 유실됐을 때만"** 재시도하며, 첫 `connect()` 실패는 기존처럼 `Error`로 남긴다(틀린 IP에 55초씩 매달리지 않기 위해). 유실은 `Error`를 거치지 않고 곧바로 `ConnectionState.Reconnecting(host, attempt, maxAttempts)`로 가고, 성공하면 `Connected`, 8회 소진 시 `Error("Reconnect failed: <마지막 원인>")`. 재연결 화면에는 "취소" 버튼(= 수동 `disconnect()`)
 - [ ] 예외 처리 강화 (네트워크 오류, 권한 오류 등)
 - [ ] PyInstaller로 단일 exe 패키징
+
+**재연결 구현 시 핵심 파일/설계:**
+- `domain/model/ReconnectPolicy.kt` — 순수 클래스(시간·코루틴 비의존). `delayBeforeAttempt(attempt)`(1-based, 1→2→4→8→10s 상한, shift 폭 31 제한으로 Long 오버플로 방지 — 음수 지연은 `delay()`를 즉시 반환시켜 재시도 폭주가 된다), `shouldAttempt`. `Disabled` 인스턴스를 테스트에 주입해 재연결 이전의 "유실 → `Error`" 동작을 그대로 재현 — 기존 heartbeat/직렬화 테스트는 로직을 고치지 않고 이 정책만 끼웠다
+- `data/repository/TrackpadRepositoryImpl.kt` — `openConnection()`으로 연결 1회를 추출해 수동 연결과 재연결이 같은 코드를 탄다. 경합은 4중으로 막는다: `connectionMutex`(접속 1회 직렬화) + `generation` CAS(연결 단위 중복 유실 보고 차단) + `reconnectEpoch`(재시도 묶음 유효성 — 연결 세대는 재연결 성공마다 올라가서 이 역할을 못 한다) + `reconnectJob.cancel()`. **취소는 뮤텍스 밖에서 먼저 한다**(락을 잡은 뒤 취소하면 진행 중인 접속 시도가 끝날 때까지 기다려 이중 접속이 된다). `openConnection`은 `CancellationException`을 따로 rethrow — 일반 `catch (e: Exception)`에 삼켜지면 취소가 `Error`로 둔갑한다. 재연결 루프는 `keepAliveScope`가 아닌 별도 `reconnectScope`에서 돈다(유실을 보고하는 heartbeat 루프가 곧바로 자기 스코프를 취소하므로). 첫 `Reconnecting`은 동기적으로 써서 `Error` 깜빡임이 구조적으로 불가능하다. `reportConnectionLost`는 `state !is Connected`면 무시 — 수동 disconnect 뒤 뒤늦게 도착한 전송 실패가 연결을 되살리거나, 재연결 중 좀비 전송 실패가 재시도를 `Error`로 깨는 것을 막는다
+- 전송 실패 합류: `CLICK`/`DOUBLE_CLICK`/`DRAG_START`/`DRAG_END`의 TCP 전송 실패는 이전에는 `Error`만 세팅하고 소켓 정리·세대 무효화·keep-alive 중단을 하지 않아, 소켓은 죽었는데 heartbeat 루프가 최대 5초 더 돌았다. 이제 `sendOverTcp()` → `reportConnectionLost`로 합류해 즉시 정리 + 재연결한다. **`MOVE`/`SCROLL`의 조용한 실패는 그대로**(F-1/F-2 의도 — 고빈도 이벤트가 유실 원인 메시지를 덮어쓰지 않게)
+- `presentation/trackpad/TrackpadScreen.kt` — `ConnectingPanel`을 첫 연결/재연결이 공유(재연결일 때만 대상 호스트 표시 + "취소" 버튼). 설정 화면은 여전히 Disconnected/Error에서만 열린다
+- 테스트 함정: `runTest`는 본문이 끝난 뒤에도 가상 시간을 계속 진행시킨다. heartbeat/재연결 루프를 살려 둔 채 테스트를 끝내면 "5초마다 전송 → 유실 → 재연결"이 무한히 돌면서 MockK가 호출을 기록하다 힙을 소진한다(실제로 `OutOfMemoryError`가 나 같은 JVM의 무관한 테스트 30개까지 무너졌다). 이 계층의 새 테스트는 반드시 `repository.disconnect()` 또는 `Error` 종료로 끝낼 것
 
 ### ⬜ Phase 5 — 선택 확장
 - [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
@@ -349,8 +361,10 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | PIN 인증 | Phase 5 선택 사항 — UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않아 동일 WiFi 내 스푸핑이 가능함. PIN 인증 설계 시 함께 재검토 |
 | 다중 기기 연결 | 정책 미정 — 서버는 현재 활성 세션 전부를 동시에 처리 가능한 구조(집합 기반)라, 여러 기기가 동시에 연결하면 전부 커서를 움직일 수 있음. 드래그 상태(`_drag_active`)도 프로세스 전역이라, 기기 A가 드래그 중일 때 기기 B의 연결이 끊기면 B의 안전장치가 A의 드래그를 놓아버림(실측 확인) — 버튼이 눌린 채 멈추는 것보다 안전한 실패 방향이라 1:1 전제하에 그대로 둠, 다중 기기 지원 시 세션별 상태 분리 필요 |
 | sub-pixel 이동 정밀도 | `InputController._move`에 한정된 이슈 — 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음. SCROLL은 Android가 잔차를 완전히 처리해 보내므로 해당 없음 — 별도 이슈로 개선 검토 |
-| heartbeat 리셋 비대칭 | 서버는 CLICK 등 어떤 상향 데이터로도 미응답 카운터가 리셋되지만, 서버→클라이언트 하향 트래픽은 ACK뿐이라 Android 쪽은 사실상 ACK만이 유일한 리셋 수단. 한쪽 방향만 끊기는 비대칭 시나리오가 가능하므로 Phase 4 재연결 설계 시 전제로 고려 |
-| Android 절전/도즈 환경의 heartbeat | 화면 꺼짐·도즈·Wi-Fi 절전으로 5초 주기 전송이 지연되면 서버가 먼저 15초 타임아웃으로 끊는 오탐 가능성 — 실기기 미검증, Phase 4 재연결/wake lock 검토 시 함께 다룰 것 |
+| heartbeat 리셋 비대칭 | 서버는 CLICK 등 어떤 상향 데이터로도 미응답 카운터가 리셋되지만, 서버→클라이언트 하향 트래픽은 ACK뿐이라 Android 쪽은 사실상 ACK만이 유일한 리셋 수단. 한쪽 방향만 끊기는 비대칭 시나리오가 가능함 — 자동 재연결은 앱이 유실을 감지한 뒤에만 시작되므로, 서버만 끊었고 앱은 아직 모르는 구간(최대 15초)은 그대로 남는다 |
+| Android 절전/도즈 환경의 heartbeat | 화면 꺼짐·도즈·Wi-Fi 절전으로 5초 주기 전송이 지연되면 서버가 먼저 15초 타임아웃으로 끊는 오탐 가능성 — 실기기 미검증. 자동 재연결은 백오프 타이머(코루틴 `delay`)만 쓰므로 도즈 중에는 타이머 자체가 지연될 수 있고, 백그라운드·네트워크 전환(WiFi→모바일)·`ConnectivityManager` 기반 즉시 재시도는 이번 재연결 범위 밖 — wake lock과 함께 별도로 다룰 것 |
+| 재연결 직후 서버 세션 2개 | 서버는 옛 연결의 종료(EOF/heartbeat 15초 타임아웃)를 감지하기 전까지 옛 세션을 유지하므로, 재연결 직후 잠깐 세션이 2개일 수 있다(서버는 다중 세션 허용 구조). 옛 연결이 회수되는 순간 서버의 드래그 강제 해제(프로세스 전역 `_drag_active`)가 **새 연결의 드래그를 놓아버릴 수 있다** — 아래 "다중 기기 연결"과 같은 뿌리. 발생 조건이 좁아(재연결 후 옛 연결 회수 전 15초 안에 새 연결에서 드래그를 시작해야 함) 지금은 허용하지만, 서버 세션별 상태 분리 시 함께 해결할 것 |
+| 재연결 실기기 검증 | Reconnecting 패널 렌더·"취소" 버튼, 유실 시 `Error` 깜빡임이 실제로 없는지, 실제 WiFi 끊김에서 백오프(1→2→4→8→10s, 8회 ≈55초)의 적절성, 재연결 직후 제스처 반응은 실기기 미검증(컴파일·JVM 단위 테스트만 통과). 재연결 횟수 소진 후 사용자가 수동으로 다시 연결하면 그대로 동작한다 |
 | 스크롤 방향 규약 | 현재는 "자연 스크롤"(macOS 기본, 손가락과 콘텐츠가 같은 방향)로 구현됨 — Windows 정밀 터치패드 기본값("아래로 움직이면 아래로 스크롤")과는 반대일 수 있음. 실기기 미검증. 뒤집을 경우 `input_controller.py`의 `_scroll()` 한 곳만 수정하면 됨(Android는 절대 동시 수정 금지 — 두 사이드가 같이 뒤집으면 원위치됨) |
 | SCROLL_SENSITIVITY_PX_PER_STEP 체감 | 기본값 40px/스텝은 계산 근거(휠 1노치≈3줄, 400px 스와이프≈10스텝≈한 화면)는 있으나 실기기 미검증. 이제 사용자가 설정 화면에서 조정할 수 있으므로(25~100px/스텝) 기본값 자체의 튜닝 우선순위는 낮아졌다. 슬라이더 범위(포인터 0.5~4.0배, 스크롤 25~100px/스텝)의 양 끝 체감도 계산 근거만 있고 실기기 미검증 |
 | 설정 영속화 실기기 검증 | 앱 완전 종료 후 재실행 시 값 유지, 회전 시 `rememberSaveable` 복원, 시스템 백 제스처로 설정→연결 화면 복귀(앱 종료로 새지 않는지), 소형 화면·키보드 노출 시 "감도 설정" 버튼 가림 여부는 실기기 미검증. `SettingsScreen`의 슬라이더 커밋 타이밍·`BackHandler`는 Compose UI 테스트가 없다(순수 로직만 분리 커버) |

@@ -1,146 +1,100 @@
-# android-dev 작업 요약 — 감도 설정 화면 + DataStore 영속화 (Phase 3 마지막 2개 항목)
+# android-dev 요약 — 재연결 로직 (Phase 4)
 
-작업 디렉토리: `C:\Github\phone_pad\.claude\worktrees\settings-ui-datastore` (워크트리 내에서만 작업, 원본 체크아웃 미접근)
-커밋하지 않음 (리더가 처리). `AGENTS.md`/`CLAUDE.md` 미수정.
-
-**프로토콜 무변경 확인**: 이벤트 `type`/필드/채널/세션을 건드린 곳이 없다.
-`domain/model/TrackpadEvent.kt`, `data/repository/TrackpadRepositoryImpl.kt`, `data/network/*`, `pc_server/*` 전부 미수정 —
-`git status`에도 나타나지 않는다. 이번 변경은 "Android가 dx/dy와 스크롤 스텝을 **어떤 값으로 계산하느냐**"에만 닿는다.
-
----
+워크트리: `C:\Github\phone_pad\.claude\worktrees\reconnect-logic` (다른 워크트리/원본 체크아웃 미접근)
+범위: **Android 단일 사이드.** 이벤트 `type`/필드/채널/핸드셰이크/서버 코드 **무변경** — 교차 경계면 전환 사유 없음.
 
 ## 1. 변경/추가 파일
 
-### 추가 (main)
-| 파일 | 역할 |
-|------|------|
-| `app/src/main/java/.../domain/model/GestureSettings.kt` | 값 객체 + 허용 범위 + clamp(`sanitized()`). 순수 Kotlin |
-| `app/src/main/java/.../domain/repository/SettingsRepository.kt` | 인터페이스 (`settings: Flow`, `update`, `reset`) |
-| `app/src/main/java/.../data/repository/DataStoreSettingsRepository.kt` | DataStore(Preferences) 구현. 읽기·쓰기 양쪽에서 clamp, `IOException` → `emptyPreferences()` |
-| `app/src/main/java/.../di/DataStoreModule.kt` | `DataStore<Preferences>` 제공(@Singleton, 손상 시 빈 Preferences로 복구) |
-| `app/src/main/java/.../presentation/settings/SettingsScreen.kt` | 슬라이더 2개 + "기본값으로 복원" + 뒤로가기(`BackHandler`) |
-| `app/src/main/java/.../presentation/settings/SettingsViewModel.kt` | 로드/저장/리셋 |
-| `app/src/main/java/.../presentation/settings/SettingsUiState.kt` | `settings` + `isLoaded` |
-| `app/src/main/java/.../presentation/settings/ScrollSpeedSlider.kt` | "스크롤 속도" 슬라이더 방향 뒤집기(순수 함수, Compose 비의존) |
-
-### 수정 (main)
-| 파일 | 변경 |
-|------|------|
-| `app/build.gradle.kts` | `androidx.datastore:datastore-preferences:1.0.0` 추가 (그 외 의존성 추가 없음 — Navigation/material-icons-extended 미추가) |
-| `presentation/util/GestureConfig.kt` | 범위 상수 4개 추가(`MOVE_SENSITIVITY_MIN/MAX`, `SCROLL_PX_PER_STEP_MIN/MAX`) + 두 기본값 상수의 KDoc 보강. **기존 상수는 삭제/개명/값 변경 없음** |
-| `presentation/trackpad/MultiTouchGestureTracker.kt` | 배율·px/step을 생성자 파라미터로 주입(기본값 = GestureConfig 상수). `GestureSettings` 편의 생성자 추가. `scrollPxPerStep > 0` require |
-| `presentation/trackpad/TrackpadScreen.kt` | `SettingsViewModel` 구독, 상태 기반 설정 화면 전환, ConnectPanel에 "감도 설정" 버튼, `TrackpadSurface`에 감도 전달 + `pointerInput(moveSensitivity, scrollPxPerStep)` |
-| `di/AppModule.kt` | `SettingsRepository` 바인딩 추가 |
-
-### 추가/수정 (test)
+### 신규
 | 파일 | 내용 |
 |------|------|
-| `test/.../domain/model/GestureSettingsTest.kt` (신규, 10) | 기본값 == GestureConfig, 범위 불변식, clamp, NaN/±Inf → 기본값, 필드 독립성, 멱등성 |
-| `test/.../data/repository/DataStoreSettingsRepositoryTest.kt` (신규, 9) | 임시 파일 기반 실제 왕복, 미저장 시 기본값, 저장 시/읽기 시 clamp, reset, 키 이름 고정 |
-| `test/.../presentation/settings/SettingsViewModelTest.kt` (신규, 7) | 로드/부분 변경/연속 변경/리셋, MockK 호출 검증 |
-| `test/.../presentation/settings/ScrollSpeedSliderTest.kt` (신규, 5) | 역함수 관계, 양 끝 스왑, 단조성, 범위 유지 |
-| `test/.../presentation/trackpad/MultiTouchGestureTrackerSettingsTest.kt` (신규, 9) | 기본 생성자 == 상수, 배율 2배 → dx 2배, px/step 절반 → 스텝 2배, 잔차 누적, 판정(탭/우클릭) 불변, 0 이하 거부 |
-| `test/.../presentation/util/GestureConfigTest.kt` (수정, +3) | 범위가 기본값을 포함, 이동 하한 > 0, **스크롤 하한 > `TAP_MAX_DISTANCE_PX`** |
+| `phone_pad_app/app/src/main/java/com/example/phone_pad_app/domain/model/ReconnectPolicy.kt` | 순수 백오프 정책(`enabled`/`maxAttempts`/`baseDelayMs`/`maxDelayMs`, `delayBeforeAttempt`, `shouldAttempt`, `isActive`). `Default`/`Disabled` 상수 제공 |
+| `phone_pad_app/app/src/main/java/com/example/phone_pad_app/di/ReconnectModule.kt` | Hilt `@Provides ReconnectPolicy = ReconnectPolicy.Default` (값 객체라 `@Inject` 생성자 불가) |
+| `phone_pad_app/app/src/test/java/com/example/phone_pad_app/domain/model/ReconnectPolicyTest.kt` | 9 tests — 지연 수열/상한/총 55초/오버플로/경계/비활성 |
+| `phone_pad_app/app/src/test/java/com/example/phone_pad_app/data/repository/TrackpadRepositoryReconnectTest.kt` | 16 tests — 리포지토리 재연결 시나리오(전부 가상 시간) |
 
-그 외: `phone_pad_app/local.properties`를 로컬 빌드용으로 생성(`sdk.dir`). `.gitignore` 대상이라 커밋되지 않는다.
+### 수정
+| 파일 | 내용 |
+|------|------|
+| `domain/model/ConnectionState.kt` | `Reconnecting(host, attempt, maxAttempts)` 추가 |
+| `presentation/util/GestureConfig.kt` | `RECONNECT_MAX_ATTEMPTS = 8`, `RECONNECT_BASE_DELAY_MS = 1_000L`, `RECONNECT_MAX_DELAY_MS = 10_000L` (heartbeat 상수 바로 아래) |
+| `data/repository/TrackpadRepositoryImpl.kt` | 생성자에 `reconnectPolicy` 추가, `connect` 본문을 `openConnection()`으로 추출, 재연결 루프/취소, TCP 전송 실패의 유실 경로 합류 |
+| `presentation/trackpad/TrackpadScreen.kt` | `Reconnecting` 분기 렌더(`ConnectingPanel`을 `message`/`hostLabel`/`onCancel` 파라미터로 확장) |
+| `data/repository/TrackpadRepositoryImplTest.kt`, `TrackpadRepositoryHeartbeatTest.kt` | 생성자에 `ReconnectPolicy.Disabled` 주입만 추가 — **테스트 로직·단언은 한 줄도 수정하지 않음** |
 
----
+`TrackpadViewModel`은 무변경(취소는 기존 `disconnect()` 재사용). `TrackpadEvent`/`TcpClient`/`UdpClient`/`SessionHandshake`/서버 무변경.
 
 ## 2. 설계 결정과 근거
 
-1. **조정 값은 2개로 제한** (확정 스펙 그대로). 나머지 상수는 서로 얽힌 불변식이 있어 무변경.
-   스크롤 하한 25f가 `SCROLL_SENSITIVITY_PX_PER_STEP > TAP_MAX_DISTANCE_PX`(20f) 불변식을 슬라이더로도 못 깨게 막는다 —
-   이 사실을 `GestureConfigTest`와 `GestureSettingsTest` 양쪽에서 고정했다.
+### 2.1 `connect` 본문 추출 (복제 금지)
+`openConnection(host, port): String?`(성공 null / 실패 원인 메시지)을 만들어 **수동 연결과 자동 재연결이 같은 코드**를 타게 했다.
+실패 후의 상태 전이만 호출자가 정한다 — 수동은 `Error`, 재연결은 다음 시도 또는 최종 `Error`.
+`_connectionState.value = Connecting`도 호출자로 올렸다: 재연결은 `Connecting`이 아니라 `Reconnecting`을 보여야 하기 때문.
 
-2. **clamp는 도메인에**, ViewModel은 보정하지 않는다. `coerceIn`이 NaN을 **그대로 통과시키는** 점(비교 연산 기반)이 핵심 함정이라
-   유한성 검사를 먼저 한다. NaN 배율이 판정기에 들어가면 모든 델타가 NaN이 되어 커서가 영원히 멈춘다.
-   `±Infinity`도 스펙대로 경계가 아니라 기본값으로 되돌린다.
+### 2.2 재연결 트리거 = "Connected였던 세션의 유실"만
+- `lastConnectedHost`/`lastConnectedPort`는 **핸드셰이크 성공 직후에만** 갱신한다 → 실패 중인 IP로는 절대 재시도하지 않는다.
+- `reportConnectionLost`의 첫 줄에 `if (_connectionState.value !is Connected) return`을 뒀다. 이 한 줄이 두 사고를 막는다:
+  1) 수동 `disconnect()` 뒤 뒤늦게 실패한 전송(예: 300ms 지연 클릭)이 연결을 되살리는 것,
+  2) `Reconnecting` 중 도착한 좀비 전송 실패가 진행 중인 재시도를 `Error`로 깨는 것.
+  (실제 중재자는 여전히 세대 CAS이고, 이 검사는 "보고 자격"을 좁히는 역할이다.)
+- 첫 `connect()` 실패/핸드셰이크 실패는 기존과 100% 동일하게 `Connecting → Error`.
 
-3. **`reset()`은 기본값을 쓰지 않고 키를 지운다.** 나중에 기본 상수가 바뀌면 "복원"한 사용자가 새 기본값을 따라가야 맞고,
-   "명시적으로 고른 값만 저장돼 있다"는 상태가 더 단순하다.
+### 2.3 경합 처리 — 세대 / 뮤텍스 / 취소
+세 장치를 **역할을 나눠서** 썼다(기존 F-2/F-3 안전장치는 그대로 유지, 약화 없음).
 
-4. **트래커는 값만 주입받는다** — `GestureSettings`(순수 Kotlin) 외에 Compose/DataStore/Flow를 전혀 모른다.
-   생성자 기본값을 GestureConfig 상수로 둬서 **기존 `MultiTouchGestureTrackerTest`(36개)가 무수정 통과**한다.
-   `scrollPxPerStep <= 0`은 `require`로 막았다(0으로 나누면 Infinity 스텝이 서버로 나간다).
+| 장치 | 담당 |
+|------|------|
+| `connectionMutex` | "접속 1회"의 직렬화. 재연결 시도도 이 락을 잡고 `openConnection`을 호출한다 → 수동 연결과 재연결이 절대 겹치지 않음 |
+| `generation` (기존) | **연결 단위** 유효성. heartbeat 루프와 TCP 전송 실패가 같은 유실을 중복 보고하지 못하게 하는 CAS |
+| `reconnectEpoch` (신규) | **재시도 묶음 단위** 유효성. 수동 `connect()`/`disconnect()`가 +1 해서 진행 중 루프를 무효화 |
+| `reconnectJob.cancel()` | 백오프 `delay` 중인 루프를 즉시 깨움 |
 
-5. **`pointerInput` key에 감도 두 값을 포함.** 지금은 설정을 연결 전에만 바꿀 수 있어 실제로 이 경로를 타지 않지만,
-   key가 `Unit`이면 값이 바뀌어도 블록이 재시작되지 않아 **낡은 값이 캡처된 채 조용히 틀린 감도로 동작**한다.
-   트래커 자체는 제스처 시작 시점 값으로 고정해(같은 스와이프 중 배율이 바뀌지 않게) 만든다.
+- **취소는 뮤텍스 밖에서 먼저 한다.** 재연결 루프가 접속 시도 중 락을 쥐고 있을 수 있어서, 락을 잡은 뒤 취소하면 그 시도가 끝날 때까지 기다리게 되고(=이중 접속) 취소 의미가 사라진다.
+- 취소만으로는 부족해서 epoch를 둔다: `cancel()` 직후 아직 취소를 확인하지 못한 루프가 상태를 한 번 더 덮어쓸 수 있다. 루프는 상태를 쓰기 전·락을 잡은 직후마다 epoch를 확인한다.
+- `openConnection`은 `CancellationException`을 **따로 잡아 그대로 올린다**(기존 `catch (e: Exception)`에 삼켜지면 취소가 `Error`로 둔갑한다). 소켓 정리는 우리를 취소한 쪽이 이어서 한다(`disconnect()`의 `cleanUp()`, 또는 `TcpClient.connect()`의 선행 `disconnect()`).
+- 재연결 루프는 `keepAliveScope`가 **아닌** 별도 `reconnectScope`에서 돈다. 유실을 보고한 heartbeat 루프가 곧바로 자기 스코프를 취소하므로, 같은 스코프에 두면 태어나자마자 취소된다.
+- 첫 `Reconnecting`은 `reportConnectionLost` 안에서 **동기적으로** 쓴다(코루틴 스케줄을 기다리지 않음) → `Error` 깜빡임이 구조적으로 불가능.
 
-6. **화면 전환은 상태 + `BackHandler`** — Navigation 의존성 미추가. 설정은 `Disconnected`/`Error`에서만 열리고,
-   연결 상태가 살아나면(`settingsAvailable == false`) 자동으로 트랙패드로 돌아간다. Connected 화면에는 버튼을 두지 않았다(제스처 표면 보호).
-   아이콘 대신 텍스트 버튼("감도 설정", "← 뒤로")을 써서 material-icons-extended를 들이지 않았다.
+### 2.4 TCP 이벤트 전송 실패의 합류
+`Click`/`DoubleClick`/`DragStart`/`DragEnd`의 `try/catch` 4벌을 `sendOverTcp(json)` 하나로 모아 `reportConnectionLost(전송 시점 세대, e.message ?: "Send failed")`를 호출한다.
+→ 소켓 정리 + 세대 무효화 + keep-alive 중단 + 재연결이 heartbeat 유실과 완전히 같은 경로로 일어난다(기존에는 상태만 `Error`가 되고 좀비 루프가 남았다).
+`Move`/`Scroll`의 `runCatching` 조용한 실패는 **한 글자도 건드리지 않았다**(F-1/F-2 의도 보존, 회귀 테스트로 고정).
 
-7. **스크롤 슬라이더 방향 뒤집기**를 `ScrollSpeedSlider`(범위 중심 대칭, 자기 자신의 역함수)로 분리했다.
-   UI에서 즉석 계산하면 한 방향만 고치고 반대를 잊어 "설정을 열 때마다 값이 반대편으로 튀는" 버그가 나기 쉽다.
+### 2.5 백오프 값
+1→2→4→8→10→10→10→10초(합 55초), 상한 10초. 상한 근거는 서버가 옛 세션을 회수하는 시간(5초×3=15초)과 같은 자릿수라 회수 이후에도 여러 번 문을 두드린다는 것. 지수 계산은 shift 폭을 31로 제한해 Long 오버플로(음수 지연 → 재시도 폭주)를 막았다.
 
-8. **저장은 `onValueChangeFinished`에서만.** 드래그 중에는 로컬 상태만 움직인다(매 프레임 디스크 쓰기 금지).
-   저장 시에는 `uiState`가 아니라 `settings.first()`로 최신 저장값을 읽어 한 필드만 바꾼다 — `uiState`는 `WhileSubscribed`라
-   구독자가 없는 동안 값이 멈춰 있을 수 있다.
+### 2.6 UI
+`ConnectingPanel(message, hostLabel?, onCancel?)`로 확장해 `Connecting`/`Reconnecting`이 공유한다. **취소 버튼은 `onCancel`이 있는 재연결에서만** 나오고 첫 연결 화면은 기존 그대로다. `settingsAvailable`은 `Disconnected || Error` 그대로 — 재연결 중에는 설정에 들어갈 수 없다.
+`Connected` 복귀 시 제스처 상태 리셋 코드는 **추가하지 않았다**(확인만): 트래커/`DragHoldDetector`/`DoubleTapDetector`는 `awaitEachGesture` 블록 안에서 제스처마다 새로 생성되고, `pendingClickJob`은 `pointerInput`의 `coroutineScope`와 함께 파기된다.
 
-9. **`isLoaded`가 false인 동안 슬라이더 비활성화** — 디스크 값이 한 프레임 늦게 도착하는 사이에 사용자가 기본값을 만져 덮어쓰는 것을 막는다.
-
----
-
-## 3. 테스트 실행 결과 (실제 출력 기준)
+## 3. 테스트 결과 (실제 출력 기준)
 
 ```
-cd phone_pad_app && ./gradlew :app:testDebugUnitTest :app:assembleDebug
-BUILD SUCCESSFUL in 21s
+.\gradlew.bat :app:testDebugUnitTest   → BUILD SUCCESSFUL
+.\gradlew.bat :app:assembleDebug       → BUILD SUCCESSFUL
 ```
-`app/build/test-results/testDebugUnitTest/*.xml` 집계: **TOTAL=192, FAILURES=0** (신규 40 + 기존 152)
+XML 리포트(`app/build/test-results/testDebugUnitTest/*.xml`) 집계: **`<testcase>` 217개, `<failure>` 0개.**
+(재연결 도입 전 192개 → +25: `ReconnectPolicyTest` 9 + `TrackpadRepositoryReconnectTest` 16. 기존 192개는 전부 통과.)
 
-| 클래스 | 결과 |
-|--------|------|
-| GestureSettingsTest | 10 / 0 fail |
-| DataStoreSettingsRepositoryTest | 9 / 0 fail |
-| SettingsViewModelTest | 7 / 0 fail |
-| ScrollSpeedSliderTest | 5 / 0 fail |
-| MultiTouchGestureTrackerSettingsTest | 9 / 0 fail |
-| GestureConfigTest | 17 / 0 fail (기존 14 + 3) |
-| MultiTouchGestureTrackerTest (무수정) | 36 / 0 fail |
-| 기존 나머지(TrackpadRepositoryImpl/Heartbeat, TcpClient, SessionHandshake, DoubleTap, DragHold, TrackpadViewModel, SendEventUseCase, Example) | 전부 0 fail |
+주요 신규 케이스: 유실 → `Reconnecting(1,N)`(Error 미경유) / 백오프 경과 전 재접속 금지 / 재연결 성공 시 **새 세션 토큰이 UDP MOVE에 반영**(옛 토큰 아님) / 성공 후 재유실 시 카운터 1부터 / 연속 실패 시 attempt 1→N 후 `Error("Reconnect failed: refused")` 및 이후 무시도 / 첫 연결 실패·핸드셰이크 실패 무재시도 / 대기 중 `disconnect()` 즉시 중단 / 대기 중 수동 `connect()`가 재연결을 취소하고 1회만 접속 / `Click`·`DragEnd` 전송 실패의 재연결 합류 + 옛 루프의 2차 보고 없음(CAS) / `MOVE`·`SCROLL` 실패는 무트리거 / 비활성 정책은 기존 `Error` 그대로.
 
-`:app:assembleDebug`도 성공 — Compose 코드 컴파일과 **Hilt DI 그래프 검증**(kapt/Dagger)까지 통과했다는 뜻이다.
-빌드 경고는 기존에 있던 `TcpClient.kt:35` opt-in 경고 하나뿐이고 이번 변경으로 새로 생긴 경고는 없다.
+**작업 중 발견해 고친 테스트 함정(공유 가치 있음):** `runTest`는 본문이 끝난 뒤에도 가상 시간을 계속 진행시키므로, heartbeat 루프나 대기 중인 재연결 루프를 **살려둔 채 끝내면** 무한히(5초마다 전송 → 유실 → 재연결 → …) 돌면서 MockK가 호출을 기록하다 힙을 소진한다. 실제로 `OutOfMemoryError`가 나며 같은 JVM의 무관한 테스트 30개까지 동시에 무너졌다. 신규 테스트는 전부 `repository.disconnect()`(또는 Error 종료)로 끝내도록 고쳤고 그 이유를 클래스 KDoc에 남겼다.
 
-### 도중에 실제로 잡힌 실패 (해결 과정)
-첫 실행에서 `DataStoreSettingsRepositoryTest` 2개가 실패했다:
-```
-java.io.IOException: Unable to rename ...\gesture_settings.preferences_pb.tmp.
-  at androidx.datastore.core.SingleProcessDataStore.writeData(SingleProcessDataStore.kt:433)
-```
-원인은 우리 코드가 아니라 **DataStore 1.0.0 + Windows JVM 조합의 제약**이다. DataStore는 임시 파일에 쓴 뒤
-`File.renameTo`로 갈아끼우는데, Windows의 `renameTo`는 대상 파일이 이미 있으면 실패한다(POSIX `rename`과 달리 덮어쓰기 불가).
-즉 **"같은 파일에 두 번째로 쓰는" 모든 테스트가 이 환경에서만 실패**한다(첫 쓰기는 파일이 없어 성공).
-→ 실제 파일 왕복(저장 → 인스턴스 종료 → 재생성 → 재읽기)은 실파일 테스트로 그대로 유지하고,
-다중 쓰기가 필요한 2개(필드 독립성, reset의 키 제거)만 같은 `DataStore<Preferences>` 계약을 메모리로 구현한 대역으로 검증했다.
-테스트 파일에 이유를 주석으로 남겼다.
+## 4. 미해결 이슈 / 범위 밖
 
----
+1. **재연결 직후 서버에 세션 2개** — 서버는 옛 연결의 EOF나 15초 heartbeat 타임아웃 전까지 옛 세션을 유지한다(다중 세션 허용 구조). AGENTS.md 섹션 10 "다중 기기 연결"의 드래그 상태 전역 문제와 같은 뿌리: **옛 연결이 회수되는 순간 서버의 `force_release_drag`가 새 연결의 드래그를 놓아버릴 수 있다.** 서버 변경은 이번 범위 아님 — 언급만.
+2. 화면 꺼짐/도즈/앱 백그라운드 중 동작, WiFi→모바일 전환, `ConnectivityManager` 기반 즉시 재시도는 범위 밖(백오프 타이머만 사용). 도즈로 `delay`가 지연되면 실제 재시도 간격은 늘어날 수 있다.
+3. 마지막 접속 IP 영속화는 범위 밖 — 재시도를 모두 소진하면 `Error` 화면으로 돌아가고 IP 입력값은 `_hostInput`에 남아 있지만 앱 재시작 시에는 사라진다.
+4. 재연결 성공은 서버 입장에서 새 클라이언트다 — 앱이 드래그 중 끊겼다면 새 세션에서 `DRAG_START`는 다시 나가지 않는다(제스처가 이미 끝났으므로 의도된 동작). PC 버튼 해제는 서버의 연결 종료 안전장치에 의존한다.
+5. `ReconnectPolicy`는 현재 사용자 조정 대상이 아니다(설정 화면 미노출). 필요해지면 `GestureSettings`처럼 DataStore로 올리는 경로가 열려 있다.
+6. `domain/model/ReconnectPolicy.kt`가 `presentation.util.GestureConfig`를 import한다 — 기존 `GestureSettings`/`TrackpadUiState`와 동일한 계층 방향 역전. 정리하려면 `GestureConfig`를 domain으로 옮기는 별도 작업이 필요(이번에 새로 만들지 않고 기존 패턴을 따랐다).
 
-## 4. 미해결 이슈 / 남은 리스크
+## 5. 실기기에서만 확인 가능한 항목 (전부 미검증)
 
-1. **다중 쓰기 경로의 실파일 검증은 이 환경에서 불가** (위 참조). 실제 타깃인 Android(리눅스)에서는 `rename`이 원자적으로 덮어쓰므로
-   정상 동작하지만, "설정을 두 번 바꿔 저장했을 때 파일이 제대로 갱신되는지"는 **실기기에서만 최종 확인 가능**하다.
-   (DataStore 1.1+는 이 문제가 해결돼 있으나, Kotlin 1.8.10/AGP 8.1.3 라인 유지를 위해 1.0.0을 썼다.)
-2. **`GestureSettings`(domain)가 `GestureConfig`(presentation.util)를 import**한다 — 계층 방향이 거꾸로다.
-   확정 스펙이 "GestureConfig를 기본값의 단일 출처로 유지"하라고 못 박아서 그대로 따랐다(기존 `TrackpadUiState`도 같은 방식으로 참조 중).
-   정리하려면 `GestureConfig`를 domain 쪽으로 옮겨야 하는데, 이는 스펙이 금지한 이동/개명이라 이번 범위 밖으로 남긴다.
-3. **`SettingsScreen`에 Compose UI 테스트 없음** — 슬라이더 드래그/커밋 타이밍, `BackHandler` 동작은 자동 테스트가 없다.
-   순수 로직(`ScrollSpeedSlider`, ViewModel)만 분리해 커버했다. 기존 `TrackpadScreen`의 코루틴 타이밍이 미커버인 것과 같은 한계.
-4. **설정 변경이 `pointerInput`을 재시작시키는 경로는 미실행 코드에 가깝다** — 현재 UI에서는 연결 전에만 설정을 바꿀 수 있어
-   Connected 상태에서 값이 바뀌는 일이 없다. 나중에 "연결 중 설정 진입"을 허용하면 이 경로가 처음으로 실제로 돌게 된다.
-5. **감도 범위의 체감 타당성은 미검증** — 0.5~4.0배, 25~100px/step은 계산 근거만 있고 실기기 튜닝 결과가 아니다
-   (AGENTS.md 섹션 10의 "SCROLL_SENSITIVITY_PX_PER_STEP 체감" 항목이 이 화면으로 조정 가능해졌을 뿐, 기본값 검증은 여전히 미완).
-
----
-
-## 5. 실기기에서만 확인 가능한 항목
-
-- 설정 변경 후 **앱을 완전히 종료했다 재실행**했을 때 값이 유지되는지 (DataStore 파일 영속성, 위 4-1과 연결)
-- 슬라이더를 끝까지 올린 상태(4.0배)에서 커서가 실제로 쓸 만한지, 끝까지 내린 상태(0.5배)에서 답답하지 않은지
-- 스크롤 하한(25px/step)에서 스크롤 진입이 튀지 않는지 — 불변식상 안전하지만 체감은 별개
-- "감도 설정" 버튼이 연결 화면 레이아웃(소형 화면/키보드 올라온 상태)에서 가려지지 않는지
-- 시스템 백 제스처로 설정 → 연결 화면 복귀가 자연스러운지 (앱 종료로 새지 않는지)
-- 설정 화면을 열어 둔 채 화면 회전 시 상태 유지(`rememberSaveable`) 및 슬라이더 값 복원
+- **컴파일/유닛 테스트는 통과했지만 Compose 화면 동작은 실기기 전까지 미검증이다.**
+- `Reconnecting` 패널 렌더링: 문구 `재연결 중… (n/N)`, 호스트 표시, "취소" 버튼 탭 → `Disconnected` 복귀.
+- 유실 순간 `Error` 패널이 한 프레임도 보이지 않는지(코드상 불가능하도록 동기 전이했지만 체감 확인 필요).
+- 실제 WiFi 끊김/AP 재접속/서버 프로세스 재시작에서 1→2→4→8→10초 백오프가 충분한지, 8회 55초가 적절한지.
+- 재연결 성공 직후 트랙패드 표면의 제스처 반응(첫 탭·드래그가 즉시 먹히는지)과 커서 점프 유무.
+- 재연결 성공 직후 **옛 세션이 서버에서 회수되는 순간** 드래그/클릭이 튀는지(위 미해결 1번).
+- 도즈/화면 꺼짐 상태에서 재연결 타이머가 얼마나 늦춰지는지.
