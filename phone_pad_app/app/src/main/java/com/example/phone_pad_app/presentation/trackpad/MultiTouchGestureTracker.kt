@@ -1,9 +1,10 @@
 package com.example.phone_pad_app.presentation.trackpad
 
+import com.example.phone_pad_app.domain.model.GestureSettings
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import kotlin.math.hypot
 
-/** 트래커가 방출하기로 결정한 커서 이동 델타 (이미 [GestureConfig.MOVE_SENSITIVITY]가 곱해진 값). */
+/** 트래커가 방출하기로 결정한 커서 이동 델타 (이미 이동 감도 배율이 곱해진 값). */
 data class MoveDelta(val dx: Float, val dy: Float)
 
 /**
@@ -70,8 +71,30 @@ data class GestureEndDecision(
  *   안에 끝났다면 손가락을 어긋나게 뗀 꼬리로 보고 직전 구간 기준으로 판정한다.
  *
  * 스레드 안전하지 않다 — 하나의 포인터 입력 루프에서만 사용한다.
+ *
+ * @param moveSensitivity 커서 이동 배율. 사용자 설정([GestureSettings.moveSensitivity])이 있으면 그 값을,
+ *        없으면 기본값 [GestureConfig.MOVE_SENSITIVITY]를 쓴다. 트래커는 설정이 **어디서 왔는지**
+ *        (DataStore/Flow 등)는 전혀 모른다 — 값만 받는 순수 클래스로 남는다.
+ * @param scrollPxPerStep 휠 1스텝에 해당하는 centroid 이동 거리 (px). 작을수록 스크롤이 빠르다.
+ *        나눗수이므로 반드시 양수여야 한다(호출부는 [GestureSettings.sanitized]를 통과한 값을 넘긴다).
  */
-class MultiTouchGestureTracker {
+class MultiTouchGestureTracker(
+    private val moveSensitivity: Float = GestureConfig.MOVE_SENSITIVITY,
+    private val scrollPxPerStep: Float = GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP,
+) {
+
+    /** 사용자 설정을 그대로 받는 편의 생성자 — 호출부가 필드를 하나씩 풀지 않아도 된다. */
+    constructor(settings: GestureSettings) : this(
+        moveSensitivity = settings.moveSensitivity,
+        scrollPxPerStep = settings.scrollPxPerStep,
+    )
+
+    init {
+        // 0이면 스크롤 스텝 계산이 0으로 나누기가 되어 Infinity 스텝이 나간다.
+        require(scrollPxPerStep > 0f) {
+            "scrollPxPerStep must be positive but was $scrollPxPerStep"
+        }
+    }
 
     /** 현재 구간의 손가락 개수. 구간이 없으면 0. */
     private var segmentPointerCount = 0
@@ -165,8 +188,8 @@ class MultiTouchGestureTracker {
             totalMoved > GestureConfig.MOVE_MIN_DISTANCE_PX
         ) {
             MoveDelta(
-                dx = dx * GestureConfig.MOVE_SENSITIVITY,
-                dy = dy * GestureConfig.MOVE_SENSITIVITY,
+                dx = dx * moveSensitivity,
+                dy = dy * moveSensitivity,
             )
         } else {
             null
@@ -188,8 +211,8 @@ class MultiTouchGestureTracker {
      * 방출할 스텝이 하나도 없으면 null을 돌려준다.
      */
     private fun accumulateScroll(dx: Float, dy: Float): ScrollDelta? {
-        scrollRemainderX += dx / GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP
-        scrollRemainderY += dy / GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP
+        scrollRemainderX += dx / scrollPxPerStep
+        scrollRemainderY += dy / scrollPxPerStep
 
         // toInt()는 0 방향으로 버리므로 음수 잔차도 대칭으로 처리된다 (-1.7 → -1, 잔차 -0.7).
         val stepsX = scrollRemainderX.toInt()

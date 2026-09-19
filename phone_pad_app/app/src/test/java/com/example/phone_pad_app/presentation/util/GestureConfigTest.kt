@@ -67,6 +67,34 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `사용자 조정 범위는 기본값을 포함한다`() {
+        // 기본값이 범위 밖이면 설정 화면을 한 번 열기만 해도 값이 경계로 끌려가 동작이 바뀐다.
+        assertTrue(GestureConfig.MOVE_SENSITIVITY_MIN < GestureConfig.MOVE_SENSITIVITY_MAX)
+        assertTrue(GestureConfig.MOVE_SENSITIVITY >= GestureConfig.MOVE_SENSITIVITY_MIN)
+        assertTrue(GestureConfig.MOVE_SENSITIVITY <= GestureConfig.MOVE_SENSITIVITY_MAX)
+
+        assertTrue(GestureConfig.SCROLL_PX_PER_STEP_MIN < GestureConfig.SCROLL_PX_PER_STEP_MAX)
+        assertTrue(GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP >= GestureConfig.SCROLL_PX_PER_STEP_MIN)
+        assertTrue(GestureConfig.SCROLL_SENSITIVITY_PX_PER_STEP <= GestureConfig.SCROLL_PX_PER_STEP_MAX)
+    }
+
+    @Test
+    fun `이동 감도 하한은 0보다 크다`() {
+        // 0이면 커서가 전혀 움직이지 않아 "고장난 앱"이 된다 — 슬라이더로도 도달 불가여야 한다.
+        assertTrue(GestureConfig.MOVE_SENSITIVITY_MIN > 0f)
+    }
+
+    @Test
+    fun `스크롤 스텝 거리 하한도 탭 최대 이동 거리보다 크다`() {
+        // 위 `스크롤 1스텝 거리는...` 테스트와 같은 불변식을 **사용자가 도달 가능한 최솟값**에
+        // 대해서도 강제한다. 하한을 낮추는 순간 슬라이더를 끝까지 내린 사용자만 스크롤 진입이
+        // 튀는, 재현하기 까다로운 버그가 된다.
+        assertTrue(
+            GestureConfig.SCROLL_PX_PER_STEP_MIN > GestureConfig.TAP_MAX_DISTANCE_PX
+        )
+    }
+
+    @Test
     fun `더블탭 상수는 확정 스펙 값과 일치한다`() {
         assertEquals(300L, GestureConfig.DOUBLE_TAP_INTERVAL_MS)
         assertEquals(40f, GestureConfig.DOUBLE_TAP_DISTANCE_PX, 0.001f)

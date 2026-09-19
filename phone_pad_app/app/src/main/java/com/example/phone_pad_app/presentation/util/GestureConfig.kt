@@ -1,8 +1,25 @@
 package com.example.phone_pad_app.presentation.util
 
 object GestureConfig {
-    /** 이동 감도 배율 */
+    /**
+     * 이동 감도 배율 — **사용자 조정 가능**(설정 화면).
+     *
+     * 이 값은 런타임에 바뀔 수 있는 값의 **기본값**이자 단일 출처다. 실제 제스처 판정에 쓰이는 값은
+     * [GestureSettings][com.example.phone_pad_app.domain.model.GestureSettings]가 들고 있고,
+     * `MultiTouchGestureTracker`는 그것을 생성자로 주입받는다 — 상수를 직접 읽지 않는다.
+     * 허용 범위는 [MOVE_SENSITIVITY_MIN]..[MOVE_SENSITIVITY_MAX].
+     */
     const val MOVE_SENSITIVITY = 1.5f
+
+    /**
+     * [MOVE_SENSITIVITY]의 사용자 조정 하한.
+     *
+     * 0에 가까워지면 커서가 사실상 움직이지 않아 "고장난 것처럼" 보이므로 0.5배 아래로는 내리지 않는다.
+     */
+    const val MOVE_SENSITIVITY_MIN = 0.5f
+
+    /** [MOVE_SENSITIVITY]의 사용자 조정 상한 — 이 이상은 화면 폭을 한 번에 가로질러 조준이 불가능해진다. */
+    const val MOVE_SENSITIVITY_MAX = 4.0f
 
     /** 탭으로 인정할 최대 이동 거리 (px) */
     const val TAP_MAX_DISTANCE_PX = 20f
@@ -38,8 +55,24 @@ object GestureConfig {
      * - Windows에서 휠 1노치는 보통 3줄이므로, 실사용에서 편한 400px 정도의 2손가락 스와이프가
      *   10스텝 ≈ 30줄 ≈ 텍스트 한 화면 분량이 된다.
      * 실기기 체감 튜닝은 별도 과제(Phase 3 감도 설정 UI)로 남긴다.
+     *
+     * **사용자 조정 가능**([SCROLL_PX_PER_STEP_MIN]..[SCROLL_PX_PER_STEP_MAX]). 이 상수는 기본값의
+     * 단일 출처이며, 실제 변환에 쓰이는 값은 트래커가 생성자로 주입받는다.
      */
     const val SCROLL_SENSITIVITY_PX_PER_STEP = 40f
+
+    /**
+     * [SCROLL_SENSITIVITY_PX_PER_STEP]의 사용자 조정 하한 (= 가장 빠른 스크롤).
+     *
+     * **반드시 [TAP_MAX_DISTANCE_PX]보다 커야 한다.** 위 KDoc의 불변식을 슬라이더로도 깨지 못하게
+     * 막는 값이다 — 사용자가 하한까지 내려도 "스크롤 진입 순간 이미 1스텝 이상 쌓여 툭 튀는" 현상이
+     * 생기지 않아야 한다. 탭 한계(20px)보다 25%만 여유를 둔 값이므로, 탭 한계를 올릴 일이 생기면
+     * 이 값도 함께 올려야 한다(`GestureConfigTest`가 고정).
+     */
+    const val SCROLL_PX_PER_STEP_MIN = 25f
+
+    /** [SCROLL_SENSITIVITY_PX_PER_STEP]의 사용자 조정 상한 (= 가장 느린 스크롤). */
+    const val SCROLL_PX_PER_STEP_MAX = 100f
 
     /**
      * 멀티터치 해제 유예 시간 (ms).

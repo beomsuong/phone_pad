@@ -22,6 +22,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -32,6 +35,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.phone_pad_app.domain.model.ConnectionState
+import com.example.phone_pad_app.presentation.settings.SettingsScreen
+import com.example.phone_pad_app.presentation.settings.SettingsViewModel
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
@@ -39,25 +44,57 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
-fun TrackpadScreen(viewModel: TrackpadViewModel = hiltViewModel()) {
+fun TrackpadScreen(
+    viewModel: TrackpadViewModel = hiltViewModel(),
+    settingsViewModel: SettingsViewModel = hiltViewModel(),
+) {
     val uiState by viewModel.uiState.collectAsState()
+    val settingsState by settingsViewModel.uiState.collectAsState()
 
-    when (val state = uiState.connectionState) {
+    // Navigation 의존성을 새로 들이지 않고 상태 하나로 화면을 가른다 — 화면이 둘뿐이고
+    // 딥링크/백스택 요구도 없어서 라이브러리를 추가할 이유가 없다.
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+
+    val state = uiState.connectionState
+    // 설정은 연결 전 화면에서만 연다. 연결이 (재연결 등으로) 살아나면 설정 화면을 열어 둔 채로
+    // 두지 않고 곧바로 트랙패드로 돌아간다 — 제스처 표면이 설정 화면에 가려지면 안 된다.
+    val settingsAvailable = state is ConnectionState.Disconnected || state is ConnectionState.Error
+
+    if (showSettings && settingsAvailable) {
+        SettingsScreen(
+            settings = settingsState.settings,
+            isLoaded = settingsState.isLoaded,
+            onMoveSensitivityChange = settingsViewModel::setMoveSensitivity,
+            onScrollPxPerStepChange = settingsViewModel::setScrollPxPerStep,
+            onResetToDefaults = settingsViewModel::resetToDefaults,
+            onBack = { showSettings = false },
+        )
+        return
+    }
+
+    when (state) {
         is ConnectionState.Disconnected -> ConnectPanel(
             hostInput = uiState.hostInput,
             onHostChange = viewModel::onHostInputChange,
             onConnect = viewModel::connect,
+            onOpenSettings = { showSettings = true },
             errorMessage = null,
         )
         is ConnectionState.Error -> ConnectPanel(
             hostInput = uiState.hostInput,
             onHostChange = viewModel::onHostInputChange,
             onConnect = viewModel::connect,
+            onOpenSettings = { showSettings = true },
             errorMessage = state.message,
         )
         is ConnectionState.Connecting -> ConnectingPanel()
         is ConnectionState.Connected -> TrackpadSurface(
             host = state.host,
+            // 제스처 판정에 쓰이는 값은 이 컴포지션 시점의 설정값이다. 설정은 연결 전에만
+            // 바꿀 수 있으므로 제스처 도중 값이 바뀌는 경합은 없지만, 값이 바뀌면
+            // pointerInput 블록이 재시작되도록 key로도 넘긴다(아래 참조).
+            moveSensitivity = settingsState.settings.moveSensitivity,
+            scrollPxPerStep = settingsState.settings.scrollPxPerStep,
             onMove = viewModel::sendMove,
             onScroll = viewModel::sendScroll,
             onClick = viewModel::sendClick,
@@ -76,6 +113,7 @@ private fun ConnectPanel(
     hostInput: String,
     onHostChange: (String) -> Unit,
     onConnect: () -> Unit,
+    onOpenSettings: () -> Unit,
     errorMessage: String?,
 ) {
     Box(
@@ -121,6 +159,13 @@ private fun ConnectPanel(
             ) {
                 Text("연결")
             }
+            Spacer(modifier = Modifier.height(8.dp))
+            // 설정 진입은 여기(연결 전)에만 둔다 — 연결 후 화면은 전체가 제스처 표면이라
+            // 버튼을 놓으면 그만큼 트랙패드 면적을 잃고 오터치도 생긴다.
+            // material-icons-extended 의존성을 새로 들이지 않으려고 텍스트 버튼으로 둔다.
+            TextButton(onClick = onOpenSettings) {
+                Text("감도 설정")
+            }
         }
     }
 }
@@ -139,6 +184,8 @@ private fun ConnectingPanel() {
 @Composable
 private fun TrackpadSurface(
     host: String,
+    moveSensitivity: Float,
+    scrollPxPerStep: Float,
     onMove: (Float, Float) -> Unit,
     onScroll: (Int, Int) -> Unit,
     onClick: () -> Unit,
@@ -152,7 +199,11 @@ private fun TrackpadSurface(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF1A1A2E))
-            .pointerInput(Unit) {
+            // key에 감도 값을 넣는 이유: pointerInput 블록은 key가 같으면 재시작되지 않으므로,
+            // 값이 바뀌어도 블록 안에서 만들어진 트래커가 **처음 캡처한 낡은 값**을 계속 쓴다.
+            // 설정은 연결 전에만 바꿀 수 있어 실제로 이 경로를 타는 일은 드물지만, 그 전제가
+            // 깨지는 순간(예: 나중에 연결 중 설정 진입을 허용) 조용히 틀린 감도로 동작하게 된다.
+            .pointerInput(moveSensitivity, scrollPxPerStep) {
                 // 판정은 전부 순수 Kotlin 트래커가 담당하고, 여기서는
                 // "눌린 포인터 개수 + 중심 좌표 + 타임스탬프"만 넘기고 결정대로 콜백을 호출한다.
                 //
@@ -206,7 +257,12 @@ private fun TrackpadSurface(
                     }
 
                     awaitEachGesture {
-                        val tracker = MultiTouchGestureTracker()
+                        // 감도는 트래커 생성 시점에 못 박는다 — 제스처 하나가 진행되는 도중에
+                        // 배율이 바뀌면 같은 스와이프 안에서 커서 속도가 달라진다.
+                        val tracker = MultiTouchGestureTracker(
+                            moveSensitivity = moveSensitivity,
+                            scrollPxPerStep = scrollPxPerStep,
+                        )
                         val dragHold = DragHoldDetector()
                         try {
                             val down = awaitFirstDown(requireUnconsumed = false)

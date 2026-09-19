@@ -70,6 +70,11 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.1")
 
+    // DataStore (감도 설정 영속화) — 1.0.0은 Kotlin 1.8.10 / AGP 8.1.3와 호환되는 마지막 안정 라인.
+    // PreferenceDataStoreFactory는 순수 JVM 모듈(datastore-preferences-core)에 있어
+    // Robolectric 없이 JVM 단위 테스트에서 그대로 쓸 수 있다.
+    implementation("androidx.datastore:datastore-preferences:1.0.0")
+
     testImplementation("junit:junit:4.13.2")
     testImplementation("io.mockk:mockk:1.13.8")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.1")
