@@ -1,0 +1,15 @@
+# Phone Pad PC 서버 런타임 의존성
+#
+# 트레이 아이콘(선택 기능)에만 필요하다. 설치돼 있지 않으면 서버는 경고 한 줄을
+# 출력하고 콘솔 모드로 그대로 동작한다 (`python server.py --no-tray` 와 동일).
+#
+#   pip install -r requirements.txt
+#
+# 하한 근거: Pillow 11.0.0 이 Python 3.13 용 휠을 처음 제공한다(2024-10).
+# pystray 0.19.5 는 순수 파이썬이라 인터프리터 버전을 타지 않지만,
+# Windows 백엔드 수정이 반영된 버전을 하한으로 잡는다.
+pystray>=0.19.5
+Pillow>=11.0.0
+
+# 테스트 전용(런타임 아님): pytest
+#   python -m pytest -q

@@ -1,14 +1,25 @@
+import argparse
+import atexit
 import json
 import socket
+import sys
 import threading
 import uuid
 
+import tray
 from input_controller import InputController
 
 HOST = "0.0.0.0"
 TCP_PORT = 9000
 UDP_PORT = 9001
 UDP_BUFFER_SIZE = 2048
+
+# accept()/recvfrom() 이 이 주기로 깨어나 정지 신호를 확인한다.
+# 짧을수록 종료가 빠르지만 idle CPU 를 쓴다 - 0.5s 는 사용자가 "종료"를 누르고
+# 즉시 사라진다고 느끼는 범위 안이다.
+ACCEPT_TIMEOUT_S = 0.5
+# 종료 시 서버 스레드를 기다리는 시간. accept 타임아웃의 몇 배로 잡는다.
+SHUTDOWN_JOIN_TIMEOUT_S = 3.0
 
 # TCP heartbeat (AGENTS.md 섹션 4 / Phase 2)
 # 클라이언트는 HEARTBEAT_INTERVAL_S 마다 {"type":"HEARTBEAT"} 를 보내고,
@@ -178,32 +189,241 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
         print(f"[-] Disconnected: {addr}")
 
 
-def main():
+def release_drag(controller: InputController, reason: str = "shutdown") -> bool:
+    """종료 경로에서 드래그를 강제로 놓는다. 예외를 밖으로 던지지 않는다.
+
+    `InputController._drag_end` 가 이미 멱등이라(드래그 중이 아니면 아무것도 하지
+    않고 False) 몇 번 호출해도 안전하다 - 정상 종료 경로와 `atexit` 안전장치가
+    둘 다 호출하는 것을 전제로 한다.
+    """
+    try:
+        if controller.force_release_drag():
+            print(f"[!] Drag was active at {reason} - left button released")
+            return True
+    except Exception as e:
+        print(f"[!] Failed to release drag at {reason}: {e}")
+    return False
+
+
+class ServerRuntime:
+    """정지 가능한 TCP accept 루프 + UDP 리스너 묶음.
+
+    기존 `main()` 이 하던 일을 그대로 하되, `stop_event` 로 루프를 빠져나올 수
+    있고 바인드된 실제 포트를 노출한다(테스트가 포트 0 으로 띄울 수 있게).
+    `handle_client`/`udp_listener` 의 시그니처와 동작은 건드리지 않는다.
+    """
+
+    def __init__(
+        self,
+        controller: InputController,
+        registry: SessionRegistry,
+        host: str = HOST,
+        tcp_port: int = TCP_PORT,
+        udp_port: int = UDP_PORT,
+        accept_timeout: float = ACCEPT_TIMEOUT_S,
+        stop_event: threading.Event = None,
+    ):
+        self.controller = controller
+        self.registry = registry
+        self.host = host
+        self.requested_tcp_port = tcp_port
+        self.requested_udp_port = udp_port
+        self.accept_timeout = accept_timeout
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+        # 바인드가 끝나고 accept 루프에 진입했음을 알리는 신호 (테스트/기동 동기화용)
+        self.ready = threading.Event()
+        self.tcp_port = None
+        self.udp_port = None
+        self.tcp_socket = None
+        self.udp_socket = None
+        self._udp_thread = None
+
+    def bind(self):
+        """소켓을 만들고 바인드한다. 실패하면 예외를 그대로 올린다(포트 점유 등)."""
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_sock.bind((self.host, self.requested_udp_port))
+            # UDP 리스너도 주기적으로 stop_event 를 확인할 수 있어야 한다
+            udp_sock.settimeout(self.accept_timeout)
+        except OSError:
+            udp_sock.close()
+            raise
+
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tcp_sock.bind((self.host, self.requested_tcp_port))
+            tcp_sock.listen()
+            tcp_sock.settimeout(self.accept_timeout)
+        except OSError:
+            tcp_sock.close()
+            udp_sock.close()
+            raise
+
+        self.udp_socket = udp_sock
+        self.tcp_socket = tcp_sock
+        self.udp_port = udp_sock.getsockname()[1]
+        self.tcp_port = tcp_sock.getsockname()[1]
+
+    def serve(self):
+        """`bind()` 이후의 accept 루프. `stop_event` 가 서면 소켓을 닫고 반환한다."""
+        self._udp_thread = threading.Thread(
+            target=udp_listener,
+            args=(self.udp_socket, self.controller, self.registry, self.stop_event),
+            name="phone-pad-udp",
+            daemon=True,
+        )
+        self._udp_thread.start()
+        print(f"Phone Pad Server listening on UDP port {self.udp_port} (MOVE only) ...")
+        print(f"Phone Pad Server listening on TCP port {self.tcp_port} ...")
+        self.ready.set()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    conn, addr = self.tcp_socket.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    # 소켓이 닫혔다 (정지 경로). 조용히 빠져나간다.
+                    break
+                threading.Thread(
+                    target=handle_client,
+                    args=(conn, addr, self.controller, self.registry),
+                    daemon=True,
+                ).start()
+        finally:
+            self.close()
+
+    def run(self):
+        try:
+            self.bind()
+        except OSError:
+            self.stop_event.set()
+            raise
+        self.serve()
+
+    def stop(self):
+        """정지 요청. 아무 스레드에서나 호출 가능."""
+        self.stop_event.set()
+
+    def close(self):
+        """리슨 소켓과 UDP 소켓을 닫는다. 여러 번 호출해도 안전하다."""
+        self.ready.clear()
+        for sock in (self.tcp_socket, self.udp_socket):
+            if sock is None:
+                continue
+            try:
+                sock.close()
+            except OSError as e:
+                print(f"[!] Failed to close socket: {e}")
+
+
+def run_console(controller: InputController, registry: SessionRegistry,
+                runtime: ServerRuntime = None) -> int:
+    """트레이 없이 메인 스레드에서 서버를 돌린다 (기존 동작). Ctrl+C 로 종료."""
+    runtime = runtime if runtime is not None else ServerRuntime(controller, registry)
+    try:
+        runtime.run()
+    except KeyboardInterrupt:
+        print("[=] Interrupted - shutting down")
+        runtime.stop()
+    except OSError as e:
+        print(f"[!] Server failed to start: {e}")
+        return 1
+    finally:
+        runtime.close()
+        release_drag(controller, "shutdown")
+    return 0
+
+
+def run_with_tray(controller: InputController, registry: SessionRegistry,
+                  runtime: ServerRuntime = None, tray_factory=None,
+                  join_timeout: float = SHUTDOWN_JOIN_TIMEOUT_S) -> int:
+    """트레이를 메인 스레드에, 서버를 백그라운드 스레드에 두고 돌린다.
+
+    스레드 모델이 뒤집히는 이유: pystray 는 Windows 에서 메시지 루프를 메인
+    스레드가 소유해야 한다. 그래서 서버 쪽이 스레드로 내려간다.
+
+    종료 순서 (확정 설계 3):
+      stop 설정 -> 서버 스레드 join(타임아웃) -> force_release_drag -> 아이콘 제거.
+    서버 스레드가 예외로 죽으면(포트 점유 등) 트레이를 내리고 1 을 반환한다 -
+    아이콘만 남은 좀비 프로세스를 만들지 않기 위해서다 (확정 설계 4).
+    """
+    runtime = runtime if runtime is not None else ServerRuntime(controller, registry)
+    factory = tray_factory if tray_factory is not None else tray.TrayController
+    failures = []
+
+    def on_quit():
+        runtime.stop()
+        if server_thread.is_alive():
+            server_thread.join(timeout=join_timeout)
+            if server_thread.is_alive():
+                print("[!] Server thread did not stop in time - continuing shutdown")
+        release_drag(controller, "tray quit")
+
+    tray_controller = factory(
+        count_provider=lambda: len(registry.snapshot()),
+        on_quit=on_quit,
+        port=runtime.requested_tcp_port,
+    )
+
+    def server_main():
+        try:
+            runtime.run()
+        except BaseException as e:  # noqa: BLE001 - 어떤 실패든 좀비 아이콘을 남기면 안 된다
+            failures.append(e)
+            print(f"[!] Server stopped unexpectedly: {e!r}")
+        finally:
+            runtime.stop()
+            # 서버가 죽었는데 트레이만 남아 있으면 사용자는 서버가 도는 줄 안다.
+            tray_controller.stop()
+
+    server_thread = threading.Thread(target=server_main, name="phone-pad-server", daemon=True)
+    server_thread.start()
+
+    try:
+        tray_controller.run()
+    finally:
+        # 트레이가 (종료 메뉴든 예외든) 내려왔으면 서버도 반드시 함께 내린다.
+        runtime.stop()
+        server_thread.join(timeout=join_timeout)
+        release_drag(controller, "shutdown")
+
+    return 1 if failures else 0
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Phone Pad PC server")
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="run without the system tray icon (console mode, Ctrl+C to quit)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
     controller = InputController()
     registry = SessionRegistry()
 
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_sock.bind((HOST, UDP_PORT))
-    threading.Thread(
-        target=udp_listener, args=(udp_sock, controller, registry), daemon=True
-    ).start()
-    print(f"Phone Pad Server listening on UDP port {UDP_PORT} (MOVE only) ...")
+    # 안전장치: 정상 종료 경로를 안 거치고 인터프리터가 끝나도 버튼을 놓는다.
+    # `force_release_drag` 가 멱등이라 정상 경로와 중복 호출돼도 문제 없다.
+    atexit.register(release_drag, controller, "atexit")
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((HOST, TCP_PORT))
-        srv.listen()
-        print(f"Phone Pad Server listening on TCP port {TCP_PORT} ...")
-        while True:
-            conn, addr = srv.accept()
-            t = threading.Thread(
-                target=handle_client,
-                args=(conn, addr, controller, registry),
-                daemon=True,
-            )
-            t.start()
+    use_tray = not args.no_tray
+    if use_tray and not tray.tray_available():
+        print(
+            "[!] pystray/Pillow not available - running in console mode "
+            f"({tray.unavailable_reason()}). Install with: pip install -r requirements.txt"
+        )
+        use_tray = False
+
+    if use_tray:
+        return run_with_tray(controller, registry)
+    return run_console(controller, registry)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
