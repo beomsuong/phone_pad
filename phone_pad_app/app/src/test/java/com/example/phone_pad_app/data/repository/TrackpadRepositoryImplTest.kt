@@ -3,6 +3,7 @@ package com.example.phone_pad_app.data.repository
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
 import com.example.phone_pad_app.domain.model.ConnectionState
+import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import io.mockk.clearMocks
@@ -41,7 +42,15 @@ class TrackpadRepositoryImplTest {
     fun setUp() {
         tcpClient = mockk(relaxed = true)
         udpClient = mockk(relaxed = true)
-        repository = TrackpadRepositoryImpl(tcpClient, udpClient, loopDispatcher)
+        // 전송 실패 → Error 전이를 검증하는 테스트들이 있으므로 자동 재연결은 꺼 둔다
+        // (재연결이 켜지면 같은 실패가 Reconnecting으로 간다 — 그 동작은
+        // TrackpadRepositoryReconnectTest가 검증한다).
+        repository = TrackpadRepositoryImpl(
+            tcpClient,
+            udpClient,
+            loopDispatcher,
+            ReconnectPolicy.Disabled,
+        )
     }
 
     private suspend fun connectSuccessfully() {

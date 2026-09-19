@@ -3,6 +3,7 @@ package com.example.phone_pad_app.data.repository
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
 import com.example.phone_pad_app.domain.model.ConnectionState
+import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import io.mockk.clearMocks
@@ -52,7 +53,10 @@ class TrackpadRepositoryHeartbeatTest {
     fun setUp() {
         tcpClient = mockk(relaxed = true)
         udpClient = mockk(relaxed = true)
-        repository = TrackpadRepositoryImpl(tcpClient, udpClient, dispatcher)
+        // 이 클래스는 "유실 → Error" 전이 자체를 검증한다. 자동 재연결(Phase 4)은 그 전이를
+        // Reconnecting으로 바꾸므로, 정책을 꺼서 재연결 도입 이전의 의미를 그대로 보존한다
+        // (재연결 동작은 TrackpadRepositoryReconnectTest가 별도로 검증).
+        repository = TrackpadRepositoryImpl(tcpClient, udpClient, dispatcher, ReconnectPolicy.Disabled)
         coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns SESSION_A
         // 기본 스텁: 서버가 아무것도 보내지 않는 상태로 계속 매달려 있는 읽기
         coEvery { tcpClient.readLine() } coAnswers { awaitCancellation() }

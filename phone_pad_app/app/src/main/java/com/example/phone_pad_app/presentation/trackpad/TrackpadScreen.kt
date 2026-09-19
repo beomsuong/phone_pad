@@ -87,7 +87,15 @@ fun TrackpadScreen(
             onOpenSettings = { showSettings = true },
             errorMessage = state.message,
         )
-        is ConnectionState.Connecting -> ConnectingPanel()
+        is ConnectionState.Connecting -> ConnectingPanel(message = "연결 중...")
+        // 자동 재연결 중에는 IP 입력 화면으로 되돌리지 않는다 — 사용자가 할 일이 없고,
+        // 유실 때마다 화면이 뒤집히면 잠깐의 WiFi 끊김에도 세션이 끝난 것처럼 보인다.
+        // 대신 기다리기 싫은 사용자를 위해 "취소"(= 수동 연결 해제)만 내어준다.
+        is ConnectionState.Reconnecting -> ConnectingPanel(
+            message = "재연결 중… (${state.attempt}/${state.maxAttempts})",
+            hostLabel = state.host,
+            onCancel = viewModel::disconnect,
+        )
         is ConnectionState.Connected -> TrackpadSurface(
             host = state.host,
             // 제스처 판정에 쓰이는 값은 이 컴포지션 시점의 설정값이다. 설정은 연결 전에만
@@ -170,13 +178,39 @@ private fun ConnectPanel(
     }
 }
 
+/**
+ * 첫 연결(`Connecting`)과 자동 재연결(`Reconnecting`)이 함께 쓰는 진행 화면.
+ *
+ * 차이는 두 가지뿐이라 화면을 따로 만들지 않았다:
+ * - [hostLabel]: 재연결은 대상이 확정되어 있으므로 어디에 붙는 중인지 보여준다.
+ * - [onCancel]: **재연결일 때만** 준다. 첫 연결은 취소 버튼 없이 기존 그대로 두고,
+ *   재연결은 최대 55초까지 이어질 수 있어 빠져나갈 문이 필요하다.
+ */
 @Composable
-private fun ConnectingPanel() {
+private fun ConnectingPanel(
+    message: String,
+    hostLabel: String? = null,
+    onCancel: (() -> Unit)? = null,
+) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator()
             Spacer(modifier = Modifier.height(16.dp))
-            Text("연결 중...")
+            Text(message)
+            if (hostLabel != null) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = hostLabel,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (onCancel != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                TextButton(onClick = onCancel) {
+                    Text("취소")
+                }
+            }
         }
     }
 }
