@@ -24,17 +24,20 @@ phone_pad/
 │       ├── PhonePadApplication.kt
 │       ├── MainActivity.kt
 │       ├── domain/
-│       │   ├── model/         TrackpadEvent.kt, ConnectionState.kt
-│       │   ├── repository/    TrackpadRepository.kt (interface)
+│       │   ├── model/         TrackpadEvent.kt, ConnectionState.kt, GestureSettings.kt
+│       │   ├── repository/    TrackpadRepository.kt, SettingsRepository.kt (interface)
 │       │   └── usecase/       SendEventUseCase.kt
 │       ├── data/
 │       │   ├── network/       TcpClient.kt, UdpClient.kt, SessionHandshake.kt
-│       │   └── repository/    TrackpadRepositoryImpl.kt
-│       ├── di/                AppModule.kt, DispatcherModule.kt
+│       │   └── repository/    TrackpadRepositoryImpl.kt, DataStoreSettingsRepository.kt
+│       ├── di/                AppModule.kt, DispatcherModule.kt, DataStoreModule.kt
 │       └── presentation/
 │           ├── util/          GestureConfig.kt
+│           ├── settings/      SettingsScreen.kt, SettingsViewModel.kt, SettingsUiState.kt,
+│           │                   ScrollSpeedSlider.kt
 │           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt,
-│                               MultiTouchGestureTracker.kt, DoubleTapDetector.kt
+│                               MultiTouchGestureTracker.kt, DoubleTapDetector.kt,
+│                               DragHoldDetector.kt
 └── pc_server/                 ← Windows Python 서버
     ├── server.py
     ├── input_controller.py
@@ -73,7 +76,7 @@ phone_pad/
 - **MOVE 이벤트만 UDP**, 나머지(클릭·스크롤·드래그·heartbeat 등) **전부 TCP**
 - "이동 좌표인가?" 한 가지 기준으로 채널 결정. 애매하면 TCP.
 
-### 현재 구현 (하이브리드 — Phase 2 완료 + Phase 3 진행 중)
+### 현재 구현 (하이브리드 — Phase 2·3 완료)
 
 **TCP 9000** — newline-delimited JSON (한 줄 = 한 이벤트, `\n` 종료)
 
@@ -164,7 +167,12 @@ phone_pad/
 - 정확히 `DOUBLE_TAP_INTERVAL_MS` 경계에서 두 번째 탭이 오면(판정은 `System.currentTimeMillis()`, 발사는 코루틴 `delay`라 시간축이 미세하게 다름) 아주 드물게 CLICK과 DOUBLE_CLICK이 둘 다 나갈 수 있음 — 영향이 미미해(실제 창은 한 프레임 수준) 현재는 허용
 
 ### 감도 상수 (`GestureConfig.kt`)
+
+> **사용자 조정 가능한 값은 `MOVE_SENSITIVITY`와 `SCROLL_SENSITIVITY_PX_PER_STEP` 두 개뿐**이다(설정 화면 → DataStore 영속화, `GestureSettings`). 이 상수들은 **기본값의 단일 출처**로 유지되며 "기본값으로 복원"은 저장된 키를 지워 이 값을 다시 따라가게 한다. 나머지 상수(탭 시간/거리, 더블탭 간격, 드래그 홀드 시간, 해제 유예)는 서로 얽힌 불변식(`DRAG_HOLD_THRESHOLD_MS == TAP_MAX_DURATION_MS`, `MULTI_TOUCH_RELEASE_GRACE_MS << TAP_MAX_DURATION_MS`, `SCROLL_PX_PER_STEP_MIN > TAP_MAX_DISTANCE_PX`)이 있어 사용자에게 열지 않는다. 설정값은 `MultiTouchGestureTracker` 생성자로 주입되며(트래커는 값의 출처를 모르는 순수 Kotlin), 설정 화면은 연결 전(Disconnected/Error) 화면에서만 진입한다.
+
 ```kotlin
+MOVE_SENSITIVITY_MIN / MAX = 0.5f / 4.0f      // 설정 슬라이더 범위 (이동 배율)
+SCROLL_PX_PER_STEP_MIN / MAX = 25f / 100f     // 설정 슬라이더 범위. MIN은 반드시 TAP_MAX_DISTANCE_PX(20)보다 커야 함(사각지대 방지) — GestureConfigTest가 강제
 MOVE_SENSITIVITY       = 1.5f   // 이동 배율
 TAP_MAX_DISTANCE_PX    = 20f    // 탭 판정 최대 이동 거리
 TAP_MAX_DURATION_MS    = 200L   // 탭 판정 최대 지속 시간
@@ -213,11 +221,11 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - `pc_server/server.py` — UDP 소켓 + 세션 매핑 + heartbeat 판정 완료. TCP 이벤트 처리(`handle_event` 호출)는 이벤트 단위로 예외를 격리해 필드값이 깨진 이벤트 하나가 세션 전체를 끊지 않는다
 - `pc_server/input_controller.py` — `_move`에 한정된 sub-pixel 잔차 누적 이슈(느린 정밀 이동 시 델타 소실) — 별도 이슈로 개선 권장. SCROLL은 Android가 잔차를 완전히 처리해 보내므로 해당 없음
 
-### 🔶 Phase 3 — 제스처 확장 (남은 항목은 감도 설정 UI 2개)
+### ✅ Phase 3 — 제스처 확장 (완료)
 - [x] 1손가락 더블탭 → DOUBLE_CLICK — 지연 후 확정 방식(`DOUBLE_TAP_INTERVAL_MS`=300ms 안에 두 번째 탭이 오면 CLICK 두 개 대신 DOUBLE_CLICK 하나). 서버는 down-up-down-up 4개를 `SendInput` 1회로 원자적으로 전송(커서 이동 없음). 다른 제스처(드래그/스크롤/우클릭) 시작 시 대기 중인 클릭을 취소가 아니라 즉시 발사(flush)해 클릭 유실·오발동을 막음
 - [x] 탭홀드(200ms↑) + 드래그 → DRAG_START / DRAG_END — 승격 판정은 `DragHoldDetector`(순수 클래스)로 분리해 단위 테스트 가능. 승격 후 이동은 여전히 UDP MOVE 그대로 사용(새 이벤트 없음). 서버는 연결 종료 시(정상/heartbeat 타임아웃/예외 전부) 드래그가 활성 상태면 강제로 버튼을 놓는 안전장치를 가짐
-- [ ] 감도 설정 화면 (Android Settings Screen)
-- [ ] `GestureConfig`를 DataStore로 영속화
+- [x] 감도 설정 화면 (Android Settings Screen) — 조정 가능한 값은 포인터 속도(0.5~4.0배)와 스크롤 속도(25~100px/스텝) 두 개뿐. 스크롤 슬라이더는 방향을 뒤집어 "오른쪽 = 빠름"으로 보여준다(`ScrollSpeedSlider`). 연결 전(Disconnected/Error) 화면의 "감도 설정" 버튼으로만 진입 — 연결 후 화면은 전체가 제스처 표면이라 버튼을 두지 않는다. Navigation 의존성 없이 상태 기반 전환 + `BackHandler`
+- [x] `GestureConfig`를 DataStore로 영속화 — `androidx.datastore:datastore-preferences:1.0.0`. 키 `move_sensitivity`/`scroll_px_per_step`, 읽기·쓰기 양쪽에서 `GestureSettings.sanitized()`(범위 clamp, NaN/Infinity는 기본값)를 통과. 슬라이더는 `onValueChangeFinished`에서만 저장. "기본값으로 복원"은 기본값을 쓰지 않고 키를 삭제
 
 **Phase 3 구현 시 핵심 파일:**
 - `presentation/trackpad/DoubleTapDetector.kt` — 완료. Compose 비의존 순수 상태 머신("직전 탭 1개"만 기억), `MultiTouchGestureTracker`와 같은 설계 원칙
@@ -226,6 +234,11 @@ HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MIS
 - `presentation/trackpad/TrackpadScreen.kt` — `pointerInput` 블록을 `coroutineScope`로 감싸 제스처 하나보다 오래 사는 스코프에서 지연 클릭 job, `flushPendingClick()`, 드래그 홀드 타이머 경합(`AwaitPointerEventScope.withTimeoutOrNull`)을 관리. 코루틴 타이밍 자체는 여전히 자동 테스트 없음(Compose 의존) — 승격 판정 로직만 `DragHoldDetector`로 분리해 부분적으로 해소됨
 - `domain/model/TrackpadEvent.kt` — `DoubleClick(button = "left")`, `DragStart`/`DragEnd`(필드 없는 `object`) 추가. 전부 CLICK과 같은 등급(저빈도)이라 전송 실패 시 `Error`로 알림(MOVE/SCROLL처럼 조용히 버리지 않음)
 - `data/network/TcpClient.kt` — `send()` 전용 단일 스레드 디스패처(`Dispatchers.IO.limitedParallelism(1)`) 도입. 이벤트별로 별도 코루틴에서 보내는 구조상 공용 IO 풀(병렬도 64)에서는 순서가 뒤바뀔 수 있어(DRAG_START 직후 DRAG_END처럼 순서가 의미를 갖는 쌍에서 특히 위험), 전송 순서를 호출 순서에 맞춰 직렬화
+- `domain/model/GestureSettings.kt` — 조정 가능한 두 값(`moveSensitivity`, `scrollPxPerStep`)과 clamp 로직(`sanitized()`)을 가진 순수 data class. `coerceIn`은 NaN을 그대로 통과시키므로 유한성 검사를 먼저 한다(NaN 배율이 판정기에 들어가면 모든 델타가 NaN이 되어 커서가 영구 정지). 기본값은 `GestureConfig` 상수 참조. 주의: domain이 presentation.util의 `GestureConfig`를 import하는 계층 방향 역전이 있음(기존 `TrackpadUiState`와 동일 패턴) — 정리하려면 `GestureConfig`를 domain으로 옮겨야 함
+- `data/repository/DataStoreSettingsRepository.kt` + `di/DataStoreModule.kt` — DataStore(Preferences) 구현과 Hilt 제공. `IOException`은 빈 Preferences로 복구(설정을 못 읽는다고 트랙패드가 멈추면 안 됨), 그 외 예외는 그대로 올림
+- `presentation/settings/` — `SettingsScreen`/`SettingsViewModel`/`SettingsUiState`/`ScrollSpeedSlider`. 저장 시 `uiState`가 아니라 `settings.first()`로 최신 저장값을 읽어 한 필드만 바꾼다(`WhileSubscribed`라 구독자가 없으면 `uiState`가 멈춰 있을 수 있음)
+- `presentation/trackpad/MultiTouchGestureTracker.kt` — 이동 배율·스크롤 px/스텝을 생성자 파라미터로 주입(기본값 = `GestureConfig` 상수, `GestureSettings` 편의 생성자 포함). 기존 판정 로직/테스트 무변경
+- `presentation/trackpad/TrackpadScreen.kt` — 트래커 생성 시 현재 설정값을 넘기고 `pointerInput` key에 설정값을 포함(안 넣으면 블록 안에 캡처된 낡은 값이 남는다)
 - `pc_server/input_controller.py` — `_double_click(button)`, `_drag_start()`/`_drag_end()`/`force_release_drag()` 완료. 드래그 상태는 프로세스 전역(현재 컨트롤러가 프로세스당 하나)
 - `pc_server/server.py` — `handle_client`의 `finally`에서 연결 종료 시 드래그 강제 해제 호출
 
@@ -339,7 +352,9 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | heartbeat 리셋 비대칭 | 서버는 CLICK 등 어떤 상향 데이터로도 미응답 카운터가 리셋되지만, 서버→클라이언트 하향 트래픽은 ACK뿐이라 Android 쪽은 사실상 ACK만이 유일한 리셋 수단. 한쪽 방향만 끊기는 비대칭 시나리오가 가능하므로 Phase 4 재연결 설계 시 전제로 고려 |
 | Android 절전/도즈 환경의 heartbeat | 화면 꺼짐·도즈·Wi-Fi 절전으로 5초 주기 전송이 지연되면 서버가 먼저 15초 타임아웃으로 끊는 오탐 가능성 — 실기기 미검증, Phase 4 재연결/wake lock 검토 시 함께 다룰 것 |
 | 스크롤 방향 규약 | 현재는 "자연 스크롤"(macOS 기본, 손가락과 콘텐츠가 같은 방향)로 구현됨 — Windows 정밀 터치패드 기본값("아래로 움직이면 아래로 스크롤")과는 반대일 수 있음. 실기기 미검증. 뒤집을 경우 `input_controller.py`의 `_scroll()` 한 곳만 수정하면 됨(Android는 절대 동시 수정 금지 — 두 사이드가 같이 뒤집으면 원위치됨) |
-| SCROLL_SENSITIVITY_PX_PER_STEP 체감 | 기본값 40px/스텝은 계산 근거(휠 1노치≈3줄, 400px 스와이프≈10스텝≈한 화면)는 있으나 실기기 미검증 — Phase 3 감도 설정 UI 작업 시 함께 튜닝 |
+| SCROLL_SENSITIVITY_PX_PER_STEP 체감 | 기본값 40px/스텝은 계산 근거(휠 1노치≈3줄, 400px 스와이프≈10스텝≈한 화면)는 있으나 실기기 미검증. 이제 사용자가 설정 화면에서 조정할 수 있으므로(25~100px/스텝) 기본값 자체의 튜닝 우선순위는 낮아졌다. 슬라이더 범위(포인터 0.5~4.0배, 스크롤 25~100px/스텝)의 양 끝 체감도 계산 근거만 있고 실기기 미검증 |
+| 설정 영속화 실기기 검증 | 앱 완전 종료 후 재실행 시 값 유지, 회전 시 `rememberSaveable` 복원, 시스템 백 제스처로 설정→연결 화면 복귀(앱 종료로 새지 않는지), 소형 화면·키보드 노출 시 "감도 설정" 버튼 가림 여부는 실기기 미검증. `SettingsScreen`의 슬라이더 커밋 타이밍·`BackHandler`는 Compose UI 테스트가 없다(순수 로직만 분리 커버) |
+| DataStore 1.0.0 + Windows JVM 테스트 제약 | DataStore 1.0.0은 임시 파일을 `File.renameTo`로 덮어쓰는데 Windows JVM에서는 대상이 있으면 실패해, **같은 파일에 두 번째로 쓰는** 실파일 테스트가 이 환경에서만 `IOException: Unable to rename`으로 실패한다(Android에서는 정상). 그래서 다중 쓰기 검증 2건(필드 독립성, reset의 키 제거)은 `DataStore<Preferences>` 계약의 in-memory 대역으로 검증하고 실파일 왕복 테스트는 단일 쓰기만 한다. DataStore 1.1+는 해결됐으나 Kotlin 1.8.10/AGP 8.1.3 유지를 위해 1.0.0 사용 — 툴체인을 올리는 시점에 함께 올릴 것 |
 | 축 잠금(axis lock) 없음 | 2손가락 대각선 드래그 시 수직/수평 휠이 동시에 나감 — 실기기에서 거슬리면 별도 이슈로 축 고정 로직 검토 |
 | 더블탭 300ms 경계 레이스 | 두 번째 탭이 정확히 `DOUBLE_TAP_INTERVAL_MS` 경계에 오면(판정은 `currentTimeMillis`, 발사는 코루틴 `delay`라 시간축이 미세하게 다름) 아주 드물게 CLICK과 DOUBLE_CLICK이 둘 다 나갈 수 있음. 실질 창이 한 프레임(~16ms) 수준으로 영향 미미해 현재는 허용, 완전 제거는 구조적으로 어려움 |
 | `TrackpadScreen`의 지연/flush/타이머 로직에 자동 테스트 없음 | 더블탭 대기·취소·flush, 드래그 홀드 타이머 경합이 Compose `awaitEachGesture`에 묶여 있어 순수 단위 테스트가 없다(승격 판정 자체는 `DragHoldDetector`/`DoubleTapDetector`로 분리되어 부분 해소). 다음에 이 영역을 건드릴 때는 남은 코루틴 타이밍 로직도 순수 클래스로 추출해 `runTest` 가상 시간으로 회귀를 고정할 것 |
