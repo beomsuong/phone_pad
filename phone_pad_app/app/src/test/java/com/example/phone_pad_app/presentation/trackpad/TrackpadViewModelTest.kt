@@ -95,6 +95,36 @@ class TrackpadViewModelTest {
     }
 
     @Test
+    fun `sendDragStart는 DRAG_START 이벤트를 보낸다`() {
+        viewModel.sendDragStart()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DragStart) }
+        coVerify(exactly = 0) { sendEventUseCase(TrackpadEvent.DragEnd) }
+        // 드래그는 클릭 계열로 번역되지 않는다 — 버튼을 누른 채 유지하는 별개의 상태 전이다
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Click::class)) }
+    }
+
+    @Test
+    fun `sendDragEnd는 DRAG_END 이벤트를 보낸다`() {
+        viewModel.sendDragEnd()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DragEnd) }
+        coVerify(exactly = 0) { sendEventUseCase(TrackpadEvent.DragStart) }
+    }
+
+    @Test
+    fun `드래그 중 이동은 기존 MOVE 경로를 그대로 쓴다`() {
+        // 확정 스펙: DRAG 전용 이동 이벤트는 없다. START → MOVE → END 순서만 유지하면 된다.
+        viewModel.sendDragStart()
+        viewModel.sendMove(3f, -4f)
+        viewModel.sendDragEnd()
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DragStart) }
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.Move(3f, -4f)) }
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DragEnd) }
+    }
+
+    @Test
     fun `sendMove는 MOVE 이벤트를 보낸다 - 클릭 경로와 섞이지 않는다`() {
         viewModel.sendMove(1.5f, -2f)
 

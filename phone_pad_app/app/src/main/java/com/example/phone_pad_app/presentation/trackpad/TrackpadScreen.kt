@@ -63,6 +63,8 @@ fun TrackpadScreen(viewModel: TrackpadViewModel = hiltViewModel()) {
             onClick = viewModel::sendClick,
             onDoubleClick = viewModel::sendDoubleClick,
             onRightClick = viewModel::sendRightClick,
+            onDragStart = viewModel::sendDragStart,
+            onDragEnd = viewModel::sendDragEnd,
             onDisconnect = viewModel::disconnect,
         )
     }
@@ -142,6 +144,8 @@ private fun TrackpadSurface(
     onClick: () -> Unit,
     onDoubleClick: () -> Unit,
     onRightClick: () -> Unit,
+    onDragStart: () -> Unit,
+    onDragEnd: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     Box(
@@ -180,86 +184,169 @@ private fun TrackpadSurface(
                         }
                     }
 
+                    /**
+                     * [DragHoldDetector]의 판정을 그대로 전송으로 옮긴다.
+                     *
+                     * 승격(Start) 시에는 우클릭과 같은 처리를 함께 한다:
+                     * - 대기 중인 지연 클릭을 즉시 발사한다 — 버튼이 눌린 채 커서가 끌려간 뒤에
+                     *   도착하면 엉뚱한 위치가 클릭된다 (F-1과 같은 이유).
+                     * - 더블탭 감지기를 리셋한다 — 드래그를 사이에 둔 무관한 두 탭이 우연히
+                     *   더블탭으로 묶이지 않게 한다 (F-4와 같은 이유).
+                     */
+                    fun handleDragHold(signal: DragHoldSignal) {
+                        when (signal) {
+                            DragHoldSignal.Start -> {
+                                flushPendingClick()
+                                doubleTapDetector.reset()
+                                onDragStart()
+                            }
+                            DragHoldSignal.End -> onDragEnd()
+                            DragHoldSignal.None -> Unit
+                        }
+                    }
+
                     awaitEachGesture {
                         val tracker = MultiTouchGestureTracker()
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        var lastTimestamp = System.currentTimeMillis()
-                        tracker.onPointerEvent(
-                            pointerCount = GestureConfig.SINGLE_POINTER_COUNT,
-                            x = down.position.x,
-                            y = down.position.y,
-                            timestampMs = lastTimestamp,
-                        )
-
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            lastTimestamp = System.currentTimeMillis()
-
-                            val pressed = event.changes.filter { it.pressed }
-                            if (pressed.isEmpty()) break
-
-                            var sumX = 0f
-                            var sumY = 0f
-                            pressed.forEach {
-                                sumX += it.position.x
-                                sumY += it.position.y
-                            }
-
-                            val decision = tracker.onPointerEvent(
-                                pointerCount = pressed.size,
-                                x = sumX / pressed.size,
-                                y = sumY / pressed.size,
+                        val dragHold = DragHoldDetector()
+                        try {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            var lastTimestamp = System.currentTimeMillis()
+                            tracker.onPointerEvent(
+                                pointerCount = GestureConfig.SINGLE_POINTER_COUNT,
+                                x = down.position.x,
+                                y = down.position.y,
+                                timestampMs = lastTimestamp,
+                            )
+                            dragHold.onGestureStart(
+                                x = down.position.x,
+                                y = down.position.y,
                                 timestampMs = lastTimestamp,
                             )
 
-                            val move = decision.move
-                            val scroll = decision.scroll
-                            if (move != null || scroll != null) {
-                                // 이 제스처가 드래그/스크롤로 확정됐다 — 대기 중이던 이전 탭의
-                                // 클릭이 있다면 지금 내보낸다 (F-1, 커서가 옮겨가기 전에).
-                                flushPendingClick()
-                            }
-                            if (move != null) {
-                                onMove(move.dx, move.dy)
-                            }
-                            if (scroll != null) {
-                                onScroll(scroll.dx, scroll.dy)
-                            }
-                            if (move != null || scroll != null) {
-                                pressed.forEach { it.consume() }
-                            }
-                        }
-
-                        val end = tracker.onGestureEnd(lastTimestamp)
-                        when (end.clickButton) {
-                            MultiTouchGestureTracker.BUTTON_LEFT -> {
-                                // 대기 중인 지연 클릭은 어느 쪽으로 판정되든 일단 취소한다:
-                                // - 더블탭 확정이면 그 클릭은 DOUBLE_CLICK에 흡수되어 사라져야 하고,
-                                // - 아니면 이 탭이 새 기준이 되므로 낡은 타이머를 남겨둘 이유가 없다.
-                                pendingClickJob?.cancel()
-                                pendingClickJob = null
-
-                                if (doubleTapDetector.onTap(end.x, end.y, lastTimestamp)) {
-                                    // 개별 CLICK 두 개가 아니라 DOUBLE_CLICK 하나만 나간다.
-                                    onDoubleClick()
+                            while (true) {
+                                // 손가락이 완전히 정지해 있으면 새 포인터 이벤트가 아예 오지 않는다
+                                // (Android는 움직일 때만 MotionEvent를 준다). 그래서 "제자리 유지
+                                // 시간"은 이벤트만 기다려서는 잴 수 없고, 남은 홀드 시간과 경합시켜야
+                                // 한다 — 타임아웃이 이기면 그게 곧 "제자리로 버텼다"는 증거다.
+                                // 승격 후보가 아니면(이미 승격했거나 탈락) null이 와서 기존처럼
+                                // 타임아웃 없이 기다린다.
+                                //
+                                // 여기서 쓰는 withTimeoutOrNull은 kotlinx의 것이 아니라
+                                // AwaitPointerEventScope의 멤버다(import 없이 해석된다) —
+                                // 포인터 입력 스코프 전용 구현이라 타임아웃이 제스처 루프 자체를
+                                // 취소하지 않고 null만 돌려준다.
+                                val remainingHold = dragHold.remainingHoldMs(System.currentTimeMillis())
+                                val event = if (remainingHold == null) {
+                                    awaitPointerEvent()
                                 } else {
-                                    // 첫 탭 — 두 번째 탭이 올 시간을 준 뒤에야 CLICK을 보낸다.
-                                    // (모든 좌클릭이 이만큼 늦어지는 것은 의도된 트레이드오프다)
-                                    pendingClickJob = launch {
-                                        delay(GestureConfig.DOUBLE_TAP_INTERVAL_MS)
-                                        onClick()
-                                    }
+                                    withTimeoutOrNull(remainingHold) { awaitPointerEvent() }
+                                }
+
+                                if (event == null) {
+                                    handleDragHold(dragHold.onHoldTimeout(System.currentTimeMillis()))
+                                    continue
+                                }
+
+                                lastTimestamp = System.currentTimeMillis()
+
+                                val pressed = event.changes.filter { it.pressed }
+                                if (pressed.isEmpty()) break
+
+                                var sumX = 0f
+                                var sumY = 0f
+                                pressed.forEach {
+                                    sumX += it.position.x
+                                    sumY += it.position.y
+                                }
+                                val centroidX = sumX / pressed.size
+                                val centroidY = sumY / pressed.size
+
+                                // 손가락 개수 변화 → 드래그 홀드 즉시 해제(확정 스펙 5번).
+                                // 승격 판정도 여기서 한 번 더 본다(떨림 이벤트로 타이머가 계속
+                                // 갱신되는 동안에도 시간이 차면 승격되도록).
+                                handleDragHold(
+                                    dragHold.onPointerEvent(
+                                        pointerCount = pressed.size,
+                                        x = centroidX,
+                                        y = centroidY,
+                                        timestampMs = lastTimestamp,
+                                    )
+                                )
+
+                                val decision = tracker.onPointerEvent(
+                                    pointerCount = pressed.size,
+                                    x = centroidX,
+                                    y = centroidY,
+                                    timestampMs = lastTimestamp,
+                                )
+
+                                val move = decision.move
+                                val scroll = decision.scroll
+                                if (move != null || scroll != null) {
+                                    // 이 제스처가 드래그/스크롤로 확정됐다 — 대기 중이던 이전 탭의
+                                    // 클릭이 있다면 지금 내보낸다 (F-1, 커서가 옮겨가기 전에).
+                                    flushPendingClick()
+                                }
+                                if (move != null) {
+                                    // 드래그 홀드 중이든 아니든 이동 경로는 완전히 동일하다 —
+                                    // 서버가 버튼을 누르고 있을 뿐이다 (확정 스펙 4번).
+                                    onMove(move.dx, move.dy)
+                                }
+                                if (scroll != null) {
+                                    onScroll(scroll.dx, scroll.dy)
+                                }
+                                if (move != null || scroll != null) {
+                                    pressed.forEach { it.consume() }
                                 }
                             }
-                            MultiTouchGestureTracker.BUTTON_RIGHT -> {
-                                // 우클릭 자체는 지연/병합 로직과 무관하지만, 대기 중인 좌클릭이
-                                // 있으면 컨텍스트 메뉴가 뜨기 전에 먼저 내보내고(F-3), 이 우클릭이
-                                // 이후의 무관한 좌탭과 잘못 묶이지 않도록 더블탭 감지기도 리셋한다(F-4).
-                                flushPendingClick()
-                                doubleTapDetector.reset()
-                                onRightClick()
+
+                            val end = tracker.onGestureEnd(lastTimestamp)
+                            // 손가락을 뗀 정상 종료 — 활성 드래그였다면 여기서 버튼을 놓는다.
+                            handleDragHold(dragHold.onGestureEnd())
+
+                            // 확정 스펙 7번: 드래그 홀드로 끝난 제스처는 탭/더블탭/클릭 판정을
+                            // 아예 하지 않는다. 승격 조건(경과 >= DRAG_HOLD_THRESHOLD_MS)과 탭 조건
+                            // (경과 < TAP_MAX_DURATION_MS)이 같은 값을 기준으로 배타적이라 실제로는
+                            // 겹치지 않지만, 꼬리 구간 보정 등으로 다른 구간이 탭으로 판정될 여지를
+                            // 남기지 않도록 제스처 단위로 명시적으로 막는다.
+                            if (!dragHold.hasPromoted) {
+                                when (end.clickButton) {
+                                    MultiTouchGestureTracker.BUTTON_LEFT -> {
+                                        // 대기 중인 지연 클릭은 어느 쪽으로 판정되든 일단 취소한다:
+                                        // - 더블탭 확정이면 그 클릭은 DOUBLE_CLICK에 흡수되어 사라져야 하고,
+                                        // - 아니면 이 탭이 새 기준이 되므로 낡은 타이머를 남겨둘 이유가 없다.
+                                        pendingClickJob?.cancel()
+                                        pendingClickJob = null
+
+                                        if (doubleTapDetector.onTap(end.x, end.y, lastTimestamp)) {
+                                            // 개별 CLICK 두 개가 아니라 DOUBLE_CLICK 하나만 나간다.
+                                            onDoubleClick()
+                                        } else {
+                                            // 첫 탭 — 두 번째 탭이 올 시간을 준 뒤에야 CLICK을 보낸다.
+                                            // (모든 좌클릭이 이만큼 늦어지는 것은 의도된 트레이드오프다)
+                                            pendingClickJob = launch {
+                                                delay(GestureConfig.DOUBLE_TAP_INTERVAL_MS)
+                                                onClick()
+                                            }
+                                        }
+                                    }
+                                    MultiTouchGestureTracker.BUTTON_RIGHT -> {
+                                        // 우클릭 자체는 지연/병합 로직과 무관하지만, 대기 중인 좌클릭이
+                                        // 있으면 컨텍스트 메뉴가 뜨기 전에 먼저 내보내고(F-3), 이 우클릭이
+                                        // 이후의 무관한 좌탭과 잘못 묶이지 않도록 더블탭 감지기도 리셋한다(F-4).
+                                        flushPendingClick()
+                                        doubleTapDetector.reset()
+                                        onRightClick()
+                                    }
+                                    else -> Unit
+                                }
                             }
-                            else -> Unit
+                        } finally {
+                            // 제스처가 취소되거나(화면 이탈, 컴포저블 파기 등) 예외로 빠져나가도
+                            // 버튼이 눌린 채 남으면 안 된다 — PC 마우스가 영원히 눌린 상태가 된다.
+                            // 정상 경로에서는 위에서 이미 해제했으므로 여기서는 None이 돌아온다
+                            // (DragHoldDetector.onGestureEnd는 멱등).
+                            handleDragHold(dragHold.onGestureEnd())
                         }
                     }
                 }
@@ -283,7 +370,7 @@ private fun TrackpadSurface(
 
         Text(
             text = "터치하여 커서 이동\n탭으로 클릭\n더블탭으로 더블클릭\n" +
-                "두 손가락 탭으로 우클릭\n두 손가락 드래그로 스크롤",
+                "길게 눌렀다 움직여 드래그\n두 손가락 탭으로 우클릭\n두 손가락 드래그로 스크롤",
             color = Color.White.copy(alpha = 0.15f),
             modifier = Modifier.align(Alignment.Center),
             fontSize = 16.sp,

@@ -96,6 +96,31 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `드래그 홀드 임계는 탭 최대 지속 시간과 정확히 같다`() {
+        // 확정 스펙: "탭으로 인정되지 않게 되는 시점" == "드래그 홀드가 되는 시점".
+        // 두 값이 어긋나면 탭도 드래그도 아닌 사각지대(또는 둘 다 발사되는 구간)가 생긴다.
+        assertEquals(GestureConfig.TAP_MAX_DURATION_MS, GestureConfig.DRAG_HOLD_THRESHOLD_MS)
+        assertEquals(200L, GestureConfig.DRAG_HOLD_THRESHOLD_MS)
+    }
+
+    @Test
+    fun `드래그 홀드 임계는 멀티터치 해제 유예보다 길다`() {
+        // 그렇지 않으면 손가락을 어긋나게 떼는 꼬리 구간이 드래그 홀드로 승격될 수 있다.
+        assertTrue(
+            GestureConfig.DRAG_HOLD_THRESHOLD_MS > GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS
+        )
+    }
+
+    @Test
+    fun `드래그 홀드 임계는 더블탭 간격보다 짧다`() {
+        // 홀드로 승격되는 순간 대기 중이던 지연 클릭을 flush 해야 하는데, 임계가 더블탭 간격보다
+        // 길면 그 클릭이 이미 스스로 나간 뒤라 flush 의미가 없어진다(= 드래그 도중 클릭이 도착).
+        assertTrue(
+            GestureConfig.DRAG_HOLD_THRESHOLD_MS < GestureConfig.DOUBLE_TAP_INTERVAL_MS
+        )
+    }
+
+    @Test
     fun `멀티터치 해제 유예는 탭 최대 지속 시간의 절반보다 짧다`() {
         // 이 여유가 없으면 "손가락 하나를 떼고 남은 손가락으로 탭"하는 동작까지
         // 2손가락 탭으로 삼켜버린다 (MultiTouchGestureTracker의 꼬리 보정 전제 조건)

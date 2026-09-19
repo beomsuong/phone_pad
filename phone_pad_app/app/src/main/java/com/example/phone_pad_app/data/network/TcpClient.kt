@@ -23,6 +23,18 @@ class TcpClient @Inject constructor() {
     private var reader: BufferedReader? = null
 
     /**
+     * [send]를 이 디스패처(병렬도 1)로 직렬화한다.
+     *
+     * 이벤트마다 별도 코루틴에서 [send]를 호출하면(`TrackpadViewModel`이 이벤트 종류별로
+     * 각각 `launch`한다) 공용 `Dispatchers.IO`(병렬도 64)에서는 실행 순서가 뒤바뀔 수 있다.
+     * DRAG_START 직후 곧바로 DRAG_END를 보내는 경우처럼 **순서가 의미를 갖는 이벤트 쌍**에서
+     * 이 역전이 일어나면, 서버는 DRAG_END(아직 비활성 → 무시) 다음에 DRAG_START(LEFTDOWN)를
+     * 받아 마우스 버튼이 눌린 채로 남는다. 단일 스레드로 직렬화하면 호출된 순서대로
+     * 소켓에 쓰기가 실행된다.
+     */
+    private val sendDispatcher = Dispatchers.IO.limitedParallelism(1)
+
+    /**
      * 서버에 연결하고 세션 핸드셰이크 한 줄을 읽는다.
      *
      * @return 서버가 발급한 세션 토큰. 핸드셰이크가 오지 않거나 형식이 어긋나면 null.
@@ -69,7 +81,7 @@ class TcpClient @Inject constructor() {
         checkNotNull(reader) { "Not connected" }.readLine()
     }
 
-    suspend fun send(json: String) = withContext(Dispatchers.IO) {
+    suspend fun send(json: String) = withContext(sendDispatcher) {
         checkNotNull(writer) { "Not connected" }.println(json)
     }
 

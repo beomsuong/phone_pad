@@ -173,6 +173,68 @@ class TrackpadRepositoryImplTest {
     }
 
     @Test
+    fun `DragStart는 필드 없는 DRAG_START 한 줄로 TCP에 나간다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DragStart)
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        // AGENTS.md 섹션 4의 와이어 포맷을 리터럴로 고정한다 (서버 handle_event와의 계약)
+        assertEquals("""{"type":"DRAG_START"}""", json.captured)
+        assertFalse("session 필드가 없는 평문 이벤트다", json.captured.contains("session"))
+        // 이동 좌표가 아니므로 UDP로 새면 안 된다
+        coVerify(exactly = 0) { udpClient.send(any()) }
+    }
+
+    @Test
+    fun `DragEnd는 필드 없는 DRAG_END 한 줄로 TCP에 나간다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DragEnd)
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        assertEquals("""{"type":"DRAG_END"}""", json.captured)
+        assertFalse("session 필드가 없는 평문 이벤트다", json.captured.contains("session"))
+        coVerify(exactly = 0) { udpClient.send(any()) }
+    }
+
+    @Test
+    fun `드래그 시작과 종료는 서로 다른 줄로 구분된다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DragStart)
+        repository.sendEvent(TrackpadEvent.DragEnd)
+
+        coVerifyOrder {
+            tcpClient.send("""{"type":"DRAG_START"}""")
+            tcpClient.send("""{"type":"DRAG_END"}""")
+        }
+    }
+
+    @Test
+    fun `DragStart 전송 실패는 CLICK과 같이 Error로 알린다`() = runTest {
+        connectSuccessfully()
+        coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
+
+        repository.sendEvent(TrackpadEvent.DragStart)
+
+        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+    }
+
+    @Test
+    fun `DragEnd 전송 실패는 Error로 알린다`() = runTest {
+        // DRAG_END 유실은 PC 버튼이 눌린 채 남는 최악의 상태라 조용히 버리면 안 된다.
+        connectSuccessfully()
+        coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
+
+        repository.sendEvent(TrackpadEvent.DragEnd)
+
+        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+    }
+
+    @Test
     fun `핸드셰이크가 오지 않으면 Error로 전환하고 UDP를 준비하지 않는다`() = runTest {
         coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns null
 

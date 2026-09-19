@@ -29,4 +29,25 @@ sealed class TrackpadEvent {
      * 부호 규약: [dy] 양수 = 손가락이 아래로 이동, [dx] 양수 = 손가락이 오른쪽으로 이동.
      */
     data class Scroll(val dx: Int, val dy: Int) : TrackpadEvent()
+
+    /**
+     * 탭홀드로 승격된 드래그의 시작. `{"type":"DRAG_START"}` (TCP, AGENTS.md 섹션 4)
+     *
+     * 서버가 마우스 왼쪽 버튼을 **누른 채로 유지**하기 시작한다는 뜻이다. 필드가 하나도 없으므로
+     * `data class`가 아니라 `object`다 — 같은 인스턴스를 재사용해도 의미가 달라지지 않는다.
+     *
+     * 드래그 중의 커서 이동은 새 이벤트가 아니라 기존 [Move](UDP)를 그대로 쓴다. "버튼 누름 +
+     * 커서 이동 + 버튼 뗌"의 조합만으로 드래그 효과가 자연히 생기므로 서버의 이동 처리는
+     * 손댈 필요가 없다.
+     */
+    object DragStart : TrackpadEvent()
+
+    /**
+     * 드래그의 종료. `{"type":"DRAG_END"}` (TCP, AGENTS.md 섹션 4)
+     *
+     * 손가락을 뗐을 때뿐 아니라 **손가락 개수가 바뀌거나 제스처가 취소된 경우에도** 반드시 보낸다.
+     * 이 이벤트가 유실되면 PC의 왼쪽 버튼이 눌린 채로 남는 심각한 상태가 되기 때문이다
+     * (서버도 TCP 연결이 끊길 때 강제로 버튼을 놓는 안전장치를 따로 가진다).
+     */
+    object DragEnd : TrackpadEvent()
 }

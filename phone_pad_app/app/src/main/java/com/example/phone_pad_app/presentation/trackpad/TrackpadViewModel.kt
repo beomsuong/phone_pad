@@ -91,6 +91,30 @@ class TrackpadViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 탭홀드 승격 → 드래그 시작. `{"type":"DRAG_START"}` (TCP)
+     *
+     * 이 시점부터 PC 왼쪽 버튼이 눌린 채로 유지된다. 이후의 커서 이동은 [sendMove]가
+     * 그대로 담당한다 — 드래그 전용 이동 이벤트는 없다 (AGENTS.md 섹션 4).
+     */
+    fun sendDragStart() {
+        viewModelScope.launch {
+            runCatching { sendEventUseCase(TrackpadEvent.DragStart) }
+        }
+    }
+
+    /**
+     * 드래그 종료. `{"type":"DRAG_END"}` (TCP)
+     *
+     * 손가락을 뗀 경우뿐 아니라 손가락 개수 변화·제스처 취소로 드래그가 끊기는 경우에도
+     * 호출된다 — 이게 나가지 않으면 PC 버튼이 눌린 채로 남는다.
+     */
+    fun sendDragEnd() {
+        viewModelScope.launch {
+            runCatching { sendEventUseCase(TrackpadEvent.DragEnd) }
+        }
+    }
+
     /** 2손가락 탭 → 우클릭. `{"type":"CLICK","button":"right"}` (TCP) */
     fun sendRightClick() {
         viewModelScope.launch {

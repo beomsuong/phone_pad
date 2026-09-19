@@ -138,6 +138,28 @@ class TrackpadRepositoryImpl @Inject constructor(
                     tcpClient.send("""{"type":"SCROLL","dx":${event.dx},"dy":${event.dy}}""")
                 }
             }
+
+            is TrackpadEvent.DragStart -> {
+                // 필드가 전혀 없는 TCP 평문 이벤트 (session 없음, AGENTS.md 섹션 4).
+                // CLICK과 같은 등급(저빈도 · 명시적 상태 전이)이라 실패를 조용히 버리지 않는다 —
+                // 버튼 누름이 유실됐는데 사용자는 드래그가 되는 줄 알고 계속 움직이게 되므로,
+                // 상태를 Error로 바꿔 즉시 드러내는 편이 낫다.
+                try {
+                    tcpClient.send(DRAG_START_JSON)
+                } catch (e: Exception) {
+                    _connectionState.value = ConnectionState.Error(e.message ?: "Send failed")
+                }
+            }
+
+            is TrackpadEvent.DragEnd -> {
+                // DRAG_END 유실은 PC 왼쪽 버튼이 눌린 채로 남는 최악의 상태를 만든다.
+                // 전송 실패를 반드시 Error로 알린다 (서버도 연결 종료 시 강제 해제 안전장치를 가진다).
+                try {
+                    tcpClient.send(DRAG_END_JSON)
+                } catch (e: Exception) {
+                    _connectionState.value = ConnectionState.Error(e.message ?: "Send failed")
+                }
+            }
         }
     }
 
@@ -238,6 +260,11 @@ class TrackpadRepositoryImpl @Inject constructor(
 
     private companion object {
         const val HEARTBEAT_JSON = """{"type":"HEARTBEAT"}"""
+
+        /** AGENTS.md 섹션 4의 와이어 포맷 — 필드 없음. 서버 `handle_event`와의 계약. */
+        const val DRAG_START_JSON = """{"type":"DRAG_START"}"""
+        const val DRAG_END_JSON = """{"type":"DRAG_END"}"""
+
         const val MESSAGE_HEARTBEAT_TIMEOUT = "Heartbeat timeout"
         const val MESSAGE_CONNECTION_LOST = "Connection lost"
     }

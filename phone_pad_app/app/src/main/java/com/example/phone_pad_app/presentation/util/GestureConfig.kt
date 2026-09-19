@@ -75,6 +75,20 @@ object GestureConfig {
      */
     const val DOUBLE_TAP_DISTANCE_PX = 40f
 
+    /**
+     * 1손가락을 제자리에 유지해야 드래그 홀드로 승격되는 시간 (ms) — `DRAG_START` 전송 시점.
+     *
+     * [TAP_MAX_DURATION_MS]와 **정확히 같은 값**이어야 하므로 숫자를 따로 적지 않고 참조한다:
+     * "탭으로 인정되지 않게 되는 바로 그 시점"이 "드래그 홀드가 되는 시점"과 일치해야
+     * 사각지대(탭도 드래그 홀드도 아닌 구간)가 생기지 않는다. 동시에 이 등식 덕분에
+     * [MultiTouchGestureTracker][com.example.phone_pad_app.presentation.trackpad.MultiTouchGestureTracker]의
+     * 탭 판정(`elapsed < TAP_MAX_DURATION_MS`)과 승격 판정(`elapsed >= DRAG_HOLD_THRESHOLD_MS`)이
+     * 구조적으로 상호 배타가 된다.
+     *
+     * 값을 바꾸려면 탭 판정 시간과 함께 움직여야 한다 — 한쪽만 바꾸면 위 성질이 깨진다.
+     */
+    const val DRAG_HOLD_THRESHOLD_MS: Long = TAP_MAX_DURATION_MS
+
     /** PC 서버 기본 포트 (TCP — CLICK/SCROLL/DRAG/HEARTBEAT 및 세션 핸드셰이크) */
     const val DEFAULT_PORT = 9000
 
