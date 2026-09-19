@@ -41,8 +41,11 @@ phone_pad/
 │                               MultiTouchGestureTracker.kt, DoubleTapDetector.kt,
 │                               DragHoldDetector.kt
 └── pc_server/                 ← Windows Python 서버
-    ├── server.py
+    ├── server.py              소켓/세션/heartbeat + 정지 가능한 ServerRuntime, 콘솔/트레이 실행 모드
     ├── input_controller.py
+    ├── tray_status.py         트레이 순수 로직 (연결 수→상태/툴팁, LAN IP 조회) — pystray 비의존
+    ├── tray.py                pystray 어댑터 (pystray/Pillow import는 여기에서만, 선택 의존성)
+    ├── requirements.txt       pystray, Pillow (트레이 전용 — 없어도 서버는 콘솔 모드로 동작)
     └── tests/                 pytest 단위 테스트
 ```
 
@@ -247,8 +250,8 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - `pc_server/input_controller.py` — `_double_click(button)`, `_drag_start()`/`_drag_end()`/`force_release_drag()` 완료. 드래그 상태는 프로세스 전역(현재 컨트롤러가 프로세스당 하나)
 - `pc_server/server.py` — `handle_client`의 `finally`에서 연결 종료 시 드래그 강제 해제 호출
 
-### 🔶 Phase 4 — 완성도 (재연결 완료, 나머지 진행 전)
-- [ ] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료
+### 🔶 Phase 4 — 완성도 (재연결·트레이 완료, 나머지 진행 전)
+- [x] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료. 서버 단일 사이드(와이어 프로토콜 무변경). 아이콘은 Pillow로 코드에서 생성(대기 회색/연결됨 초록), 메뉴는 상태 라벨·접속 주소(LAN IP:9000)·종료. `--no-tray` 옵션과 미설치 시 콘솔 모드 폴백. 정지 가능한 `ServerRuntime`으로 정상 종료 경로를 만들고 `atexit` 드래그 해제 안전장치를 추가해 섹션 10의 "서버 프로세스 강제 종료 시 드래그 상태" 항목을 해소
 - [ ] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지)
 - [x] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — Android 단일 사이드(프로토콜/서버 무변경: 재연결은 기존 핸드셰이크를 그대로 다시 수행할 뿐이라 서버에는 "새 클라이언트 접속"과 구분되지 않음). **"Connected였던 세션이 유실됐을 때만"** 재시도하며, 첫 `connect()` 실패는 기존처럼 `Error`로 남긴다(틀린 IP에 55초씩 매달리지 않기 위해). 유실은 `Error`를 거치지 않고 곧바로 `ConnectionState.Reconnecting(host, attempt, maxAttempts)`로 가고, 성공하면 `Connected`, 8회 소진 시 `Error("Reconnect failed: <마지막 원인>")`. 재연결 화면에는 "취소" 버튼(= 수동 `disconnect()`)
 - [ ] 예외 처리 강화 (네트워크 오류, 권한 오류 등)
@@ -260,6 +263,14 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - 전송 실패 합류: `CLICK`/`DOUBLE_CLICK`/`DRAG_START`/`DRAG_END`의 TCP 전송 실패는 이전에는 `Error`만 세팅하고 소켓 정리·세대 무효화·keep-alive 중단을 하지 않아, 소켓은 죽었는데 heartbeat 루프가 최대 5초 더 돌았다. 이제 `sendOverTcp()` → `reportConnectionLost`로 합류해 즉시 정리 + 재연결한다. **`MOVE`/`SCROLL`의 조용한 실패는 그대로**(F-1/F-2 의도 — 고빈도 이벤트가 유실 원인 메시지를 덮어쓰지 않게)
 - `presentation/trackpad/TrackpadScreen.kt` — `ConnectingPanel`을 첫 연결/재연결이 공유(재연결일 때만 대상 호스트 표시 + "취소" 버튼). 설정 화면은 여전히 Disconnected/Error에서만 열린다
 - 테스트 함정: `runTest`는 본문이 끝난 뒤에도 가상 시간을 계속 진행시킨다. heartbeat/재연결 루프를 살려 둔 채 테스트를 끝내면 "5초마다 전송 → 유실 → 재연결"이 무한히 돌면서 MockK가 호출을 기록하다 힙을 소진한다(실제로 `OutOfMemoryError`가 나 같은 JVM의 무관한 테스트 30개까지 무너졌다). 이 계층의 새 테스트는 반드시 `repository.disconnect()` 또는 `Error` 종료로 끝낼 것
+
+**트레이 아이콘 구현 시 핵심 파일/설계:**
+- `pc_server/tray_status.py` — pystray 비의존 순수 로직(표준 라이브러리만): 연결 수 → 상태/툴팁, `detect_lan_ip()`(소켓 주입 가능, 실패 시 `127.0.0.1`이 아니라 "(확인 불가)" — 로컬호스트를 안내하면 사용자를 오도한다), 주소 라벨 포맷
+- `pc_server/tray.py` — pystray 어댑터. `pystray`/`Pillow` import는 이 파일에서만, `ImportError`뿐 아니라 DLL 로드 실패까지 잡아 `tray_available()`로 노출. `icon_factory`/`image_factory` 주입으로 가짜 `Icon`을 넣어 미설치 환경에서도 동작 로직 전체를 테스트한다. 연결 수 갱신은 1초 폴링 스레드(`SessionRegistry` 공개 API/동작은 그대로), 상태가 그대로면 아이콘을 건드리지 않고(Windows 깜빡임 방지) 이미지는 상태 **종류**가 바뀔 때만 교체
+- `pc_server/server.py` — `ServerRuntime`(stop Event + accept timeout 0.5s, 포트 0 바인딩·실제 포트 노출), `run_console`/`run_with_tray`, `release_drag()`(멱등, 예외 비전파), `main(argv)`. **기존 `handle_client`/`udp_listener`/`handle_udp_packet`/`SessionRegistry`는 무변경**
+- 스레드 모델: pystray가 Windows에서 메시지 루프를 메인 스레드가 소유해야 하므로 **트레이가 메인 스레드, 서버가 백그라운드 스레드**(콘솔 모드는 기존처럼 메인 스레드가 서버). 종료 순서: `stop 설정 → 서버 스레드 join(3s) → release_drag → 아이콘 제거 → 정수 반환` — 드래그 해제를 아이콘 제거보다 먼저 둔다(아이콘이 사라진 뒤 버튼이 눌린 채 남으면 단서가 없다). `os._exit`/`sys.exit` 남발 없음
+- 서버 스레드 사망 처리: 서버 스레드가 `BaseException`을 잡아 로그하고 트레이를 내려 종료 코드 1로 끝난다(아이콘만 남는 좀비 방지). `stop()`과 pystray 루프 기동의 경합은 `_stopped`/`_loop_ready` 이중 확인 + lock 기반 test-and-set으로 막고 전용 테스트로 고정
+- 테스트 함정: `pystray.MenuItem`은 콜백의 `action.__code__.co_argcount`로 인자 수를 세므로 `lambda _icon, _item, act=action: act()`처럼 기본 인자 바인딩을 쓰면 3개로 계산해 `ValueError`를 던진다. **pystray 미설치 환경에서는 `_build_menu()`의 pystray 경로가 실행되지 않아 이 결함이 영원히 드러나지 않는다**(실제 venv에서 실행해서 22건 실패로 발견) → `_wrap_action()`으로 수정. 어댑터를 고칠 때는 미설치 환경 테스트만 믿지 말고 venv에 실제 pystray를 설치해 한 번 더 돌릴 것
 
 ### ⬜ Phase 5 — 선택 확장
 - [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
@@ -299,14 +310,18 @@ Android                                          PC Server
 ### PC 서버
 ```bash
 cd pc_server
-python server.py
+pip install -r requirements.txt   # 트레이 아이콘용 (선택 — 없으면 콘솔 모드로 동작)
+python server.py                  # 시스템 트레이 아이콘과 함께 실행
+python server.py --no-tray        # 트레이 없이 콘솔 모드 (Ctrl+C로 종료)
 # → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) 포트에서 대기
 ```
+**트레이 모드:** 아이콘 색이 상태를 보여준다(회색 = 대기 중, 초록 = 연결됨). 툴팁은 `Phone Pad - 연결됨 (N대)`, 메뉴에는 앱에 입력할 **접속 주소(`PC의 LAN IP:9000`)** 가 표시되며 **"종료"** 로 끈다. `pystray`/`Pillow`가 설치돼 있지 않으면 경고 한 줄을 출력하고 자동으로 콘솔 모드로 동작한다(서버 기능은 트레이 의존성에 막히지 않는다). 서버가 예외로 죽으면(포트 바인드 실패 등) 트레이도 함께 내려가 프로세스가 종료 코드 1로 끝난다 — 아이콘만 남는 좀비는 생기지 않는다.
+**같은 PC에서 서버를 두 번 실행하지 말 것:** Windows에서는 `SO_REUSEADDR` 때문에 이미 점유된 포트에도 bind가 성공해, 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받는다(아래 섹션 10 참조).
 **Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다).
 
 **트러블슈팅:** 커서가 갑자기 멈추고 앱이 `Heartbeat timeout`/`Connection lost`를 띄우면 TCP 9000 경로(Wi-Fi 절전, 도즈 모드 등으로 heartbeat 전송이 지연되는 경우 포함)를 먼저 의심한다. TCP 세션이 회수되면 이미 전송 중이던 UDP MOVE도 서버가 조용히 무시하므로 함께 멈춘다.
 
-PC 마우스 왼쪽 버튼이 눌린 채로 멈춰 있다면(뭘 클릭해도 계속 드래그처럼 동작) 탭홀드 드래그의 `DRAG_END`가 유실된 상태다 — 앱을 재연결하면 TCP 연결이 다시 맺어지면서 서버가 이전 연결 종료 시 강제로 버튼을 놓으므로 대부분 자연히 해소된다. 서버 프로세스를 강제 종료했다면 이 안전장치가 동작하지 않으므로 수동으로 마우스 좌클릭을 한 번 눌러 버튼 상태를 풀어야 할 수 있다.
+PC 마우스 왼쪽 버튼이 눌린 채로 멈춰 있다면(뭘 클릭해도 계속 드래그처럼 동작) 탭홀드 드래그의 `DRAG_END`가 유실된 상태다 — 앱을 재연결하면 TCP 연결이 다시 맺어지면서 서버가 이전 연결 종료 시 강제로 버튼을 놓으므로 대부분 자연히 해소된다. 서버를 트레이 "종료"·Ctrl+C·예외 종료 등 인터프리터가 정상적으로 끝나는 경로로 껐다면 종료 시 드래그가 강제로 해제된다(`atexit` 안전장치). 작업 관리자로 프로세스를 강제로 죽였다면(`taskkill /F` 등 인터프리터가 정리 기회를 못 얻는 경로) 이 안전장치도 동작하지 않으므로 수동으로 마우스 좌클릭을 한 번 눌러 버튼 상태를 풀어야 할 수 있다.
 
 ### Android 앱
 1. Android Studio에서 `phone_pad_app/` 열기
@@ -374,5 +389,9 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | `TrackpadScreen`의 지연/flush/타이머 로직에 자동 테스트 없음 | 더블탭 대기·취소·flush, 드래그 홀드 타이머 경합이 Compose `awaitEachGesture`에 묶여 있어 순수 단위 테스트가 없다(승격 판정 자체는 `DragHoldDetector`/`DoubleTapDetector`로 분리되어 부분 해소). 다음에 이 영역을 건드릴 때는 남은 코루틴 타이밍 로직도 순수 클래스로 추출해 `runTest` 가상 시간으로 회귀를 고정할 것 |
 | 탭홀드 드래그 승격 민감도 | 승격 조건이 "200ms 동안 20px(TAP_MAX_DISTANCE_PX) 이내"라, 고해상도 화면에서 첫 200ms 동안 아주 천천히(약 100px/s 미만) 정밀하게 커서를 미는 동작이 의도치 않게 드래그로 승격될 수 있음. 스펙이 요구한 "탭/드래그 사각지대 없음"의 결과이므로 결함은 아니나 실기기에서 가장 먼저 체감될 항목 — 조정 시 승격 판정 전용의 더 엄격한 정지 반경(예: 8px)을 별도로 두는 방향을 검토(임계 시간 자체를 건드리면 사각지대가 재발함) |
 | DRAG_START/DRAG_END 전송 순서 완전 보장 아님 | `TcpClient.send()`를 전용 단일 스레드 디스패처로 직렬화해 위험을 크게 줄였지만, `TrackpadViewModel`이 이벤트마다 별도 코루틴을 `launch`하는 구조라 그 코루틴들이 디스패처에 도달하는 순서 자체까지 수학적으로 보장하지는 않는다. 실제 발생 확률은 매우 낮고(같은 UI 스레드에서 순차 호출되므로), 서버의 멱등 처리와 연결 종료 시 강제 해제 안전장치가 최종 방어선 |
-| 서버 프로세스 강제 종료 시 드래그 상태 | `handle_client`의 `finally` 안전장치는 프로세스가 정상적으로 도는 동안만 동작한다 — 드래그 중 서버 프로세스 자체가 강제 종료되면(`finally` 미실행) PC 마우스 버튼이 눌린 채로 남을 수 있음. `atexit`/시그널 핸들러 추가는 Phase 4 트레이 아이콘(정상 종료 경로 정비) 작업과 함께 검토 |
+| 서버 프로세스 강제 종료 시 드래그 상태 | **대부분 해소(Phase 4 트레이).** 트레이 "종료"·Ctrl+C·예외 종료는 `atexit` 안전장치와 정상 종료 경로가 `force_release_drag()`를 호출한다(정상·예외 종료 양쪽을 별도 자식 프로세스로 실측, `LEFTUP` 발사 확인). **남은 경계:** `taskkill /F` 같은 하드 킬은 인터프리터가 정리 기회를 얻지 못해 여전히 버튼이 눌린 채 남을 수 있다 — 프로세스 안에서는 막을 수 없는 영역 |
+| 서버 중복 실행 (Windows `SO_REUSEADDR`) | 기존 코드가 리슨 소켓에 `SO_REUSEADDR`를 설정하는데, **Windows에서는 이 옵션이 이미 점유된 포트에도 bind를 성공시킨다**(실측). 서버를 두 번 띄우면 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받는다 — 트레이가 생기면서 이 실수가 눈에 보이게 됐을 뿐 이전부터 있던 동작. 고치려면 `SO_EXCLUSIVEADDRUSE`나 named mutex가 필요한데 기존 소켓 동작(재시작 시 TIME_WAIT 재바인드 등) 변경이라 이번엔 손대지 않았다 — PyInstaller 패키징 항목과 함께 다룰 것. (이 때문에 서버 사망 경로 테스트는 포트 충돌 대신 이 머신에 없는 주소 `203.0.113.1`에 bind해 진짜 `OSError [WinError 10049]`를 발생시킨다) |
+| 트레이 실환경 검증 잔여 | 콘솔에서의 **진짜 Ctrl+C**(자동화하면 `CTRL_C_EVENT`가 실행 셸까지 죽여서 단위 테스트로만 커버), 아이콘 시각 품질(다크 테마 대비)과 팝업 메뉴의 한글 폰트/잘림, 실기기 연동 회귀(프로토콜 무변경이라 회귀는 없어야 함). 트레이 렌더링·상태 갱신·종료는 임시 venv에서 실제 Windows 트레이로 확인함 |
+| PyInstaller `--noconsole` 시 로그 소실 | `sys.stdout is None`이어도 CPython `print()`는 조용히 no-op이라(실측) 서버가 죽지는 않는다. 다만 그 상태에서는 트레이 폴백 경고·서버 사망 로그가 아무 데도 보이지 않으므로, 패키징 시 파일 로깅이나 트레이 알림으로 대체할 것 |
+| 트레이 LAN IP 캐시 | 접속 주소 라벨의 LAN IP는 서버 구동 중 한 번만 조회해 캐시한다(매 폴링마다 소켓을 열 이유가 없어서). Wi-Fi를 바꿔 PC의 IP가 바뀌면 서버를 재시작해야 새 주소가 보인다 |
 | 앱 백그라운드 진입 시 드래그 미종료 | 드래그 홀드 중 Android 앱이 백그라운드로 가서 `TrackpadViewModel`이 파기되면 `DRAG_END`를 보낼 기회가 없다 — 서버 heartbeat 타임아웃(≈15초)이 감지해 강제로 놓을 때까지 PC 버튼이 눌린 채 유지됨. 실기기 미검증 |

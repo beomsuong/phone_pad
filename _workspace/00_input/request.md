@@ -1,80 +1,64 @@
-# 요청: 재연결 로직 (Phase 4 — "연결 끊김 감지 → 자동 재시도")
+# 요청: PC 서버 트레이 아이콘 (Phase 4 — "PC 트레이 아이콘(pystray) — 연결 상태 표시 + 종료")
 
 사용자 요청: "이어서 작업해줘" → AGENTS.md 섹션 6 Phase 4 항목
-- [ ] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — heartbeat가 만드는 `Error("Heartbeat timeout")`/`Error("Connection lost")`를 재시도 트리거로 사용
+- [ ] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료
 
-## 범위 판단: **단일 사이드 (Android)**
+## 범위 판단: **단일 사이드 (서버)**
 
-사유: 이벤트 `type`/필드/채널/세션 형식 변경이 없다. 재연결은 **기존 핸드셰이크(TCP 연결 → `SESSION` 줄 수신 → UDP 타깃 설정)를 그대로 다시 수행**할 뿐이고,
-서버 입장에서는 "새 클라이언트가 접속한 것"과 구분되지 않는다. `ConnectionState`에 상태가 추가되지만 이는 앱 내부 UI 상태이지 와이어 프로토콜이 아니다.
-→ android-dev 서브 에이전트 1명, protocol-qa 생략. ※ 구현 중 이벤트/핸드셰이크를 건드리게 되면 즉시 멈추고 보고할 것(교차 경계면 전환).
+사유: 이벤트 `type`/필드/채널/세션 형식 변경이 전혀 없다. 서버 프로세스의 **표시/종료 UI**를 붙이는 작업이고 Android는 아무것도 바뀌지 않는다.
+→ server-dev 서브 에이전트 1명, protocol-qa 생략. ※ 구현 중 와이어 프로토콜을 건드리게 되면 즉시 멈추고 보고할 것(교차 경계면 전환).
 
-## 현재 구조 (에이전트가 코드로 직접 확인할 것 — `data/repository/TrackpadRepositoryImpl.kt`)
-- 연결 유실은 전부 `reportConnectionLost(generation, message)`를 지난다(heartbeat sender 전송 실패 / watchdog EOF·예외·타임아웃 3회). 세대(generation) CAS로 이중 보고를 막는다.
-- `connect()`/`disconnect()`는 `connectionMutex`로 직렬화되고 세대를 올려 옛 루프를 무효화한다(F-2/F-3 패턴 — **이 안전장치를 약화시키지 말 것**).
-- **주의 — 전송 실패 경로가 다르다:** `Click`/`DoubleClick`/`DragStart`/`DragEnd`의 TCP 전송 실패는 지금 `_connectionState = Error(...)`만 세팅하고 **소켓 정리도, 세대 무효화도, keep-alive 중단도 하지 않는다**(소켓은 죽었는데 heartbeat 루프는 계속 돌고, 최대 5초 뒤 sender가 다시 `reportConnectionLost`로 Error를 덮어쓴다). 재연결을 붙이려면 이 경로도 같은 "연결 유실" 처리로 합류해야 한다(아래 §2).
-- `MOVE`/`SCROLL`의 전송 실패는 **조용히 버리는 것이 의도**다(고빈도 이벤트가 heartbeat의 원인 메시지를 덮어쓰는 것 방지, F-1/F-2) — 이 두 경로는 **건드리지 말 것.**
+## 현재 구조 (에이전트가 코드로 직접 확인할 것 — `pc_server/server.py`)
+- `main()`이 UDP 리스너 스레드(daemon)를 띄우고, **메인 스레드에서 블로킹 `srv.accept()` 무한 루프**를 돈다. 정지 신호를 받을 방법이 없다 → 정상 종료 경로가 없다.
+- `SessionRegistry`가 활성 세션 토큰 집합을 Lock으로 보호한다(`snapshot()`, `issue()`, `remove()`). 연결 수의 단일 출처.
+- `handle_client`의 `finally`가 연결 종료 시 드래그 강제 해제(`controller.force_release_drag()`)를 수행한다. 그러나 **프로세스 자체가 강제 종료되면 `finally`가 실행되지 않는다** — AGENTS.md 섹션 10 "서버 프로세스 강제 종료 시 드래그 상태" 항목이 "`atexit`/시그널 핸들러 추가는 Phase 4 트레이 아이콘(정상 종료 경로 정비) 작업과 함께 검토"라고 적어 두었다 → **이번 작업에 포함한다.**
+- 기존 테스트(`tests/test_server_*.py`, `tests/test_input_controller.py`)는 `handle_client`/`udp_listener`/`handle_udp_packet`/`SessionRegistry`/`InputController`를 직접 호출한다. **이 함수들의 시그니처와 동작은 호환되게 유지**(새 파라미터는 선택형으로만). 기존 테스트를 고쳐서 통과시키지 말 것.
 
 ## 확정 설계 (리더 결정 — 임의 변경 금지)
 
-### 1. 재연결 트리거 조건
-- **"Connected였던 세션이 유실됐을 때만"** 자동 재연결한다. 사용자가 IP를 입력해 처음 누른 `connect()`가 실패한 경우(핸드셰이크 실패, 연결 거부 등)는 **재시도하지 않고 기존처럼 `Error`로 남긴다** — 잘못된 IP에 무한 재시도하면 안 된다.
-- 재연결 대상은 마지막으로 **성공**한 `host`/`port`. (연결 실패 중인 값이 아님.)
-- 사용자 조작이 항상 이긴다: 재연결 대기/시도 중에 `disconnect()`(수동 해제)가 오면 재시도를 즉시 중단하고 `Disconnected`, 수동 `connect()`가 오면 진행 중인 재연결을 취소하고 그 요청을 수행한다.
+### 1. 트레이 UI
+- **아이콘 이미지는 Pillow로 코드에서 생성**한다(바이너리 에셋 파일 추가 금지). 상태별 2종: 대기(회색 원) / 연결됨(초록 원).
+- **툴팁(title)**: 대기 → `Phone Pad - 대기 중`, 연결됨 → `Phone Pad - 연결됨 (N대)`.
+- **메뉴**(위→아래): ① 상태 라벨(비활성, 툴팁과 같은 문구) ② **접속 주소 라벨(비활성)** `접속 주소: <PC의 LAN IP>:<TCP_PORT>` — 사용자는 앱에 이 IP를 손으로 입력해야 하므로 가장 유용한 정보다 ③ 구분선 ④ **"종료"**.
+- PC의 LAN IP는 소켓 라우팅 기법(`socket.connect(("10.255.255.255", 1))`/UDP, 패킷은 실제로 나가지 않음)으로 구하고, **실패하면 `127.0.0.1`이 아니라 "(확인 불가)"** 로 표시한다(로컬호스트를 안내하면 오도한다). 이 함수는 예외를 밖으로 던지지 않는다.
+- 연결 수가 바뀌면 아이콘/툴팁/메뉴 라벨이 갱신되어야 한다. 방식은 자유(폴링 스레드 ≈1s 또는 `SessionRegistry` 변경 콜백)이나 **`SessionRegistry`의 기존 공개 API/동작은 그대로** 유지한다.
 
-### 2. 상태 머신
-`ConnectionState`에 **`Reconnecting(host: String, attempt: Int, maxAttempts: Int)`** 를 추가한다(도메인 모델, 순수 데이터).
-```
-Connected ──(유실 감지)──► Reconnecting(attempt=1) ──(성공)──► Connected
-                              │  ▲
-                        (실패, 백오프 후 attempt+1)
-                              ▼  │
-                        Reconnecting(attempt=N) ──(N 소진)──► Error("Reconnect failed: <마지막 원인>")  (재시도 종료, 수동 연결 화면)
-사용자 disconnect() → 어느 상태에서든 Disconnected (재시도 중단)
-```
-- 유실 감지 → **`Error`를 거치지 않고 곧바로 `Reconnecting`으로 전이**한다(UI가 Error 패널을 깜빡 보여주지 않게). 단, 재연결이 **비활성**이거나 재연결 조건이 아니면 기존처럼 `Error(message)`.
-- `Click`/`DoubleClick`/`DragStart`/`DragEnd` 전송 실패도 `reportConnectionLost`와 **같은 처리로 합류**시킨다(소켓 정리 + 세대 무효화 + keep-alive 중단 + 재연결 트리거). 원인 메시지는 기존대로 `e.message ?: "Send failed"`. 세대는 **이벤트 전송 시점의 현재 세대**를 쓰고 CAS로 이중 보고를 막는다.
-- 재연결 시도 1회 = 기존 `connect` 본문(TCP 연결+핸드셰이크 → 토큰 저장 → UDP 연결 → `Connected(host)` → keep-alive 시작)을 그대로 재사용한다. 코드 복제 금지 — 내부 함수로 추출해 수동 connect와 재연결이 같은 경로를 쓰게 할 것.
-- 재연결 성공 시 시도 횟수 카운터는 리셋되어 다음 유실에서 다시 1부터 시작한다.
+### 2. 순수 로직 분리 (테스트 가능성이 핵심)
+- pystray/Pillow/디스플레이에 **의존하지 않는** 순수 부분을 별도 모듈(예: `pc_server/tray_status.py`)로 분리한다: `연결 수 → (상태 종류, 툴팁 문자열, 메뉴 라벨)` 계산, LAN IP 조회 함수(소켓 주입 가능하게), 주소 라벨 포맷팅.
+- pystray를 실제로 쓰는 어댑터(예: `pc_server/tray.py`)는 얇게. **`pystray`/`Pillow` import는 이 어댑터 안에서만**, 그리고 import 실패(미설치)를 감지할 수 있게 한다.
+- **테스트는 pystray/Pillow가 설치되어 있지 않아도 전부 통과해야 한다**(현재 이 환경에 둘 다 없다). 어댑터는 가짜(fake) `Icon`을 주입해 동작 로직(상태 변화 시 갱신, 종료 콜백)을 검증할 수 있게 설계한다.
 
-### 3. 백오프 정책 (순수 Kotlin 클래스로 분리)
-- `domain/model/ReconnectPolicy.kt`(또는 동등한 위치): 순수 클래스. `maxAttempts`, `delayBeforeAttempt(attempt: Int): Long`(ms), `enabled` 등을 가진다. 시간 의존 없이 단위 테스트 가능해야 한다.
-- 기본값(`GestureConfig`에 상수로 — 하트비트 상수와 같은 자리): 지수 백오프 1s → 2s → 4s → 8s → 이후 10s 상한, **`RECONNECT_MAX_ATTEMPTS = 8`**(총 대기 ≈ 1+2+4+8+10×4 = 55초). 상수 이름은 `RECONNECT_MAX_ATTEMPTS`, `RECONNECT_BASE_DELAY_MS`, `RECONNECT_MAX_DELAY_MS`.
-- **재연결 정책은 생성자 주입**한다(Hilt로 기본 정책 제공). 기존 `TrackpadRepositoryImplTest`/`TrackpadRepositoryHeartbeatTest`는 "유실 → Error 전이"를 검증하고 있으므로, 그 테스트들이 **재연결 비활성 정책으로 의미를 그대로 보존**하도록 할 것(테스트 로직을 뜯어고쳐 통과시키지 말고, 정책을 주입해 기존 동작을 재현). 재연결 동작은 **신규 테스트**로 검증한다.
-- 대기는 주입된 `ioDispatcher` 위의 코루틴 `delay`로 한다(테스트가 `StandardTestDispatcher`+가상 시간으로 제어 가능해야 함 — 실제 sleep 금지).
+### 3. 정상 종료 경로 (가장 조심할 부분)
+- `main()`을 **정지 가능하게** 리팩터링: `threading.Event`(stop) + `srv.settimeout(≈0.5s)`로 accept 루프가 주기적으로 stop을 확인하고, 정지 시 TCP 리슨 소켓과 UDP 소켓을 닫고 반환한다. UDP 리스너는 이미 `stop_event`를 받는다.
+- 트레이의 "종료"를 누르면: stop 설정 → 서버 스레드 join(타임아웃 있음) → **`controller.force_release_drag()` 호출(드래그 중 종료해도 PC 버튼이 눌린 채 남지 않게)** → 아이콘 제거 → 프로세스 정상 반환. 강제 종료(`os._exit`/`sys.exit` 남발) 금지.
+- **`atexit` 안전장치**: 정상 종료 경로를 안 거치고 인터프리터가 끝나는 경우(예외 종료 등)에도 `force_release_drag()`가 한 번 호출되게 `atexit`를 등록한다. 중복 호출돼도 안전해야 한다(이미 멱등인지 `input_controller.py`로 확인).
+- 이미 접속한 클라이언트 스레드는 daemon이라 프로세스 종료 시 함께 끝난다 — 별도 정리 불필요. 단 **종료 시 연결 중인 클라이언트 소켓에 대한 처리(닫기 등)는 이번 범위 아님**(프로세스가 끝나면 OS가 닫아 앱은 heartbeat/EOF로 감지 → 재연결 로직이 이미 있다).
 
-### 4. UI (`TrackpadScreen`)
-- `Reconnecting` 상태를 렌더한다: "재연결 중… (attempt/maxAttempts)" 문구 + **"취소" 버튼**(누르면 `viewModel.disconnect()` → `Disconnected`, 재시도 중단). 기존 `ConnectingPanel` 재사용/확장 가능하되 **취소 버튼은 재연결 상태에서만**(첫 연결 중 Connecting은 지금 그대로).
-- `when (state)`는 sealed 클래스 전체를 다뤄야 한다(컴파일 에러 방지). 설정 화면 진입 조건(`settingsAvailable`)은 Disconnected/Error 그대로 — Reconnecting 중에는 설정을 열 수 없다.
-- 재연결 성공 시 `Connected`로 돌아오면 `TrackpadSurface`가 새로 컴포지션에 들어온다 — 제스처 판정 상태는 이미 `awaitEachGesture`/트래커가 제스처마다 새로 만들어지므로 별도 리셋 불필요(확인만 하고 불필요한 코드 추가 금지).
+### 4. 서버 스레드 사망 처리 (조용한 좀비 방지)
+- 트레이가 메인 스레드에서 돌고 서버는 백그라운드 스레드에서 돌게 된다. **서버 스레드가 예외로 죽으면(예: 포트 9000이 이미 사용 중 → `OSError` bind 실패) 아이콘만 남는 좀비가 되면 안 된다.** 서버 스레드의 예외를 잡아 콘솔에 명확히 로그하고 트레이를 정지시켜 **프로세스가 0이 아닌 종료 코드로 끝나게** 한다. 이 경로를 테스트로 고정한다(예: 이미 점유된 포트에 bind 시도).
+- 트레이 없이도 돌 수 있어야 한다: **`--no-tray` 인자**, 그리고 **pystray/Pillow 미설치 시 경고 한 줄 출력 후 트레이 없이 기존과 동일하게 콘솔 모드로 동작**(서버 기능이 트레이 의존성 때문에 막히면 안 됨). 콘솔 모드에서는 기존처럼 메인 스레드가 서버를 돌며 Ctrl+C로 종료된다(Ctrl+C 시에도 위 드래그 해제 안전장치가 동작).
 
-### 5. 알려진 경계 (구현하지 말고 summary에 미해결로 기록)
-- 서버는 옛 연결의 종료(EOF/heartbeat 15초 타임아웃)를 감지하기 전까지 옛 세션을 유지한다 → 재연결 직후 잠깐 동안 서버에 세션이 2개일 수 있다(서버는 다중 세션 허용 구조). 서버 변경은 이번 범위 아님. AGENTS.md 섹션 10 "다중 기기 연결"의 드래그 상태 전역 문제(옛 연결의 종료가 새 연결의 드래그를 놓아버릴 수 있음)와 같은 뿌리 — 언급만.
-- 화면 꺼짐/도즈/앱 백그라운드 중의 동작, 네트워크 전환(WiFi→모바일), `ConnectivityManager` 기반 즉시 재시도는 이번 범위 아님(백오프 타이머만 사용).
+### 5. 의존성
+- `pc_server/requirements.txt` 신규: `pystray`, `Pillow` (버전은 Python 3.13 호환이 확인된 하한으로). 테스트용 `pytest`는 별도 언급만.
+- **전역 Python에 `pip install` 하지 말 것**(사용자 환경 변경). 실제 pystray 동작 스모크가 필요하면 venv를 `C:\Users\membe\.claude\jobs\1cfaabb7\tmp\venv`에 만들어 거기서만 설치·확인한다. 네트워크/설치가 불가하면 그 사실을 summary에 적고 어댑터는 가짜 `Icon` 테스트로만 검증한다(“실제 트레이 렌더링 미검증”으로 명시).
 
-## 테스트 요구사항 (JUnit + MockK, 기존 스타일, `runTest` 가상 시간)
-1. `ReconnectPolicy`(순수) — 지연 시퀀스 1,2,4,8,10,10..., 상한 클램프, `maxAttempts` 경계, 비활성 정책.
-2. 리포지토리 재연결 시나리오(가짜/MockK `TcpClient`·`UdpClient`, 가상 시간):
-   - Connected 후 heartbeat 유실 → `Reconnecting(1,N)` (Error를 거치지 않음) → 다음 시도 성공 시 `Connected`, 새 세션 토큰이 UDP MOVE에 쓰임(옛 토큰 아님), 카운터 리셋
-   - 시도가 연속 실패 → attempt가 1..N으로 증가 → N 소진 후 `Error("Reconnect failed: ...")`, 그 이후 더 이상 재시도하지 않음
-   - **첫 연결 실패는 재시도하지 않음**(Connecting → Error 그대로, 가상 시간을 한참 진행해도 추가 connect 호출 없음)
-   - 재연결 대기 중 `disconnect()` → 즉시 `Disconnected`, 이후 가상 시간을 진행해도 connect 호출 없음
-   - 재연결 대기/시도 중 수동 `connect()` → 진행 중 재연결 취소, 수동 연결 1회만 수행(이중 접속 없음)
-   - `Click`/`DragEnd` 전송 실패 → 소켓 정리 + 재연결 트리거(Error 깜빡임 없이 Reconnecting), 그리고 그 뒤 옛 heartbeat 루프가 두 번째 유실 보고를 내지 않음(세대 CAS)
-   - `MOVE`/`SCROLL` 전송 실패는 재연결을 **트리거하지 않음**(기존 F-1/F-2 유지)
-   - 재연결 비활성 정책이면 기존과 동일하게 `Error(message)`
-3. 기존 테스트 전부 통과(위 §3의 정책 주입 방식으로). 192개 → 그 이상.
-4. `TrackpadViewModel` 쪽 변경이 필요하면 최소한으로(취소는 기존 `disconnect()` 재사용).
+## 테스트 요구사항 (pytest, 기존 스타일)
+1. 순수 로직: 연결 수 0/1/N → 상태/툴팁/라벨(경계: 0, 1, 2), 주소 라벨 포맷, LAN IP 조회 성공/실패(소켓 주입으로 예외 시 "(확인 불가)")
+2. 어댑터(가짜 Icon): 연결 수 변화 → 아이콘·툴팁 갱신, 같은 상태에선 불필요한 갱신 안 함, "종료" 콜백이 stop을 설정
+3. 정지 가능한 서버: stop 설정 시 accept 루프가 시간 안에 반환하고 리슨 소켓이 닫힘(실제 로컬 소켓, 짧은 타임아웃), 정지 후 재바인딩 가능(포트가 풀렸는지)
+4. 종료 시 드래그 해제: 드래그 활성 상태에서 정상 종료 → `force_release_drag` 호출, `atexit` 경로도 호출, 중복 호출 안전
+5. 서버 스레드 사망: 포트 점유 시 예외가 로그되고 트레이 정지 + 비정상 종료 코드
+6. `--no-tray`/미설치 폴백: 트레이 없이 서버가 기존과 동일하게 동작
+7. 기존 pytest 전부 통과
 
 ## 실행/검증
-- `phone_pad_app/`에서 `./gradlew :app:testDebugUnitTest :app:assembleDebug` (Windows PowerShell이면 `.\gradlew.bat`). `phone_pad_app/local.properties`는 이미 리더가 복사해 두었다(gitignore 대상, 커밋 금지).
-- 작업 디렉토리: **이 워크트리(`C:\Github\phone_pad\.claude\worktrees\reconnect-logic`) 안에서만.** 다른 워크트리(`settings-ui-datastore`)와 원본 체크아웃(`C:\Github\phone_pad`)은 읽기·수정 모두 금지.
-- 컴파일이 통과해도 Compose 화면 동작은 실기기 전엔 미검증임을 summary에 명시.
+- `pc_server/`에서 `python -m pytest -q`. 작업 디렉토리는 **이 워크트리(`C:\Github\phone_pad\.claude\worktrees\tray-icon`) 안에서만.** 다른 워크트리(`reconnect-logic`, `settings-ui-datastore`)와 원본 체크아웃(`C:\Github\phone_pad`)은 읽기·수정 금지.
+- 테스트가 실제 포트를 쓴다면 고정 포트(9000/9001) 충돌을 피하도록 임시 포트(0 바인딩)를 쓰고, 다른 프로세스의 9000/9001 사용 여부에 테스트가 좌우되지 않게 할 것.
 
 ## 산출물
-- 코드/테스트: `phone_pad_app/`
-- 요약: `_workspace/01_android-dev_summary.md` — 변경 파일, 설계 결정과 근거, 실제 테스트 출력 기준 결과, 미해결 이슈, 실기기 확인 항목
+- 코드/테스트: `pc_server/` (+ `requirements.txt`)
+- 요약: `_workspace/01_server-dev_summary.md` — 변경 파일, 설계 결정과 근거, 실제 pytest 출력 기준 결과, 미해결 이슈, 실기기/실환경에서만 확인 가능한 항목
 - **커밋하지 말 것**(리더 처리). AGENTS.md/CLAUDE.md 수정 금지(리더 처리).
 
 ## 제외
-- 서버 변경, UDP 브로드캐스트 자동 탐색, 트레이 아이콘, IP 영속화(마지막 접속 IP 저장), ConnectivityManager 연동, 앱 백그라운드/도즈 대응.
+- Android 변경, PyInstaller 패키징(Phase 4 별도 항목 — 단, 나중에 `--noconsole`로 패키징해도 트레이 종료 경로가 성립하도록 `print` 남용은 그대로 두되 stdout이 None이어도 죽지 않는지는 summary에 언급만), UDP 자동 탐색, 트레이 메뉴의 추가 기능(클립보드 복사, 자동 시작 등), 다중 기기 정책.
