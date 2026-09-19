@@ -1,163 +1,110 @@
-# android-dev 요약 — 1손가락 더블탭 → DOUBLE_CLICK (Phase 3)
+# android-dev 작업 요약 — 탭홀드 + 드래그 → DRAG_START / DRAG_END (Phase 3)
 
-확정 스펙(`_workspace/00_input/request.md`)의 "Android 구현 대상" 7항목을 전부 구현했습니다.
-필드명·상수명·구조는 스펙 그대로 유지했습니다.
+## 결과 한 줄
+1손가락 제자리 홀드 200ms 승격 → `DRAG_START`, 이후 이동은 기존 MOVE 그대로, 해제 시 `DRAG_END`.
+승격 판정은 순수 클래스 `DragHoldDetector`로 분리했고, 전체 149개 단위 테스트 통과(회귀 없음).
 
-## 변경 파일
+## 확정 스펙 (server-dev / protocol-qa 공유용)
+
+TCP 9000, newline-delimited JSON. **필드 없음, session 없음** (CLICK/SCROLL과 같은 평문 이벤트).
+
+```jsonc
+{"type":"DRAG_START"}
+{"type":"DRAG_END"}
+```
+
+- 드래그 중 이동은 새 이벤트가 아니라 **기존 MOVE(UDP 9001)** 를 그대로 사용 — 서버 `_move` 무변경.
+- 앱이 보내는 순서 보장: `DRAG_START` → (0개 이상의 MOVE) → `DRAG_END`.
+- 승격되지 않은 제스처는 이전과 100% 동일하게 동작(MOVE만, 버튼 없음).
+- 와이어 리터럴은 `TrackpadRepositoryImpl`의 `DRAG_START_JSON` / `DRAG_END_JSON` 상수에 고정되어 있고,
+  `TrackpadRepositoryImplTest`가 문자열 그대로를 assert 한다.
+
+## 변경 파일 목록
 
 ### 신규
 | 파일 | 내용 |
 |------|------|
-| `presentation/trackpad/DoubleTapDetector.kt` | 순수 Kotlin 더블탭 판정 상태 머신 |
-| `app/src/test/.../presentation/trackpad/DoubleTapDetectorTest.kt` | 더블탭 판정 테스트 13종 |
+| `app/src/main/java/com/example/phone_pad_app/presentation/trackpad/DragHoldDetector.kt` | 승격 판정 순수 클래스 + `DragHoldSignal` enum (None/Start/End) |
+| `app/src/test/java/com/example/phone_pad_app/presentation/trackpad/DragHoldDetectorTest.kt` | 승격 경계 조건 테스트 24개 |
 
 ### 수정
 | 파일 | 내용 |
 |------|------|
-| `presentation/util/GestureConfig.kt` | `DOUBLE_TAP_INTERVAL_MS = 300L`, `DOUBLE_TAP_DISTANCE_PX = 40f` 추가 |
-| `presentation/trackpad/MultiTouchGestureTracker.kt` | `GestureEndDecision`에 `x`/`y` 추가. 판정 로직 자체는 불변 |
-| `presentation/trackpad/TrackpadScreen.kt` | `coroutineScope` 래핑 + 지연/병합 클릭 로직, `TrackpadSurface`에 `onDoubleClick` 배선 |
-| `domain/model/TrackpadEvent.kt` | `data class DoubleClick(val button: String = "left")` 추가 |
-| `data/repository/TrackpadRepositoryImpl.kt` | `DoubleClick` → TCP 직렬화 (실패 시 `Error`) |
-| `presentation/trackpad/TrackpadViewModel.kt` | `sendDoubleClick()` 추가 |
-| 기존 테스트 3종 | `GestureConfigTest`, `TrackpadRepositoryImplTest`, `TrackpadViewModelTest`, `MultiTouchGestureTrackerTest`에 케이스 추가 |
+| `presentation/util/GestureConfig.kt` | `DRAG_HOLD_THRESHOLD_MS: Long = TAP_MAX_DURATION_MS` 추가 (숫자 중복 없이 참조) |
+| `domain/model/TrackpadEvent.kt` | `object DragStart`, `object DragEnd` 추가 (필드 없음) |
+| `data/repository/TrackpadRepositoryImpl.kt` | `when` 분기 2개 + 와이어 리터럴 상수. 전송 실패 시 CLICK과 동급으로 `ConnectionState.Error` |
+| `presentation/trackpad/TrackpadViewModel.kt` | `sendDragStart()` / `sendDragEnd()` (UseCase 경유) |
+| `presentation/trackpad/TrackpadScreen.kt` | 타이머 경합 루프, `handleDragHold()`, `TrackpadSurface` 콜백 배선, 안내 문구에 "길게 눌렀다 움직여 드래그" 추가 |
+| `app/src/test/.../presentation/util/GestureConfigTest.kt` | 상수 관계 테스트 3개 추가 |
+| `app/src/test/.../data/repository/TrackpadRepositoryImplTest.kt` | 직렬화/실패 처리 테스트 5개 추가 |
+| `app/src/test/.../presentation/trackpad/TrackpadViewModelTest.kt` | 이벤트 번역 테스트 3개 추가 |
 
-## 와이어 포맷 (확정 스펙 그대로)
+## 실제 구현한 타이머 / 승격 로직
 
-```jsonc
-{"type":"DOUBLE_CLICK","button":"left"}
+### 1. 타이머 경합 (`TrackpadScreen.kt`)
+손가락이 완전히 정지하면 Android가 MotionEvent를 아예 주지 않으므로, 이벤트만 기다려서는 "제자리 유지 시간"을 잴 수 없다. 그래서 루프 매 회차마다:
+
+```kotlin
+val remainingHold = dragHold.remainingHoldMs(System.currentTimeMillis())
+val event = if (remainingHold == null) awaitPointerEvent()
+            else withTimeoutOrNull(remainingHold) { awaitPointerEvent() }
+if (event == null) { handleDragHold(dragHold.onHoldTimeout(now)); continue }
 ```
-TCP 9000, newline-delimited. `session` 필드 없음 (CLICK과 동일 등급의 평문 이벤트).
-리터럴은 `TrackpadRepositoryImplTest`에서 문자열 비교로 고정했습니다.
 
-## 실제 구현한 지연/병합 로직
+- 여기서 쓰는 `withTimeoutOrNull`은 **kotlinx의 것이 아니라 `AwaitPointerEventScope`의 멤버**다(import 없이 해석됨 — import를 지우고 재컴파일해 확인). 포인터 입력 스코프 전용 구현이라 타임아웃이 제스처 루프 자체를 취소하지 않는다.
+- `remainingHoldMs()`는 승격 후보가 아니면(이미 승격 / 거리 초과로 탈락 / 종료) `null`을 돌려주므로, 그 뒤로는 기존과 동일하게 타임아웃 없이 대기한다 → **기존 MOVE/CLICK 경로의 대기 특성이 그대로 유지**된다.
+- 임계를 이미 넘긴 경우 음수가 아니라 `0L`을 돌려준다(`withTimeoutOrNull(0)`은 즉시 null → 한 회차 만에 승격 후 정착, 무한 루프 없음).
 
-### 1. `DoubleTapDetector` — "언제 두 탭이 하나인가"만 판정
+### 2. 승격 판정 (`DragHoldDetector`, 순수 Kotlin)
+- `onGestureStart(x, y, t)` — 첫 down 시점에 무장. 기준 좌표/시각 고정.
+- `onPointerEvent(count, x, y, t)` — 개수≠1이면 즉시 해제(`End`), 시작점에서 `TAP_MAX_DISTANCE_PX` 초과 시 **sticky 탈락**(되돌아와도 승격 없음, 트래커의 `isDrag` 규약과 동일), 시간이 찼으면 승격(떨림 이벤트로 타이머가 계속 갱신되는 경우 대비).
+- `onHoldTimeout(t)` — 제자리 유지 확인 → `elapsed >= DRAG_HOLD_THRESHOLD_MS`면 `Start`.
+- `onGestureEnd()` — 활성이었으면 `End`, **멱등**(정상 경로 + `finally` 양쪽에서 호출).
+- `hasPromoted` — 이 제스처가 승격된 적 있는지. 호출부가 클릭/더블탭 판정을 통째로 건너뛰는 근거(스펙 7번).
 
-```
-onTap(x, y, timestampMs): Boolean
-```
-직전 탭 **하나만** 기억합니다. `0 <= elapsed <= DOUBLE_TAP_INTERVAL_MS` **이고**
-`hypot(dx, dy) <= DOUBLE_TAP_DISTANCE_PX`이면 `true`를 돌려주고 **즉시 내부 상태를 비웁니다.**
-아니면 이 탭을 새 "직전 탭"으로 기억하고 `false`.
+### 3. 엣지 케이스 처리
+| 상황 | 처리 |
+|------|------|
+| 손가락 개수 변화(1→2) | 즉시 `DRAG_END`. **그 제스처 안에서는 재무장하지 않음** |
+| 화면 밖 이탈 / 제스처 취소 / 컴포저블 파기 | `awaitEachGesture` 본문을 `try/finally`로 감싸 `finally`에서 `onGestureEnd()` → 활성이었으면 `DRAG_END` |
+| 승격된 제스처의 종료 | `DRAG_END`만. `hasPromoted` 검사로 CLICK/DOUBLE_CLICK 판정 자체를 생략 |
+| 승격 직후 안 움직이고 뗌 | `DRAG_START` → `DRAG_END` (스펙 8번, 서버 관점에서 좌클릭 down/up과 동일) |
+| 대기 중인 지연 클릭이 있는데 드래그 승격 | 지난 라운드 `flushPendingClick()` 패턴 그대로 **즉시 발사**(취소 아님) + `doubleTapDetector.reset()` — F-1/F-4와 같은 이유 |
 
-- 확정 즉시 리셋하는 이유: 안 하면 3번 탭했을 때 `A+B`와 `B+C`가 각각 더블클릭으로 잡혀
-  더블클릭이 두 번 나갑니다. 테스트로 고정했습니다(`네 번 탭하면 더블탭이 정확히 두 번 확정된다`).
-- 거리는 축별이 아니라 **직선 거리(hypot)** 기준입니다.
-- 음수 간격(시각 역행)은 짝으로 인정하지 않습니다 — `System.currentTimeMillis()`는 단조 증가가
-  보장되지 않아서, `elapsed <= INTERVAL`만 보면 아무리 오래된 탭과도 묶일 수 있습니다.
-- 시간 축(지연 전송)은 이 클래스의 책임이 아닙니다. 그래서 코루틴 없이 JUnit만으로 전부 검증됩니다.
+**"재무장하지 않음"을 택한 근거(설계 결정):** 1→2→1로 돌아왔을 때 다시 무장하면, 2손가락 스크롤 후 손가락을 하나씩 떼는 꼬리 구간이 "제자리 1손가락 유지"로 보여 **스크롤 직후 드래그가 오발동**한다. 지난 라운드 F-2(스크롤 뒤 좌클릭 오발동)와 정확히 같은 함정이라 같은 방향으로 막았다. 대가로 "2손가락 → 1손가락으로 줄인 뒤 홀드 드래그"는 동작하지 않는다(스펙 범위 밖).
 
-### 2. `MultiTouchGestureTracker` — 탭 위치를 함께 반환
+### 4. 탭 판정과의 상호 배타성
+`DRAG_HOLD_THRESHOLD_MS == TAP_MAX_DURATION_MS`이고 트래커의 탭 조건은 `elapsed < TAP_MAX_DURATION_MS`, 승격 조건은 `elapsed >= DRAG_HOLD_THRESHOLD_MS`라 **구조적으로 겹치지 않는다**(경계 200ms는 드래그 쪽). 실제 두 클래스를 함께 돌려 이걸 고정하는 테스트를 넣었다. 그럼에도 꼬리 구간 보정 등으로 다른 구간이 탭으로 판정될 여지를 남기지 않기 위해 `hasPromoted` 가드를 이중으로 두었다.
 
-`GestureEndDecision`에 `x`, `y`(기본값 `0f`)를 **뒤에 덧붙여** 기존 호출부/테스트를 깨지 않았습니다.
-기존 `resolveClickButton`을 `resolveTap`으로 바꾸면서 `TapResolution(button, x, y)`를 돌려주게 했는데,
-**분기 조건과 판정식은 한 글자도 바꾸지 않았습니다** — 각 분기가 원래 쓰던 구간의 시작 좌표를
-함께 싣기만 합니다. 꼬리 보정(`MULTI_TOUCH_RELEASE_GRACE_MS`) 경로에서는 꼬리가 아니라
-**직전 구간의 시작 좌표**를 돌려주도록 `prevStartX`/`prevStartY`를 새로 추적합니다
-(판정 기준과 좌표 기준이 어긋나지 않게).
+## 테스트 목록
 
-### 3. `TrackpadScreen` — 지연된 단일 클릭 job
+### `DragHoldDetectorTest` (신규, 24개)
+승격: 제자리+임계 도달 / 임계 직전 미승격 / 경계값 200ms는 승격 / 탭 한계 거리 이내 떨림은 승격 허용 / 떨림 이벤트 경로 승격
+미승격: 시간 전 거리 초과 → 영영 미승격 / 거리 초과 sticky(복귀해도 미승격) / 승격 전 종료는 무신호
+해제: 승격 후 뗌 → End / `onGestureEnd` 멱등 / 손가락 추가 → 즉시 End / 개수 변화 후 재무장 안 함 / 2손가락 시작은 후보 아님
+승격 후: 이동해도 재발사 없음 / 승격 직후 뗌 = Start+End만
+타이머: 무장 직후 남은 시간 = 임계 전체 / 초과 시 0(음수 아님) / 승격·탈락·종료 후 null
+재사용: 새 제스처 시 이력 초기화 / `reset()`
+배타성: 승격 제스처는 트래커가 탭으로 판정 안 함 / 짧은 탭은 승격 안 함
 
-`pointerInput(Unit) { coroutineScope { ... awaitEachGesture { ... } } }` 구조입니다.
-`coroutineScope`를 한 겹 두른 이유는, 지연 클릭 job이 **자기를 만든 제스처보다 오래 살아야** 하기
-때문입니다 — 대기 중에 들어오는 "두 번째 탭"은 이미 다음 제스처이고, `awaitEachGesture` 블록
-안에서 `launch`하면 제스처마다 스코프가 달라 그 job을 가로질러 취소할 수 없습니다.
-
-1손가락 탭(`BUTTON_LEFT`)이 끝났을 때:
-1. 대기 중인 `pendingClickJob`을 **먼저 무조건 취소** (어느 쪽으로 판정되든)
-2. `doubleTapDetector.onTap(end.x, end.y, lastTimestamp)`
-   - `true` → `onDoubleClick()` 즉시 호출 (미뤄뒀던 CLICK은 1번에서 이미 취소되어 사라짐)
-   - `false` → `launch { delay(DOUBLE_TAP_INTERVAL_MS); onClick() }`로 새로 예약
-
-2손가락 탭(우클릭)은 이 로직을 전혀 거치지 않고 기존처럼 즉시 `onRightClick()`입니다.
-
-**의도된 대가:** 모든 1손가락 좌클릭에 300ms 지연이 생깁니다. request.md에 적힌 대로
-더블클릭을 지원하는 구조에서 피할 수 없는 트레이드오프입니다.
-
-### 4. 채널 원칙 준수
-
-`DoubleClick`은 이동 좌표가 아니므로 **TCP**입니다. MOVE만 UDP라는 AGENTS.md 섹션 4 원칙을
-유지했고, "UDP로 새지 않는지"를 테스트로 고정했습니다. 전송 실패 시에는 CLICK과 같은 등급으로
-`ConnectionState.Error`를 세팅합니다(MOVE/SCROLL처럼 조용히 버리지 않음) — 저빈도 · 사용자
-명시 행동이라 watchdog이 세팅한 원인 메시지를 덮어쓸 위험이 사실상 없기 때문입니다.
-
-## 테스트
-
-### `DoubleTapDetectorTest` (신규 13종)
-임계값을 하드코딩하지 않고 전부 `GestureConfig`에서 파생시켰습니다.
-
-- 첫 탭은 언제나 false
-- 간격·거리 모두 이내 → 두 번째 탭에서 true / 완전히 같은 좌표도 true
-- **간격 초과** → false + 두 번째 탭이 새 직전 탭이 됨(이어지는 세 번째 탭이 묶이는지로 확인)
-- **간격 경계값**(정확히 `DOUBLE_TAP_INTERVAL_MS`)은 "이내"로 인정
-- **거리 초과** → 간격이 이내여도 false
-- **거리 경계값**(정확히 `DOUBLE_TAP_DISTANCE_PX`)은 "이내"로 인정
-- 거리 판정이 축별이 아니라 직선 거리 기준인지 (각 축 0.8D → 합성 1.13D는 초과)
-- 거리 초과로 실패한 탭도 새 직전 탭으로 갱신되는지
-- **확정 후 리셋**: A-B가 더블탭이면 C는 새로 시작 / 네 번 탭 → `[false, true, false, true]`
-- `reset()` 후 다음 탭이 첫 탭이 되는지
-- 시각 역행(음수 간격) 방어
-
-### 기존 테스트 확장
-- `GestureConfigTest` +3: 상수값 고정(300L/40f), `DOUBLE_TAP_DISTANCE_PX > TAP_MAX_DISTANCE_PX`(정확히 2배),
-  `DOUBLE_TAP_INTERVAL_MS > TAP_MAX_DURATION_MS`
-- `TrackpadRepositoryImplTest` +4: 와이어 리터럴 고정, 기본 button=left, CLICK 두 개로 쪼개지지 않음, 실패 시 Error
-- `TrackpadViewModelTest` +3: `sendDoubleClick`이 `DoubleClick(left)`를 보냄, CLICK을 보내지 않음, 둘이 구분됨
-- `MultiTouchGestureTrackerTest` +3: 탭 위치가 구간 시작 좌표인지, 떨림이 있어도 고정인지,
-  꼬리 보정 시 직전 구간 좌표를 쓰는지
+### 기존 파일 추가분
+- `GestureConfigTest` +3: 임계 == `TAP_MAX_DURATION_MS`(==200L) / 해제 유예보다 김 / 더블탭 간격보다 짧음
+- `TrackpadRepositoryImplTest` +5: `DRAG_START` 리터럴·TCP 전용·session 없음 / `DRAG_END` 동일 / 순서 구분 / 각각 전송 실패 → `Error`
+- `TrackpadViewModelTest` +3: `sendDragStart`/`sendDragEnd` 번역(클릭 계열과 안 섞임) / 드래그 중 이동이 기존 MOVE 경로 사용
 
 ### 실행 결과
-
 ```
-$ cd phone_pad_app && ./gradlew :app:testDebugUnitTest
-BUILD SUCCESSFUL in 46s
-31 actionable tasks: 13 executed, 18 up-to-date
+cd phone_pad_app && ./gradlew :app:cleanTestDebugUnitTest :app:testDebugUnitTest
+BUILD SUCCESSFUL
+tests=149 skipped=0 failures=0 errors=0
 ```
+테스트 스위트 11개 전부 통과 — `MultiTouchGestureTrackerTest`(36), `DoubleTapDetectorTest`(13), `TrackpadRepositoryHeartbeatTest`(12) 등 기존 테스트 회귀 없음.
+컴파일(`:app:compileDebugKotlin`)·kapt까지 실제로 통과했으므로 **빌드 미검증 상태 아님**. 단, 실기기 동작은 미검증.
 
-| 클래스 | 테스트 | 실패 |
-|--------|--------|------|
-| ExampleUnitTest | 1 | 0 |
-| SessionHandshakeTest | 8 | 0 |
-| TcpClientTest | 4 | 0 |
-| TrackpadRepositoryHeartbeatTest | 12 | 0 |
-| TrackpadRepositoryImplTest | 18 | 0 |
-| SendEventUseCaseTest | 1 | 0 |
-| **DoubleTapDetectorTest (신규)** | **13** | **0** |
-| MultiTouchGestureTrackerTest | 36 | 0 |
-| TrackpadViewModelTest | 10 | 0 |
-| GestureConfigTest | 11 | 0 |
-| **합계** | **114** | **0** |
+## 남은 이슈 / server-dev·protocol-qa 확인 요청
 
-`compileDebugKotlin`이 통과했으므로 `coroutineScope { awaitEachGesture { ... } }` 중첩에서
-`PointerInputScope`(바깥)와 `CoroutineScope`(안쪽) 리시버가 모두 정상 해석됩니다 —
-`awaitEachGesture`는 바깥 리시버로, `launch`는 안쪽 리시버로 잡힙니다.
-
-**회귀 없음:** 1손가락 드래그(MOVE), 2손가락 우클릭, 2손가락 스크롤 관련 기존 테스트 전부 통과.
-
-## 남은 이슈
-
-1. **실기기 미검증** — 단위 테스트만 통과했고 실제 기기에서의 체감(300ms 클릭 지연이 답답한지,
-   40px 허용 거리가 충분한지)은 확인하지 못했습니다. 두 상수 모두 `GestureConfig`에 분리되어 있어
-   조정은 한 곳만 고치면 됩니다.
-
-2. **경계값 300ms 근처의 좁은 경합** — 두 번째 탭이 정확히 `DOUBLE_TAP_INTERVAL_MS` 시점에
-   들어오면, `delay(300)`이 이미 깨어나 `onClick()`을 실행한 뒤일 수 있습니다. 그 경우
-   CLICK과 DOUBLE_CLICK이 모두 나갑니다. 판정 시각(`System.currentTimeMillis()`)과
-   코루틴 `delay`의 시간축이 서로 다르므로 구조적으로 완전히 없앨 수는 없고, 실제로 문제가 되면
-   판정을 `elapsed < INTERVAL`(경계 배제)로 좁히는 선택지가 있습니다.
-   확정 스펙이 "이내"라고 명시해서 현재는 경계 포함으로 두었습니다.
-
-3. **좌클릭 직후 우클릭의 순서 역전** — 1손가락 탭 후 300ms 안에 2손가락 탭을 하면,
-   우클릭이 먼저 나가고 지연된 좌클릭이 그 뒤에 도착합니다. 스펙이 "우클릭은 이 로직과 완전히
-   무관"이라고 못박아서 우클릭 경로에서 `pendingClickJob`을 건드리지 않았습니다.
-   실사용 빈도가 낮은 조합이지만, 필요하면 우클릭 분기에서도 대기 job을 flush/취소하는 방식으로
-   정리할 수 있습니다. **스펙 변경 사항이라 임의로 하지 않았습니다.**
-
-4. **화면 전환 시 대기 중인 클릭 유실** — `pointerInput` 스코프가 취소되면(연결 해제 등)
-   대기 중이던 지연 클릭은 전송되지 않고 사라집니다. 최대 300ms 이내의 클릭이라
-   실질적 영향은 없다고 판단했습니다.
-
-5. **`AGENTS.md` 갱신 필요** — 섹션 4의 `// 더블클릭 (Phase 2, 미구현)` 주석, 섹션 5 표의
-   `1손가락 더블탭 → ⬜ 미구현`, 섹션 5 감도 상수 목록(신규 2개 누락), 섹션 6 Phase 3 체크박스를
-   갱신해야 합니다. 이 세션은 소스/테스트만 건드렸습니다.
+1. **`TrackpadScreen`의 코루틴 타이밍 자체는 여전히 자동 테스트 없음.** 승격 "판정"은 전부 `DragHoldDetector`로 빼서 테스트했지만, `withTimeoutOrNull` 경합·`try/finally` 배선·`flushPendingClick` 호출 순서는 Compose에 묶여 있어 단위 테스트가 없다. 지난 라운드 대비 커버리지는 늘었으나 AGENTS.md 섹션 10의 해당 미결 항목은 **부분 해소**에 그친다.
+2. **재무장 안 함 정책**(위 3번 표)은 스펙에 명시되지 않은 내 판단이다. protocol-qa가 다르게 봐야 한다고 판단하면 재검토 필요.
+3. **화면 밖 이탈 경로는 실기기 미검증.** `finally` 안전망은 넣었지만, Compose가 그 상황에서 어떤 순서로 이벤트를 주는지는 코드상으로만 확인했다. 서버 측 "연결 종료 시 강제 LEFTUP" 안전장치가 최종 방어선으로 반드시 있어야 한다.
+4. **승격 직후 첫 MOVE 사이의 서버 처리 순서 의존.** `DRAG_START`는 TCP, 뒤따르는 MOVE는 UDP라 이론상 UDP가 먼저 도착할 수 있다(채널이 다르므로 순서 보장 없음). 이 경우 버튼이 눌리기 직전에 커서가 조금 움직이는 정도라 영향은 미미하지만, 구조적 한계로 기록해 둔다.
+5. 서버가 `DRAG_START`/`DRAG_END`를 **멱등**으로 처리한다는 전제에 의존한다(취소 경로에서 `DRAG_END`가 중복 전송될 이론적 여지는 `onGestureEnd` 멱등성으로 앱에서도 막았지만, 이중 방어가 맞다).

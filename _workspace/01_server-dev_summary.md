@@ -1,85 +1,93 @@
-# server-dev 요약 — DOUBLE_CLICK (Phase 3)
-
-> **주의:** 이 작업은 원래 android-dev 에이전트로 기동된 세션이 코디네이터 지시에 따라
-> 이어받아 수행했습니다. 구현부(`input_controller.py`)는 이미 디스크에 존재했고,
-> 이 세션이 추가한 것은 **테스트뿐**입니다.
+# server-dev 작업 요약 — DRAG_START / DRAG_END (Phase 3)
 
 ## 변경 파일
 
-| 파일 | 변경 내용 | 작성자 |
-|------|----------|--------|
-| `pc_server/input_controller.py` | `handle_event`에 `DOUBLE_CLICK` 분기 + `_double_click(button)` 신규 | 이전 세션 (검토만 수행) |
-| `pc_server/tests/test_input_controller.py` | DOUBLE_CLICK 테스트 9종 + CLICK 회귀 2종 추가 | 이 세션 |
+| 파일 | 변경 |
+|------|------|
+| `pc_server/input_controller.py` | `__init__` 신규, `handle_event`에 `DRAG_START`/`DRAG_END` 분기, `_send_button_flag`/`_drag_start`/`_drag_end`/`force_release_drag` 추가, `drag_active` 프로퍼티, `threading` import |
+| `pc_server/server.py` | `handle_client`의 `finally` 블록에 강제 해제 안전장치 추가 |
+| `pc_server/tests/test_input_controller.py` | DRAG 단위 테스트 14개 추가, `test_handle_unknown_type_does_not_raise`에 drag 모킹 추가 |
+| `pc_server/tests/test_server_drag.py` | **신규** — 서버 경로 + 연결 종료 안전장치 테스트 14개 |
 
-## 구현부 검토 결과 (스펙 준수 확인)
+기존 `_move`/`_click`/`_double_click`/`_scroll`, `SessionRegistry`, UDP 경로, heartbeat 로직은 전혀 건드리지 않았다.
 
-`_double_click(button)`은 request.md 확정 스펙을 그대로 따르고 있음을 확인했습니다:
+## 처리하는 이벤트 (TCP 9000, 필드 없음)
 
-- `flags = (down_flag, up_flag, down_flag, up_flag)` 4개를 `(INPUT * 4)` 배열로 만들어
-  **`SendInput(4, inputs, ...)` 단 1회**로 전송 — `_click`을 두 번 호출(SendInput 2회)하지 않음
-- 버튼 분기는 기존 `_click`과 동일한 규약(`button == "left"`가 아니면 우클릭 플래그)
-- `MOUSEINPUT(dwFlags=flag)`만 세팅하므로 `dx`/`dy`/`mouseData`가 모두 0 —
-  커서를 움직이는 요소가 없어 Windows 더블클릭 판정 사각형(기본 4px) 문제가 발생하지 않음
-- `handle_event`의 분기 위치는 `CLICK` 바로 뒤, `event.get("button", "left")` 기본값도 CLICK과 동일
-
-## 추가한 테스트 (11종)
-
-### DOUBLE_CLICK 디스패치
-1. `test_handle_double_click_defaults_to_left` — `button` 필드 없으면 `"left"`로 위임
-2. `test_handle_double_click_passes_explicit_button` — 명시된 `button`을 그대로 전달
-3. `test_handle_double_click_does_not_reuse_click` — `_click`이 호출되지 않고 `SendInput`이 정확히 1회.
-   **이번 스펙의 핵심(원자성)을 고정하는 테스트**
-
-### SendInput 시퀀스
-4. `test_double_click_sends_down_up_down_up_in_single_send_input` —
-   `[LEFTDOWN, LEFTUP, LEFTDOWN, LEFTUP]` 순서 + SendInput 1회 + `count == len(inputs)` + `size == sizeof(INPUT)`
-5. `test_double_click_right_button_uses_right_flags` —
-   `[RIGHTDOWN, RIGHTUP, RIGHTDOWN, RIGHTUP]` (이번 범위 외지만 재사용성 확인)
-6. `test_double_click_does_not_move_cursor` —
-   4개 INPUT 전부 `dx == dy == mouseData == 0`이고 `dwFlags & MOUSEEVENTF_MOVE == 0`.
-   "커서가 안 움직여야 더블클릭이 성립한다"는 설계 근거를 직접 검증
-7. `test_handle_double_click_end_to_end_flags` — `handle_event` → `_double_click` → `SendInput` 전 구간
-
-### 회귀 (DOUBLE_CLICK 추가가 단일 클릭을 건드리지 않았는지)
-8. `test_single_click_still_sends_exactly_two_inputs` — `_click("left")` → `[LEFTDOWN, LEFTUP]` 2개, SendInput 1회
-9. `test_single_right_click_still_sends_exactly_two_inputs` — `_click("right")` → `[RIGHTDOWN, RIGHTUP]`
-
-`_click`의 SendInput 레벨 테스트는 기존에 없었습니다(디스패치 테스트만 존재) — 이번에 신규로 추가해
-"CLICK은 2개, DOUBLE_CLICK은 4개"라는 구분을 코드로 고정했습니다.
-
-### 기존 테스트 보강 (이전 세션 작업, 그대로 유지)
-- `test_handle_unknown_type_does_not_raise`에 `_double_click` 미호출 검증 추가 —
-  `SESSION`/`UNKNOWN`/`{}` 가 실수로 더블클릭을 유발하지 않음
-
-## 헬퍼
-
-`_sent_flags(mock_send_input)` 신규 — SendInput 1회 호출을 단언하고 `dwFlags` 목록을 뽑습니다.
-기존 `_sent_wheel_events`는 `mouseData`까지 필요한 휠 전용이라 분리했습니다.
-
-## 테스트 실행 결과
-
+```jsonc
+{"type":"DRAG_START"}   // LEFTDOWN 1개짜리 INPUT, SendInput 1회. UP 없음
+{"type":"DRAG_END"}     // LEFTUP 1개짜리 INPUT, SendInput 1회
 ```
-$ cd pc_server && python -m pytest
-platform win32 -- Python 3.13.1, pytest-9.0.3, pluggy-1.6.0
-collected 67 items
+- 두 이벤트 모두 필드를 읽지 않는다(있어도 무시). `session` 없음.
+- 드래그 중 이동은 기존 MOVE(UDP)가 그대로 담당 — `_move` 무변경.
 
-tests\test_input_controller.py ...........................               [ 40%]
-tests\test_server_heartbeat.py ...................                       [ 68%]
-tests\test_server_udp_session.py .....................                   [100%]
+## 구현한 로직
 
-============================= 67 passed in 0.20s ==============================
+**`InputController`**
+- `__init__`: `self._drag_active = False` + `self._drag_lock = threading.Lock()`
+  (InputController는 프로세스 전역 1개이고 TCP 클라이언트 스레드가 여러 개일 수 있어
+  "검사 후 변경"을 원자화. 스펙 요구사항은 아니지만 중복 LEFTDOWN 경합을 막는다.)
+- `drag_active` 프로퍼티(읽기 전용) — 외부 관측용.
+- `_drag_start()`: 비활성일 때만 `MOUSEEVENTF_LEFTDOWN` 1개 전송 후 활성화. 이미 활성이면 no-op(멱등). 전송 실패 시 상태를 바꾸지 않는다(버튼이 안 눌렸으므로).
+- `_drag_end()`: 활성일 때만 `MOUSEEVENTF_LEFTUP` 1개 전송 후 비활성화. 이미 비활성이면 no-op(멱등). **전송 실패 시 `_drag_active`를 True로 남긴다** — 이후 연결 종료 안전장치가 다시 시도할 수 있게.
+- `force_release_drag() -> bool`: `_drag_end()`와 동일 동작. 실제로 놓았으면 `True`.
+- `_send_button_flag(flag)`: down/up 단독 INPUT 1개를 보내는 공용 헬퍼(커서 이동/mouseData 없음).
+
+**`server.handle_client` finally**
+```python
+registry.remove(session)
+print(...)
+try:
+    if controller.force_release_drag():
+        print(f"[!] Drag was active on disconnect — left button released ({addr})")
+except Exception as e:
+    print(f"[!] Failed to release drag on disconnect: {e}")
+conn.close()
 ```
+- 정상 종료(EOF) / heartbeat 타임아웃 / 예외 전부 이 블록을 지난다.
+- 강제 해제 중 예외가 나도 세션 회수·소켓 종료를 막지 않도록 try/except로 감쌌다.
+- 핸드셰이크 실패 early-return 경로(SESSION 전송 실패)는 드래그가 활성일 수 없어 손대지 않았다.
 
-`test_input_controller.py` 27개(기존 16 + 신규 11), 전체 67개 전부 통과. MOVE/CLICK/SCROLL/HEARTBEAT/UDP 세션 회귀 없음.
+## 테스트 (총 95개 전부 통과)
 
-## 남은 이슈
+`cd pc_server && python -m pytest` → **95 passed in 0.29s** (실행 확인 완료)
 
-1. **실기기(실제 Windows 입력) 미검증** — `SendInput`을 모킹한 단위 테스트라 "실제로 더블클릭으로
-   인식되는지"는 확인하지 못했습니다. 특히 4개 INPUT을 시각차 0으로 주입하는 방식이 모든
-   애플리케이션에서 더블클릭으로 받아들여지는지는 실기기 확인이 필요합니다.
-   (`GetDoubleClickTime` 기본 500ms 안에는 확실히 들어가지만, 일부 앱이 down-up 간
-   최소 간격을 요구할 가능성은 배제 못 함)
-2. **`AGENTS.md` 갱신 필요** — 섹션 4의 `// 더블클릭 (Phase 2, 미구현)` 주석과 섹션 5 표의
-   `1손가락 더블탭 → ⬜ 미구현`, 섹션 6 Phase 3 체크박스를 구현 완료로 바꿔야 합니다.
-   이 세션은 소스/테스트만 건드렸습니다.
-3. `_move`의 sub-pixel 잔차 누적 이슈(기존 별도 이슈)는 이번 작업과 무관하게 그대로 남아 있습니다.
+**`tests/test_input_controller.py` 추가분 14개**
+- 신규 컨트롤러는 `_drag_active is False`
+- `DRAG_START` → `[LEFTDOWN]` 1개, `_drag_active True`
+- `DRAG_START`가 커서를 건드리지 않음(dx/dy/mouseData 0, MOVE 플래그 없음)
+- `DRAG_START` 3연속 → SendInput 1회만(멱등)
+- `DRAG_END` → `[LEFTUP]` 1개, `_drag_active False`
+- `DRAG_START` 없이 `DRAG_END` → SendInput 호출 없음, 크래시 없음
+- `DRAG_END` 2연속 → 1회만
+- down→up→down→up 사이클 반복 가능
+- `DRAG_START`에 여분 필드가 있어도 무시하고 정상 동작
+- 드래그 중 MOVE는 `_move(3,-1)`만 하고 드래그 상태 불변
+- `force_release_drag()` 활성 시 LEFTUP + True / 비활성 시 no-op + False
+- `DRAG_END` 정상 수신 후 `force_release_drag()`는 아무것도 안 보냄
+- LEFTUP 전송 실패 시 활성 상태 유지 → 재시도 성공
+- (수정) 미지의 type에 대해 `_drag_start`/`_drag_end`도 호출되지 않음
+
+**`tests/test_server_drag.py` 신규 14개** (FakeConn으로 `handle_client` 구동, 실제 소켓/SendInput 없음)
+- `{"type":"DRAG_START"}` 줄 → `_drag_start()` 호출
+- `DRAG_END` 줄이 도착한 시점(EOF 읽기 전)에 이미 버튼이 놓임
+- 한 연결 안 DRAG_START→DRAG_END → `[LEFTDOWN, LEFTUP]`
+- 줄이 청크 경계로 쪼개져 와도 파싱됨
+- 드래그 이벤트는 하향 트래픽을 만들지 않음(SESSION만)
+- **정상 종료(EOF) 시 드래그 활성 → 강제 LEFTUP**
+- **heartbeat 타임아웃(3연속) 시 드래그 활성 → 강제 LEFTUP** + 세션 회수·소켓 종료 유지
+- **recv 예외(ConnectionResetError) 경로에서도 강제 LEFTUP**
+- `DRAG_END`를 정상 수신했으면 finally에서 중복 LEFTUP 없음
+- 드래그를 안 쓴 연결은 종료 시 SendInput 호출 0
+- 강제 해제가 실패해도 세션 회수·소켓 종료는 진행
+- 재연결 시 이미 해제된 상태면 중복 LEFTUP 없음
+- UDP로 온 `DRAG_START`는 무시(MOVE 전용 채널 원칙)
+- 같은 연결에서 HEARTBEAT/SCROLL/DOUBLE_CLICK 회귀 없음
+
+기존 회귀 스위트(MOVE/CLICK/DOUBLE_CLICK/SCROLL/HEARTBEAT/UDP 세션) 81개 전부 통과.
+
+## 남은 이슈 / 참고
+
+1. **다중 클라이언트 시 교차 해제**: `InputController`가 프로세스 전역 1개라 A 연결이 드래그 중인데 B 연결이 끊기면 B의 finally가 A의 드래그를 놓는다. 현재 구조(1대1 사용 전제, AGENTS.md 섹션 10 "다중 기기 연결" 미결)에서는 문제가 아니며, 버튼이 눌린 채 멈추는 쪽보다 안전한 실패 방향이라 그대로 뒀다. 다중 기기를 지원하게 되면 드래그 상태를 세션별로 분리해야 한다.
+2. **프로세스 강제 종료**: 서버 프로세스 자체가 kill되면 finally가 돌지 않아 버튼이 눌린 채 남는다. `atexit`/시그널 핸들러는 이번 범위 밖(Phase 4 트레이 아이콘 작업에서 함께 다루면 좋다).
+3. **AGENTS.md 갱신 필요**: 섹션 4의 `// 드래그 (Phase 3, 미구현)` 주석과 섹션 5/6 로드맵을 구현 완료로 바꿔야 한다(리더/문서 담당 몫으로 남김).
+4. Android 쪽 와이어 리터럴 고정 테스트(SCROLL처럼 `test_handle_client_processes_android_scroll_wire_literal` 형태)를 DRAG에도 추가하려면 android-dev의 직렬화 테스트 리터럴 확정이 필요 — 현재는 스펙 문자열(`{"type":"DRAG_START"}`)을 그대로 하드코딩해 두었다.

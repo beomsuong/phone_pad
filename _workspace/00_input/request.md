@@ -1,64 +1,75 @@
-# 요청: 1손가락 더블탭 → DOUBLE_CLICK (AGENTS.md Phase 3)
+# 요청: 탭홀드 + 드래그 → DRAG_START / DRAG_END (AGENTS.md Phase 3)
 
-**범위 판단:** 교차 경계면 (새 이벤트 타입 DOUBLE_CLICK 추가 + 서버 구현 필요)
+**범위 판단:** 교차 경계면 (새 이벤트 타입 2개 추가 + 서버가 마우스 버튼을 "누른 채로 유지"하는 상태를 새로 가짐)
 **실행 경로:** 리더가 스펙 사전 확정 → android-dev/server-dev 병렬 호출 → protocol-qa 사후 검증
 
-## 왜 "CLICK 두 번"이 아니라 명시적 DOUBLE_CLICK 이벤트가 필요한가
+## 이 제스처가 뭔지
 
-두 번째 탭이 화면(폰)에서 첫 번째 탭과 완전히 같은 좌표에 오는 경우는 거의 없다 — 사람이 두 번 탭하면 몇 픽셀씩 어긋난다. 만약 이 어긋남이 `MOVE_MIN_DISTANCE_PX`를 넘겨 그사이에 MOVE가 한 번이라도 나가면 PC 커서가 미세하게 움직이고, Windows의 네이티브 더블클릭 판정은 커서가 움직이지 않은 아주 좁은 사각형(기본 4px) 안에서 두 클릭이 일어나야만 성립한다. 즉 "CLICK을 빠르게 두 번 보내서 OS가 알아서 더블클릭으로 인식하게 하자"는 접근은 실기기에서 신뢰할 수 없다. 그래서 Android가 명시적으로 더블탭을 판정해서 **`DOUBLE_CLICK` 이벤트 하나만** 보내고, 서버가 커서를 전혀 움직이지 않은 채로 클릭 두 번을 원자적으로 실행한다.
+1손가락으로 화면을 누른 채 `DRAG_HOLD_THRESHOLD_MS`(탭 최대 지속시간과 동일, 200ms) 이상 **움직이지 않고 버티면** "드래그 홀드"로 승격된다 — PC에서 마우스 왼쪽 버튼을 누른 채로 유지하는 것과 같다. 이후 손가락을 움직이면 버튼이 눌린 채로 커서가 움직여 텍스트 선택/아이콘 드래그 등이 된다. 손가락을 떼면 버튼을 놓는다.
+
+이건 기존 "1손가락 드래그"(그냥 커서만 움직이는 것, Phase 1부터 있음)와 다르다 — 기존 드래그는 버튼을 전혀 누르지 않는다. 이번 기능은 **버티는 시간**이 핵심 트리거다: 빨리 움직이면 여전히 기존처럼 버튼 없는 커서 이동이고, 제자리에서 200ms 이상 버티면 그 순간 버튼이 눌린다.
 
 ## 확정 스펙
 
-### 와이어 포맷 (TCP 9000, 기존 newline-delimited JSON)
+### 와이어 포맷 (TCP 9000, 필드 없음)
 ```jsonc
-{"type":"DOUBLE_CLICK","button":"left"}
+{"type":"DRAG_START"}
+{"type":"DRAG_END"}
 ```
-- `button` 필드는 CLICK과 동일한 모양을 위해 유지하지만, 이번 범위(1손가락 더블탭)에서는 항상 `"left"`
-- session 필드 없음 (CLICK과 동일한 TCP 평문 이벤트)
+- 둘 다 필드가 전혀 없다. session도 없다 (CLICK/SCROLL과 동일한 TCP 평문 이벤트)
+- **드래그 중 이동은 새 이벤트가 아니라 기존 MOVE(UDP)를 그대로 쓴다** — 서버가 버튼을 누른 채로 유지하는 동안 MOVE가 오면 커서만 움직이므로, 실제 드래그 효과는 "버튼 누름 + 커서 이동 + 버튼 뗌"의 조합만으로 자연히 발생한다. `_move` 자체는 전혀 손댈 필요 없다
 
-### 판정 로직 (지연 후 확정 방식)
-1손가락 탭이 끝날 때마다 **즉시 CLICK을 보내지 않고**, 짧은 시간(`DOUBLE_TAP_INTERVAL_MS`) 동안 "혹시 이어서 탭이 또 오는지" 기다린다:
-- 이 시간 안에 같은 위치(`DOUBLE_TAP_DISTANCE_PX` 이내) 근처에서 또 1손가락 탭이 끝나면 → 두 탭을 합쳐 **`DOUBLE_CLICK` 한 번만** 보낸다 (개별 CLICK 두 개를 보내지 않는다)
-- 이 시간이 지나도록 두 번째 탭이 안 오면 → 그제서야 미뤄뒀던 **CLICK을 보낸다** (단일 탭은 여전히 CLICK 하나)
-- 우클릭(2손가락 탭)은 이 지연/병합 로직과 완전히 무관하다 — 우클릭은 지금처럼 즉시 전송
-
-이 방식의 대가: **모든 1손가락 탭(클릭)에 `DOUBLE_TAP_INTERVAL_MS`만큼의 지연이 생긴다.** 더블클릭을 지원하려면 구조적으로 피할 수 없는 트레이드오프이며(더블클릭을 지원하는 모든 UI가 같은 문제를 갖는다), 이번 작업의 의도된 결과다.
+### 판정 로직 (Android)
+1. 1손가락 구간이 시작된 뒤, **제자리(탭 최대 이동 거리 이내)를 유지한 채** `DRAG_HOLD_THRESHOLD_MS`가 지나면(아직 손가락을 떼지 않았다면) 그 순간 드래그 홀드로 승격 → `DRAG_START` 전송
+2. `DRAG_HOLD_THRESHOLD_MS`는 `TAP_MAX_DURATION_MS`와 **정확히 같은 값**이어야 한다 — "탭으로 인정되지 않게 되는 바로 그 시점"이 "드래그 홀드 후보가 되는 시점"과 일치해야 사각지대가 없다. 별도 상수로 만들되 `TAP_MAX_DURATION_MS`를 참조할 것(`const val DRAG_HOLD_THRESHOLD_MS = TAP_MAX_DURATION_MS`)
+3. 승격 전에 손가락이 `TAP_MAX_DISTANCE_PX`를 넘게 움직이면(즉 시간이 되기 전에 이미 드래그가 시작되면) 승격하지 않는다 — 기존처럼 버튼 없는 일반 커서 이동(MOVE)으로 처리된다 (기존 동작, 회귀 금지)
+4. 승격된 뒤에는 이동을 계속 기존 MOVE 경로로 방출한다 (판정/감도 로직 변경 없음)
+5. 드래그 홀드 상태에서 손가락 개수가 바뀌면(예: 두 번째 손가락이 닿음) 즉시 `DRAG_END`를 보내고 버튼을 놓는다 — 2손가락 드래그 홀드는 이번 범위가 아니다
+6. 드래그 홀드 상태에서 손가락이 화면 밖으로 나가거나 제스처가 취소되는 경우에도 `DRAG_END`를 보낸다 (AGENTS.md 섹션 5의 기존 엣지 케이스 문구가 이걸 가리킨다)
+7. 드래그 홀드로 끝난 제스처는 탭/더블탭/클릭 판정을 아예 하지 않는다 (`DRAG_END`만 보내고 끝 — `CLICK`/`DOUBLE_CLICK`과 무관)
+8. 드래그 홀드가 승격됐지만 그 뒤로 전혀 움직이지 않고 바로 손을 뗀 경우 → `DRAG_START` 직후 `DRAG_END`만 나간다 (사이에 MOVE 없음). 이는 서버 관점에서 일반 좌클릭의 down/up과 동일한 결과이므로 문제 없다
 
 ### 상수 (Android `GestureConfig.kt`)
-- `DOUBLE_TAP_INTERVAL_MS = 300L` — 두 탭을 하나의 더블탭으로 묶는 최대 간격(첫 탭 종료 ~ 둘째 탭 종료). 실기기 미검증, 조정 가능
-- `DOUBLE_TAP_DISTANCE_PX = 40f` — 두 탭 중심 좌표 사이 최대 허용 거리. `TAP_MAX_DISTANCE_PX`(20px)의 2배 — 두 번째 탭이 첫 번째와 완전히 같은 자리가 아니어도 되도록 여유를 준다
+- `DRAG_HOLD_THRESHOLD_MS: Long = TAP_MAX_DURATION_MS` — 위 2번 참고
+
+### 서버 안전장치 (중요)
+`DRAG_END`가 유실되면(네트워크 문제, 앱 강제 종료 등) PC의 마우스 왼쪽 버튼이 **영원히 눌린 채로 멈추는** 심각한 상태가 된다. 이를 막기 위해 서버는:
+- `InputController`가 드래그 활성 여부(`_drag_active`)를 인스턴스 상태로 가진다
+- `DRAG_START`/`DRAG_END`는 각각 **멱등**이어야 한다 — 이미 활성 상태에서 또 `DRAG_START`가 오면 무시(중복 LEFTDOWN 방지), 비활성 상태에서 `DRAG_END`가 오면 무시
+- **TCP 연결이 어떤 이유로든 끊길 때(정상 종료, heartbeat 타임아웃, 예외 등 `handle_client`의 `finally` 블록 전부)** 드래그가 활성 상태였다면 서버가 강제로 버튼을 놓는다(LEFTUP 전송). 이건 세션/연결과 무관하게 `InputController`가 전역으로 가지는 상태이므로(현재 구조상 `InputController` 인스턴스 자체가 프로세스 전체에서 하나) `handle_client`의 `finally`에서 안전하게 호출 가능해야 한다
 
 ## Android 구현 대상
+- `presentation/util/GestureConfig.kt`: `DRAG_HOLD_THRESHOLD_MS` 추가
+- `presentation/trackpad/TrackpadScreen.kt`: 1손가락 구간에서 "제자리 유지 시간"을 재는 타이머 경합 로직 추가 (예: `awaitPointerEvent()`를 남은 시간만큼의 타임아웃과 경합시켜, 타임아웃이 먼저 나면 승격). **가능하면 승격 판정 자체(경과 시간 + 누적 이동 거리로 승격 여부를 결정하는 순수 로직)는 별도의 작은 순수 함수/클래스로 분리해서 단위 테스트가 가능하게 할 것** — 코루틴 타이밍 자체는 Compose에 묶여 테스트하기 어렵더라도, "승격 조건" 판정 로직만이라도 순수 함수로 빼면 회귀를 잡을 수 있다 (지난 라운드 QA가 `TrackpadScreen`에 자동 테스트가 없다고 지적한 것과 같은 문제를 이번엔 최대한 피해가는 방향)
+- `domain/model/TrackpadEvent.kt`: `object DragStart : TrackpadEvent()`, `object DragEnd : TrackpadEvent()` 추가 (필드 없음)
+- `data/repository/TrackpadRepositoryImpl.kt`: TCP로 `{"type":"DRAG_START"}` / `{"type":"DRAG_END"}` 직렬화. CLICK과 같은 등급(저빈도, 명시적 상태 전이)이라 전송 실패 시 `Error`로 알림
+- `TrackpadViewModel.kt`: `sendDragStart()`, `sendDragEnd()` 추가
+- `TrackpadSurface`: 콜백 배선
 
-1. **`presentation/trackpad/DoubleTapDetector.kt` 신규** — 순수 Kotlin, Compose 비의존 (기존 `MultiTouchGestureTracker`와 같은 설계 원칙). "직전 탭"을 하나만 기억하는 상태 머신:
-   - `onTap(x, y, timestampMs): Boolean` — 직전 탭이 있고 `DOUBLE_TAP_INTERVAL_MS` 이내 + `DOUBLE_TAP_DISTANCE_PX` 이내면 `true`(더블탭 확정, 내부 상태 리셋) 반환. 아니면 이 탭을 "직전 탭"으로 기억하고 `false` 반환
-   - `reset()`
-2. **`MultiTouchGestureTracker.kt`**: `GestureEndDecision`에 탭 위치(`x`, `y`, 예: 구간 시작 좌표 재사용)를 추가해서, 호출부가 별도로 좌표를 들고 다닐 필요 없게 한다. 판정 로직(탭/드래그/우클릭) 자체는 변경하지 않는다
-3. **`TrackpadScreen.kt`**: `pointerInput(Unit)` 블록을 `coroutineScope { }`로 감싸서, 개별 제스처(`awaitEachGesture`)보다 오래 사는 스코프에서 "지연된 단일 클릭"을 `launch`로 관리한다.
-   - 1손가락 탭(`clickButton == BUTTON_LEFT`)이 끝나면 `DoubleTapDetector.onTap(...)` 호출
-     - `true`(더블탭 확정) → 대기 중인 지연 클릭 job이 있으면 취소하고, 즉시 `onDoubleClick()` 호출
-     - `false` → 기존에 대기 중이던 job이 있으면 취소하고, `launch { delay(DOUBLE_TAP_INTERVAL_MS); onClick() }`으로 새로 예약
-   - 2손가락 탭(우클릭)은 기존처럼 즉시 `onRightClick()` — 이 로직과 무관
-4. **`domain/model/TrackpadEvent.kt`**: `data class DoubleClick(val button: String = "left") : TrackpadEvent()` 추가
-5. **`data/repository/TrackpadRepositoryImpl.kt`**: `DoubleClick`을 TCP로 `{"type":"DOUBLE_CLICK","button":"left"}` 직렬화. CLICK과 같은 등급(저빈도, 사용자 명시 행동)이므로 전송 실패 시 기존 CLICK처럼 `ConnectionState.Error`로 알려도 된다 (MOVE/SCROLL과 달리 조용히 버리지 않음)
-6. **`TrackpadViewModel.kt`**: `sendDoubleClick()` 추가 → `sendEventUseCase(TrackpadEvent.DoubleClick())`
-7. **`TrackpadSurface`**: `onDoubleClick: () -> Unit` 파라미터 추가, `viewModel::sendDoubleClick`로 배선
-
-기존 1손가락 드래그(MOVE), 2손가락 우클릭, 2손가락 스크롤 로직은 회귀 없이 그대로 유지해야 한다.
+기존 1손가락 MOVE/CLICK/더블탭, 2손가락 우클릭/스크롤 로직은 절대 회귀시키지 마세요.
 
 ## Android 테스트
-- `DoubleTapDetectorTest`(신규): 간격/거리 이내 두 탭 → 두 번째 호출에서 true. 간격 초과 → false(새 직전 탭으로 갱신). 거리 초과 → false. 더블탭 확정 후 상태 리셋되어 세 번째 탭이 두 번째와 다시 묶이지 않는지(즉 A-B가 더블탭이면 C는 새로 시작)
-- `TrackpadScreen`/어댑터 레벨 검증이 어려우면(Compose 의존) 최소한 `DoubleTapDetector` 순수 로직 테스트로 커버. 기존 테스트 전부 회귀 없이 통과할 것
+- 승격 판정 순수 로직(있다면): 제자리 유지 + 시간 경과 → 승격 / 시간 전에 이동 초과 → 승격 안 됨 등 경계 조건
+- 최소한 기존 테스트 스위트 전부 회귀 없이 통과
 
 ## Server 구현 대상
 `pc_server/input_controller.py`:
-- `handle_event`에 `DOUBLE_CLICK` 분기 추가 → `self._double_click(event.get("button", "left"))`
-- `_double_click(button)` 신규: 기존 `_click`과 같은 INPUT/MOUSEINPUT 구조체 패턴으로 **down-up-down-up 4개를 하나의 `SendInput` 호출**에 담아 원자적으로 보낸다 (커서를 움직이는 요소가 전혀 없으므로 Windows 더블클릭 판정 사각형 문제가 발생하지 않는다). `_click`을 두 번 호출(=SendInput 두 번)하지 말 것 — 한 번에 묶는 것이 이번 스펙의 핵심이다
+- `InputController.__init__`에 `self._drag_active = False` 추가 (현재 `__init__`이 없으므로 신규 작성)
+- `handle_event`에 `DRAG_START`/`DRAG_END` 분기 추가
+- `_drag_start()`: `_drag_active`가 False일 때만 LEFTDOWN 1개짜리 INPUT을 `SendInput`으로 보내고 `_drag_active = True`. 이미 True면 아무것도 안 함
+- `_drag_end()`: `_drag_active`가 True일 때만 LEFTUP 1개짜리 INPUT을 `SendInput`으로 보내고 `_drag_active = False`. 이미 False면 아무것도 안 함
+- 외부에서 호출 가능한 강제 해제 메서드도 필요(이름은 자유, 예: `force_release_drag()`) — 내부적으로 `_drag_end()`와 동일하게 동작하면 됨 (Python은 private 강제가 없으니 `_drag_end()`를 직접 호출해도 무방, 어느 쪽이든 서버 안전장치 요구사항을 만족하면 됨)
+
+`pc_server/server.py`:
+- `handle_client`의 `finally` 블록(기존 세션 회수/소켓 종료 로직 바로 옆)에서, 드래그가 활성 상태였다면 강제로 놓는 호출을 추가
 
 ## Server 테스트
-- `handle_event({"type":"DOUBLE_CLICK","button":"left"})` → `SendInput`이 1회만 호출되고, 전달되는 INPUT 배열이 정확히 [LEFTDOWN, LEFTUP, LEFTDOWN, LEFTUP] 순서인지 (모킹)
-- `button`이 `"right"`로 와도 동작하는지(RIGHTDOWN/RIGHTUP 4개, 이번 범위는 아니지만 재사용성 확인 차원)
-- 기존 MOVE/CLICK/SCROLL/HEARTBEAT 회귀 없는지
+- `DRAG_START` → LEFTDOWN 1개짜리 `SendInput` 호출, `_drag_active` True
+- 연속 `DRAG_START` 두 번 → `SendInput`이 첫 번째만 호출(멱등)
+- `DRAG_END` → LEFTUP 1개짜리 `SendInput` 호출, `_drag_active` False
+- `DRAG_START` 없이 `DRAG_END`만 오면 → 아무 호출도 안 함, 크래시 없음
+- **연결이 끊길 때 드래그가 활성 상태였다면 서버가 LEFTUP을 강제로 보내는지** (`handle_client`를 FakeConn으로 구동해 확인 — heartbeat 타임아웃 경로와 정상 종료 경로 둘 다)
+- 기존 MOVE/CLICK/DOUBLE_CLICK/SCROLL/HEARTBEAT 회귀 없는지
 
 ## 참고 문서
-- `AGENTS.md` 섹션 4(통신 프로토콜)/5(제스처 설계)/6(로드맵) — 구현 후 갱신 필요
+- `AGENTS.md` 섹션 4(통신 프로토콜)/5(제스처 설계, 엣지 케이스에 이미 "화면 밖으로 나간 손가락 → DRAG_END" 문구가 있음)/6(로드맵) — 구현 후 갱신 필요
