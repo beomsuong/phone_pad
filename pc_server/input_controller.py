@@ -1,4 +1,5 @@
 import ctypes
+import threading
 
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
@@ -36,6 +37,20 @@ class INPUT(ctypes.Structure):
 
 
 class InputController:
+    def __init__(self):
+        # 드래그 홀드 상태(왼쪽 버튼을 누른 채 유지 중인지).
+        # DRAG_START/DRAG_END 는 멱등이어야 하고, TCP 연결이 끊길 때 서버가 강제로
+        # 버튼을 놓아야 하므로(버튼이 영원히 눌린 채 멈추는 것 방지) 인스턴스 상태로 둔다.
+        self._drag_active = False
+        # InputController 는 프로세스 전체에서 하나이고 TCP 클라이언트 스레드가
+        # 여러 개일 수 있으므로, "검사 후 변경"을 원자적으로 만든다.
+        self._drag_lock = threading.Lock()
+
+    @property
+    def drag_active(self) -> bool:
+        """드래그 홀드(왼쪽 버튼 눌림 유지) 중인지."""
+        return self._drag_active
+
     def handle_event(self, event: dict):
         t = event.get("type")
         if t == "MOVE":
@@ -55,6 +70,11 @@ class InputController:
             dy = int(round(float(event.get("dy", 0))))
             if dx != 0 or dy != 0:
                 self._scroll(dx, dy)
+        elif t == "DRAG_START":
+            # 필드 없음 (AGENTS.md 섹션 4). 버튼을 누른 채로 유지한다.
+            self._drag_start()
+        elif t == "DRAG_END":
+            self._drag_end()
 
     def _move(self, dx: int, dy: int):
         inp = INPUT(
@@ -100,6 +120,52 @@ class InputController:
             ]
         )
         ctypes.windll.user32.SendInput(len(deltas), inputs, ctypes.sizeof(INPUT))
+
+    def _send_button_flag(self, flag: int):
+        """버튼 플래그 하나짜리 INPUT 을 SendInput 1회로 보낸다 (down 또는 up 단독)."""
+        inputs = (INPUT * 1)(
+            INPUT(
+                type=INPUT_MOUSE,
+                _input=_INPUTunion(mi=MOUSEINPUT(dwFlags=flag)),
+            ),
+        )
+        ctypes.windll.user32.SendInput(1, inputs, ctypes.sizeof(INPUT))
+
+    def _drag_start(self) -> bool:
+        """왼쪽 버튼을 누른 채로 유지(LEFTDOWN 만, UP 없음). 이미 눌려 있으면 무시(멱등).
+
+        이동은 기존 MOVE(UDP)가 그대로 담당한다 — 버튼이 눌린 동안 커서가 움직이면
+        그것이 곧 드래그다. 반환값은 실제로 버튼을 눌렀는지 여부.
+        """
+        with self._drag_lock:
+            if self._drag_active:
+                return False
+            # SendInput 이 실패하면 상태를 바꾸지 않는다(버튼이 안 눌렸으므로).
+            self._send_button_flag(MOUSEEVENTF_LEFTDOWN)
+            self._drag_active = True
+            return True
+
+    def _drag_end(self) -> bool:
+        """눌린 왼쪽 버튼을 놓는다(LEFTUP 만). 이미 놓여 있으면 무시(멱등).
+
+        SendInput 이 실패하면 `_drag_active` 를 True 로 남겨, 이후 연결 종료 시
+        안전장치(`force_release_drag`)가 다시 시도할 수 있게 한다.
+        """
+        with self._drag_lock:
+            if not self._drag_active:
+                return False
+            self._send_button_flag(MOUSEEVENTF_LEFTUP)
+            self._drag_active = False
+            return True
+
+    def force_release_drag(self) -> bool:
+        """외부(연결 종료 경로)에서 호출하는 강제 해제. `_drag_end()` 와 동일 동작.
+
+        `DRAG_END` 가 유실되면(네트워크 문제, 앱 강제 종료 등) PC 마우스 왼쪽 버튼이
+        영원히 눌린 채 멈추므로, `server.handle_client` 의 `finally` 에서 호출한다.
+        드래그 중이 아니었으면 아무것도 하지 않고 False.
+        """
+        return self._drag_end()
 
     def _click(self, button: str):
         down_flag = MOUSEEVENTF_LEFTDOWN if button == "left" else MOUSEEVENTF_RIGHTDOWN

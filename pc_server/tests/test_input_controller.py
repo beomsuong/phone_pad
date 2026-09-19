@@ -91,7 +91,9 @@ def test_handle_unknown_type_does_not_raise():
     with patch.object(controller, "_move") as mock_move, \
             patch.object(controller, "_click") as mock_click, \
             patch.object(controller, "_scroll") as mock_scroll, \
-            patch.object(controller, "_double_click") as mock_double_click:
+            patch.object(controller, "_double_click") as mock_double_click, \
+            patch.object(controller, "_drag_start") as mock_drag_start, \
+            patch.object(controller, "_drag_end") as mock_drag_end:
         controller.handle_event({"type": "SESSION", "session": "deadbeef"})
         controller.handle_event({"type": "UNKNOWN"})
         controller.handle_event({})
@@ -99,6 +101,8 @@ def test_handle_unknown_type_does_not_raise():
     mock_click.assert_not_called()
     mock_scroll.assert_not_called()
     mock_double_click.assert_not_called()
+    mock_drag_start.assert_not_called()
+    mock_drag_end.assert_not_called()
 
 
 # --- DOUBLE_CLICK -----------------------------------------------------------
@@ -284,3 +288,160 @@ def test_handle_scroll_end_to_end_mouse_data():
     with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
         controller.handle_event({"type": "SCROLL", "dx": 0, "dy": -3})
     assert _sent_wheel_events(mock_send) == [(MOUSEEVENTF_WHEEL, -360)]
+
+
+# --- DRAG_START / DRAG_END --------------------------------------------------
+
+
+def test_new_controller_starts_with_drag_inactive():
+    controller = InputController()
+    assert controller._drag_active is False
+    assert controller.drag_active is False
+
+
+def test_drag_start_sends_single_leftdown_and_activates():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+    # LEFTDOWN 1개짜리 INPUT — UP 이 따라붙으면 안 된다(버튼을 누른 채 유지해야 하므로)
+    assert _sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN]
+    assert controller._drag_active is True
+
+
+def test_drag_start_does_not_move_cursor():
+    """드래그 시작이 커서를 건드리면 안 된다 — 이동은 기존 MOVE(UDP)가 담당."""
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+    count, inputs, _ = mock_send.call_args.args
+    assert count == 1
+    mi = inputs[0]._input.mi
+    assert mi.dx == 0 and mi.dy == 0
+    assert mi.mouseData == 0
+    assert mi.dwFlags & MOUSEEVENTF_MOVE == 0
+
+
+def test_repeated_drag_start_is_idempotent():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        controller.handle_event({"type": "DRAG_START"})
+        controller.handle_event({"type": "DRAG_START"})
+    # 중복 LEFTDOWN 방지: 첫 번째만 나간다
+    assert mock_send.call_count == 1
+    assert controller._drag_active is True
+
+
+def test_drag_end_sends_single_leftup_and_deactivates():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        mock_send.reset_mock()
+        controller.handle_event({"type": "DRAG_END"})
+    assert _sent_flags(mock_send) == [MOUSEEVENTF_LEFTUP]
+    assert controller._drag_active is False
+
+
+def test_drag_end_without_drag_start_does_nothing():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_END"})  # 크래시 없어야 함
+    mock_send.assert_not_called()
+    assert controller._drag_active is False
+
+
+def test_repeated_drag_end_is_idempotent():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        mock_send.reset_mock()
+        controller.handle_event({"type": "DRAG_END"})
+        controller.handle_event({"type": "DRAG_END"})
+    assert mock_send.call_count == 1
+    assert controller._drag_active is False
+
+
+def test_drag_cycle_can_repeat():
+    """놓은 뒤 다시 누를 수 있어야 한다(상태가 한 번 쓰고 끝나면 안 됨)."""
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        controller.handle_event({"type": "DRAG_END"})
+        controller.handle_event({"type": "DRAG_START"})
+        assert controller._drag_active is True
+        controller.handle_event({"type": "DRAG_END"})
+    assert mock_send.call_count == 4
+    flags = [call.args[1][0]._input.mi.dwFlags for call in mock_send.call_args_list]
+    assert flags == [
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+    ]
+    assert controller._drag_active is False
+
+
+def test_drag_start_ignores_extra_fields():
+    """와이어 포맷상 필드가 없지만, 있더라도 무시하고 정상 동작해야 한다."""
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START", "button": "right", "dx": 5})
+    assert _sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN]
+
+
+def test_move_while_dragging_does_not_change_drag_state():
+    """드래그 중 MOVE 는 커서만 움직이고 버튼 상태를 건드리지 않는다."""
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput"):
+        controller.handle_event({"type": "DRAG_START"})
+        with patch.object(controller, "_move") as mock_move:
+            controller.handle_event({"type": "MOVE", "dx": 2.6, "dy": -1.4})
+        mock_move.assert_called_once_with(3, -1)
+        assert controller._drag_active is True
+
+
+def test_force_release_drag_releases_when_active():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        mock_send.reset_mock()
+        released = controller.force_release_drag()
+    assert released is True
+    assert _sent_flags(mock_send) == [MOUSEEVENTF_LEFTUP]
+    assert controller._drag_active is False
+
+
+def test_force_release_drag_is_noop_when_inactive():
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        released = controller.force_release_drag()
+    assert released is False
+    mock_send.assert_not_called()
+
+
+def test_force_release_after_drag_end_sends_nothing():
+    """정상 종료(DRAG_END 수신)한 뒤의 연결 종료에서 LEFTUP 이 또 나가면 안 된다."""
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        controller.handle_event({"type": "DRAG_END"})
+        mock_send.reset_mock()
+        assert controller.force_release_drag() is False
+    mock_send.assert_not_called()
+
+
+def test_drag_stays_active_if_send_input_fails_on_release():
+    """LEFTUP 전송이 실패하면 상태를 활성으로 남겨 안전장치가 재시도할 수 있어야 한다."""
+    controller = InputController()
+    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+        controller.handle_event({"type": "DRAG_START"})
+        mock_send.side_effect = OSError("SendInput failed")
+        try:
+            controller.handle_event({"type": "DRAG_END"})
+        except OSError:
+            pass
+        assert controller._drag_active is True
+        # 재시도는 성공
+        mock_send.side_effect = None
+        assert controller.force_release_drag() is True
+    assert controller._drag_active is False

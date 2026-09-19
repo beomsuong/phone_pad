@@ -165,6 +165,15 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
     finally:
         registry.remove(session)
         print(f"[=] Session revoked: {session}")
+        # 드래그 안전장치: DRAG_END 가 유실된 채 연결이 끊기면(정상 종료 / heartbeat
+        # 타임아웃 / 예외 전부 이 블록을 지난다) PC 마우스 왼쪽 버튼이 영원히 눌린 채
+        # 멈춘다. 드래그가 활성 상태였다면 서버가 강제로 놓는다.
+        try:
+            if controller.force_release_drag():
+                print(f"[!] Drag was active on disconnect - left button released ({addr})")
+        except Exception as e:
+            # 강제 해제 실패가 소켓 정리를 막으면 안 된다
+            print(f"[!] Failed to release drag on disconnect: {e}")
         conn.close()
         print(f"[-] Disconnected: {addr}")
 
