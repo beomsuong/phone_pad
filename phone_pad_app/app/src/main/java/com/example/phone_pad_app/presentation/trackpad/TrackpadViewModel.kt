@@ -44,6 +44,19 @@ class TrackpadViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 진행 중인 첫 연결 시도를 취소하고 IP 입력 화면으로 되돌린다 (`Connecting` 전용).
+     *
+     * [disconnect]와 나눠 둔 이유는 되돌아가는 상태가 다르기 때문이 아니라(둘 다
+     * `Disconnected`다) 의미가 다르기 때문이다 — 취소는 살아있는 연결이나 자동 재연결을
+     * 건드리면 안 된다. 그 구분은 repository가 상태를 보고 판단한다.
+     */
+    fun cancelConnect() {
+        viewModelScope.launch {
+            repository.cancelConnect()
+        }
+    }
+
     fun disconnect() {
         viewModelScope.launch {
             repository.disconnect()

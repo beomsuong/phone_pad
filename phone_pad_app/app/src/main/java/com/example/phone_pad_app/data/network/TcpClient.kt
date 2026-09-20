@@ -6,6 +6,7 @@ import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
+import java.net.InetSocketAddress
 import java.net.Socket
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -35,26 +36,58 @@ class TcpClient @Inject constructor() {
     private val sendDispatcher = Dispatchers.IO.limitedParallelism(1)
 
     /**
+     * 연결 시도 타임아웃 (ms). 기본값은 [GestureConfig.CONNECT_TIMEOUT_MS].
+     *
+     * `internal var`인 이유는 **테스트에서만** 짧게 줄이기 위해서다 — 실제 5초를 기다리는
+     * 단위 테스트를 만들지 않기 위한 주입점이며, 프로덕션 코드는 이 값을 건드리지 않는다.
+     */
+    internal var connectTimeoutMs: Int = GestureConfig.CONNECT_TIMEOUT_MS
+
+    /**
+     * 소켓 생성 지점. 테스트에서 연결 인자(특히 타임아웃)를 기록하거나 특정 예외를 재현하기
+     * 위한 주입점이다. 프로덕션에서는 항상 기본 [Socket] 생성자를 쓴다.
+     */
+    internal var socketFactory: () -> Socket = { Socket() }
+
+    /**
      * 서버에 연결하고 세션 핸드셰이크 한 줄을 읽는다.
+     *
+     * 연결은 [connectTimeoutMs] 안에 끝나야 한다 — 넘으면 [java.net.SocketTimeoutException].
+     * 주소를 해석할 수 없으면 [java.net.UnknownHostException].
+     *
+     * **취소 가능성:** 블로킹 `connect()`는 코루틴 취소로 풀리지 않는다. 그래서 소켓을
+     * 연결 시도 **전에** [socket] 필드에 등록해, 다른 코루틴이 [disconnect]로 소켓을 닫아
+     * 진행 중인 시도를 깨울 수 있게 한다(첫 연결 "취소" 버튼이 이 경로를 쓴다).
+     * 그때 이 함수는 `SocketException`으로 빠져나온다.
      *
      * @return 서버가 발급한 세션 토큰. 핸드셰이크가 오지 않거나 형식이 어긋나면 null.
      */
     suspend fun connect(host: String, port: Int): String? = withContext(Dispatchers.IO) {
         disconnect()
-        val s = Socket(host, port)
+        val s = socketFactory()
         socket = s
-        writer = PrintWriter(s.getOutputStream(), true)
-        val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
-        reader = r
+        try {
+            s.connect(InetSocketAddress(host, port), connectTimeoutMs)
+            writer = PrintWriter(s.getOutputStream(), true)
+            val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
+            reader = r
 
-        s.soTimeout = GestureConfig.SESSION_HANDSHAKE_TIMEOUT_MS
-        val session = SessionHandshake.parseSession(r.readLine())
-        if (session != null) {
-            // 핸드셰이크 성공 후에는 heartbeat 주기를 읽기 타임아웃으로 사용한다.
-            // 읽기 한 번이 이 시간 안에 아무것도 받지 못하면 미응답 1회로 집계된다.
-            applyHeartbeatTimeout(s)
+            s.soTimeout = GestureConfig.SESSION_HANDSHAKE_TIMEOUT_MS
+            val session = SessionHandshake.parseSession(r.readLine())
+            if (session != null) {
+                // 핸드셰이크 성공 후에는 heartbeat 주기를 읽기 타임아웃으로 사용한다.
+                // 읽기 한 번이 이 시간 안에 아무것도 받지 못하면 미응답 1회로 집계된다.
+                applyHeartbeatTimeout(s)
+            }
+            session
+        } catch (e: Throwable) {
+            // 실패한 소켓을 필드에 남겨 두면 isConnected/soTimeoutMillis가 거짓말을 한다.
+            // 이미 다른 코루틴이 우리를 취소하며 필드를 비웠을 수도 있으므로(=== 검사),
+            // 우리가 만든 소켓만 직접 닫는다.
+            runCatching { s.close() }
+            if (socket === s) disconnect()
+            throw e
         }
-        session
     }
 
     /**

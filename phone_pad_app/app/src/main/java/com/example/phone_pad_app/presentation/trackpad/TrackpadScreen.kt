@@ -78,16 +78,21 @@ fun TrackpadScreen(
             onHostChange = viewModel::onHostInputChange,
             onConnect = viewModel::connect,
             onOpenSettings = { showSettings = true },
-            errorMessage = null,
+            error = null,
         )
         is ConnectionState.Error -> ConnectPanel(
             hostInput = uiState.hostInput,
             onHostChange = viewModel::onHostInputChange,
             onConnect = viewModel::connect,
             onOpenSettings = { showSettings = true },
-            errorMessage = state.message,
+            error = state,
         )
-        is ConnectionState.Connecting -> ConnectingPanel(message = "연결 중...")
+        // 첫 연결에도 "취소"를 준다. 연결 타임아웃(5초) + 핸드셰이크(3초)로 최악 8초가 걸리고,
+        // 그 사이 사용자가 IP 오타를 알아차려도 빠져나갈 문이 없으면 앱이 멈춘 것처럼 보인다.
+        is ConnectionState.Connecting -> ConnectingPanel(
+            message = "연결 중...",
+            onCancel = viewModel::cancelConnect,
+        )
         // 자동 재연결 중에는 IP 입력 화면으로 되돌리지 않는다 — 사용자가 할 일이 없고,
         // 유실 때마다 화면이 뒤집히면 잠깐의 WiFi 끊김에도 세션이 끝난 것처럼 보인다.
         // 대신 기다리기 싫은 사용자를 위해 "취소"(= 수동 연결 해제)만 내어준다.
@@ -122,7 +127,7 @@ private fun ConnectPanel(
     onHostChange: (String) -> Unit,
     onConnect: () -> Unit,
     onOpenSettings: () -> Unit,
-    errorMessage: String?,
+    error: ConnectionState.Error?,
 ) {
     Box(
         modifier = Modifier
@@ -151,14 +156,8 @@ private fun ConnectPanel(
                 keyboardActions = KeyboardActions(onGo = { onConnect() }),
                 modifier = Modifier.fillMaxWidth(),
             )
-            if (errorMessage != null) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = errorMessage,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
+            // 예외 원문 대신 한국어 조치 힌트를 주 메시지로 보여준다 (원문은 보조 줄에 유지).
+            ConnectionErrorSection(error)
             Spacer(modifier = Modifier.height(16.dp))
             Button(
                 onClick = onConnect,
@@ -183,8 +182,9 @@ private fun ConnectPanel(
  *
  * 차이는 두 가지뿐이라 화면을 따로 만들지 않았다:
  * - [hostLabel]: 재연결은 대상이 확정되어 있으므로 어디에 붙는 중인지 보여준다.
- * - [onCancel]: **재연결일 때만** 준다. 첫 연결은 취소 버튼 없이 기존 그대로 두고,
- *   재연결은 최대 55초까지 이어질 수 있어 빠져나갈 문이 필요하다.
+ * - [onCancel]이 하는 일: 재연결은 수동 연결 해제, 첫 연결은 시도 취소(오류 없이 IP 입력
+ *   화면으로 복귀)다. 둘 다 "빠져나갈 문"이 필요하다 — 재연결은 최대 55초까지 이어지고,
+ *   첫 연결도 연결 타임아웃 + 핸드셰이크로 최악 8초가 걸린다.
  */
 @Composable
 private fun ConnectingPanel(

@@ -23,6 +23,25 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `연결 타임아웃은 확정 스펙 값 5초다`() {
+        assertEquals(5000, GestureConfig.CONNECT_TIMEOUT_MS)
+    }
+
+    @Test
+    fun `연결 타임아웃은 OS 기본값에 맡기지 않을 만큼 짧고 사용자를 가두지 않는다`() {
+        // 0이면 java.net.Socket.connect가 "무한 대기"로 해석한다 — OS 기본값에 맡기는 것과 같아
+        // 애초에 이 상수를 만든 이유가 사라진다.
+        assertTrue("0은 무한 대기를 의미한다", GestureConfig.CONNECT_TIMEOUT_MS > 0)
+        // 연결(5초) + 핸드셰이크(3초)가 직렬로 붙으므로 최악 대기가 10초를 넘지 않아야 한다.
+        assertTrue(
+            "연결+핸드셰이크 최악 대기가 너무 길다",
+            GestureConfig.CONNECT_TIMEOUT_MS + GestureConfig.SESSION_HANDSHAKE_TIMEOUT_MS <= 10_000
+        )
+        // 혼잡한 Wi-Fi의 TCP 초기 재전송(RTO 약 1초, 이후 2초)을 덮을 만큼은 길어야 한다.
+        assertTrue("TCP 재전송을 덮지 못한다", GestureConfig.CONNECT_TIMEOUT_MS >= 3_000)
+    }
+
+    @Test
     fun `heartbeat 상수는 확정 스펙 값과 일치한다`() {
         // 서버(pc_server) HEARTBEAT_INTERVAL_S = 5.0 / HEARTBEAT_MISS_LIMIT = 3 과 대칭
         assertEquals(5000L, GestureConfig.HEARTBEAT_INTERVAL_MS)

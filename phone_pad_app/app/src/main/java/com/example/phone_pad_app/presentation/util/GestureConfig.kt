@@ -128,6 +128,26 @@ object GestureConfig {
     /** PC 서버 UDP 포트 (MOVE 전용) */
     const val UDP_PORT = 9001
 
+    /**
+     * TCP 연결(3-way handshake)을 포기하기까지의 최대 시간 (ms).
+     *
+     * 이 값이 없으면(= `Socket(host, port)`) OS 기본 타임아웃에 맡기게 되는데, Android에서는
+     * 흔히 20초 이상이라 **오타 난 IP나 꺼져 있는 PC**를 입력했을 때 "연결 중..." 화면에
+     * 수십 초 동안 갇힌다. 그래서 명시적으로 짧게 끊는다.
+     *
+     * 5초의 근거:
+     * - 같은 LAN 안의 살아있는 서버는 3-way handshake가 보통 수 ms ~ 수십 ms다. 5초는 그보다
+     *   두 자릿수 넉넉하다.
+     * - 혼잡한 Wi-Fi에서 첫 SYN이 유실되어도 TCP 초기 재전송(RTO ≈ 1초, 이후 2초)까지는
+     *   덮어야 "가끔 실패하는" 연결이 되지 않는다. 5초면 재전송 2~3회를 포함한다.
+     * - 실패했을 때 사용자가 IP를 고쳐 다시 시도하기까지의 체감 대기를 짧게 유지한다.
+     *
+     * [SESSION_HANDSHAKE_TIMEOUT_MS](3초)와는 **별개로 직렬 적용**된다 — 최악의 경우
+     * 연결 5초 + 핸드셰이크 3초 = 8초 뒤에 실패가 확정된다. 그 전에라도 사용자가
+     * "취소"로 빠져나올 수 있다(`ConnectingPanel`).
+     */
+    const val CONNECT_TIMEOUT_MS = 5000
+
     /** TCP 연결 직후 세션 핸드셰이크 한 줄을 기다리는 최대 시간 (ms) */
     const val SESSION_HANDSHAKE_TIMEOUT_MS = 3000
 

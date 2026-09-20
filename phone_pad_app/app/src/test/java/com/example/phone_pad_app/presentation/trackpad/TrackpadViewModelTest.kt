@@ -46,6 +46,23 @@ class TrackpadViewModelTest {
     }
 
     @Test
+    fun `cancelConnect는 disconnect가 아니라 repository의 취소 경로를 부른다`() {
+        // 둘을 섞으면 "첫 연결 취소"가 살아있는 연결이나 자동 재연결까지 끊게 된다.
+        viewModel.cancelConnect()
+
+        coVerify(exactly = 1) { repository.cancelConnect() }
+        coVerify(exactly = 0) { repository.disconnect() }
+    }
+
+    @Test
+    fun `disconnect는 여전히 repository의 연결 해제를 부른다`() {
+        viewModel.disconnect()
+
+        coVerify(exactly = 1) { repository.disconnect() }
+        coVerify(exactly = 0) { repository.cancelConnect() }
+    }
+
+    @Test
     fun `sendRightClick은 button이 right인 CLICK 이벤트를 UseCase로 보낸다`() {
         viewModel.sendRightClick()
 

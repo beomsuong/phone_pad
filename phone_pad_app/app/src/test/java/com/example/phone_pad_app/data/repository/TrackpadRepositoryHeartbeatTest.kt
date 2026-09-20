@@ -2,6 +2,7 @@ package com.example.phone_pad_app.data.repository
 
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
+import com.example.phone_pad_app.domain.model.ConnectionErrorKind
 import com.example.phone_pad_app.domain.model.ConnectionState
 import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
@@ -146,7 +147,7 @@ class TrackpadRepositoryHeartbeatTest {
         // 3회째(15s) 도달 → Error + cleanUp
         advanceTimeBy(1)
         runCurrent()
-        assertEquals(ConnectionState.Error("Heartbeat timeout"), state())
+        assertEquals(ConnectionState.Error("Heartbeat timeout", ConnectionErrorKind.HEARTBEAT_TIMEOUT), state())
         verify(exactly = 1) { tcpClient.disconnect() }
         verify(exactly = 1) { udpClient.close() }
 
@@ -169,7 +170,7 @@ class TrackpadRepositoryHeartbeatTest {
         advanceTimeBy(2_001)
         runCurrent()
 
-        assertEquals(ConnectionState.Error("Connection lost"), state())
+        assertEquals(ConnectionState.Error("Connection lost", ConnectionErrorKind.CONNECTION_LOST), state())
         verify(exactly = 1) { tcpClient.disconnect() }
         verify(exactly = 1) { udpClient.close() }
     }
@@ -185,7 +186,7 @@ class TrackpadRepositoryHeartbeatTest {
         advanceTimeBy(501)
         runCurrent()
 
-        assertEquals(ConnectionState.Error("Connection lost"), state())
+        assertEquals(ConnectionState.Error("Connection lost", ConnectionErrorKind.CONNECTION_LOST), state())
     }
 
     @Test
@@ -196,7 +197,7 @@ class TrackpadRepositoryHeartbeatTest {
         advanceTimeBy(INTERVAL)
         runCurrent()
 
-        assertEquals(ConnectionState.Error("Connection lost"), state())
+        assertEquals(ConnectionState.Error("Connection lost", ConnectionErrorKind.CONNECTION_LOST), state())
         verify(exactly = 1) { tcpClient.disconnect() }
     }
 

@@ -2,6 +2,7 @@ package com.example.phone_pad_app.data.repository
 
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
+import com.example.phone_pad_app.domain.model.ConnectionErrorKind
 import com.example.phone_pad_app.domain.model.ConnectionState
 import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
@@ -151,7 +152,7 @@ class TrackpadRepositoryImplTest {
 
         repository.sendEvent(TrackpadEvent.DoubleClick())
 
-        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("tcp down", ConnectionErrorKind.CONNECTION_LOST), repository.connectionState.first())
     }
 
     @Test
@@ -229,7 +230,7 @@ class TrackpadRepositoryImplTest {
 
         repository.sendEvent(TrackpadEvent.DragStart)
 
-        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("tcp down", ConnectionErrorKind.CONNECTION_LOST), repository.connectionState.first())
     }
 
     @Test
@@ -240,7 +241,7 @@ class TrackpadRepositoryImplTest {
 
         repository.sendEvent(TrackpadEvent.DragEnd)
 
-        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("tcp down", ConnectionErrorKind.CONNECTION_LOST), repository.connectionState.first())
     }
 
     @Test
@@ -263,7 +264,7 @@ class TrackpadRepositoryImplTest {
 
         verify { udpClient.close() }
         verify { tcpClient.disconnect() }
-        assertEquals(ConnectionState.Error("refused"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("refused", ConnectionErrorKind.CONNECTION_REFUSED), repository.connectionState.first())
     }
 
     @Test

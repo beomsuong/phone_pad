@@ -2,6 +2,7 @@ package com.example.phone_pad_app.data.repository
 
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
+import com.example.phone_pad_app.domain.model.ConnectionErrorKind
 import com.example.phone_pad_app.domain.model.ConnectionState
 import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
@@ -216,7 +217,7 @@ class TrackpadRepositoryReconnectTest {
             advanceTimeBy(policy.delayBeforeAttempt(3))
             runCurrent()
             assertEquals(
-                ConnectionState.Error("Reconnect failed: refused"),
+                ConnectionState.Error("Reconnect failed: refused", ConnectionErrorKind.RECONNECT_FAILED),
                 repository.connectionState.first(),
             )
 
@@ -225,7 +226,7 @@ class TrackpadRepositoryReconnectTest {
             runCurrent()
             assertEquals(4, connectCalls) // 최초 1 + 재시도 3
             assertEquals(
-                ConnectionState.Error("Reconnect failed: refused"),
+                ConnectionState.Error("Reconnect failed: refused", ConnectionErrorKind.RECONNECT_FAILED),
                 repository.connectionState.first(),
             )
 
@@ -241,13 +242,13 @@ class TrackpadRepositoryReconnectTest {
 
         repository.connect(HOST, PORT)
         runCurrent()
-        assertEquals(ConnectionState.Error("refused"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("refused", ConnectionErrorKind.CONNECTION_REFUSED), repository.connectionState.first())
 
         // 틀린 IP에 55초씩 매달리면 안 된다 — 가상 시간을 한참 진행해도 추가 시도가 없다
         advanceTimeBy(600_000)
         runCurrent()
         coVerify(exactly = 1) { tcpClient.connect(HOST, PORT) }
-        assertEquals(ConnectionState.Error("refused"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("refused", ConnectionErrorKind.CONNECTION_REFUSED), repository.connectionState.first())
     }
 
     @Test
@@ -261,7 +262,7 @@ class TrackpadRepositoryReconnectTest {
 
         coVerify(exactly = 1) { tcpClient.connect(HOST, PORT) }
         assertEquals(
-            ConnectionState.Error("Session handshake failed"),
+            ConnectionState.Error("Session handshake failed", ConnectionErrorKind.HANDSHAKE_FAILED),
             repository.connectionState.first(),
         )
     }
@@ -430,7 +431,7 @@ class TrackpadRepositoryReconnectTest {
         connectThenLose(repository)
 
         assertEquals(
-            ConnectionState.Error("Connection lost"),
+            ConnectionState.Error("Connection lost", ConnectionErrorKind.CONNECTION_LOST),
             repository.connectionState.first(),
         )
 
@@ -449,6 +450,6 @@ class TrackpadRepositoryReconnectTest {
         repository.sendEvent(TrackpadEvent.Click("left"))
         runCurrent()
 
-        assertEquals(ConnectionState.Error("tcp down"), repository.connectionState.first())
+        assertEquals(ConnectionState.Error("tcp down", ConnectionErrorKind.CONNECTION_LOST), repository.connectionState.first())
     }
 }

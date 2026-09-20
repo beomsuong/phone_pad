@@ -3,6 +3,8 @@ package com.example.phone_pad_app.data.repository
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
 import com.example.phone_pad_app.di.IoDispatcher
+import com.example.phone_pad_app.domain.model.ConnectionErrorClassifier
+import com.example.phone_pad_app.domain.model.ConnectionErrorKind
 import com.example.phone_pad_app.domain.model.ConnectionState
 import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
@@ -79,6 +81,20 @@ class TrackpadRepositoryImpl @Inject constructor(
     private val generation = AtomicInteger(0)
 
     /**
+     * **수동** 연결 시도 묶음의 세대. [connect]/[cancelConnect]/[disconnect]가 올릴 때마다
+     * 직전까지 진행 중이던 시도가 무효가 된다.
+     *
+     * [generation](연결 단위)·[reconnectEpoch](재연결 묶음 단위)와 별개로 두는 이유는 역할이
+     * 다르기 때문이다. 이 값은 "사용자가 요청한 **이 접속 시도**가 아직 유효한가"만 답한다 —
+     * 블로킹 `connect()`는 코루틴 취소로 풀리지 않아서, 취소 후에도 시도가 계속 살아 있다가
+     * 뒤늦게 성공/실패한다. 그 뒤늦은 결과가 `Connected`/`Error`를 쓰지 못하게 막는 장치다.
+     *
+     * 자동 재연결 루프는 이 값을 **건드리지 않는다**. 재연결이 이 값을 올리면, 마침 락을
+     * 기다리던 사용자의 수동 연결이 영문도 모르고 무효화된다.
+     */
+    private val connectEpoch = AtomicInteger(0)
+
+    /**
      * 자동 재연결 루프를 담는 스코프. [keepAliveScope]와 **분리해야 한다** —
      * 유실을 보고하는 쪽(heartbeat 루프)이 곧바로 자기 스코프를 취소하므로,
      * 같은 스코프에서 재연결을 시작하면 태어나자마자 취소된다.
@@ -115,14 +131,45 @@ class TrackpadRepositoryImpl @Inject constructor(
      */
     override suspend fun connect(host: String, port: Int) {
         cancelReconnect()
+        val epoch = connectEpoch.incrementAndGet()
         connectionMutex.withLock {
+            // 락을 기다리는 동안 사용자가 취소했거나 다른 연결이 끼어들었을 수 있다.
+            if (connectEpoch.get() != epoch) return
             _connectionState.value = ConnectionState.Connecting
-            val failure = openConnection(host, port)
-            if (failure != null) {
+            when (val outcome = openConnection(host, port) { connectEpoch.get() == epoch }) {
+                // 취소된 시도의 뒤늦은 결과는 아무 상태도 쓰지 않는다 —
+                // cancelConnect()가 이미 Disconnected로 돌려놨다.
+                ConnectOutcome.Cancelled, ConnectOutcome.Success -> Unit
                 // 첫 연결(또는 수동 연결) 실패는 재시도하지 않는다 — 틀린 IP에 무한히 매달리면 안 된다.
-                _connectionState.value = ConnectionState.Error(failure)
+                is ConnectOutcome.Failure -> if (connectEpoch.get() == epoch) {
+                    _connectionState.value = ConnectionState.Error(outcome.message, outcome.kind)
+                }
             }
         }
+    }
+
+    /**
+     * 진행 중인 첫 연결 시도를 취소한다 (`Connecting` 상태 전용).
+     *
+     * 순서가 설계의 전부다 — 전부 **[connectionMutex] 밖**에서 한다. 접속을 시도 중인
+     * 코루틴이 락을 쥔 채 블로킹 `connect()`에 매달려 있으므로, 락을 먼저 잡으려 하면
+     * 그 시도가 OS 타임아웃까지 끝나기를 기다리게 되어 "취소"가 취소가 아니게 된다.
+     *
+     * 1. [connectEpoch]를 올려 **진행 중인 시도를 먼저 무효화**한다. 이후 그 시도가 성공해도
+     *    `Connected`를 쓰지 못하고, 실패해도 `Error`를 쓰지 못한다.
+     * 2. 상태를 곧바로 [ConnectionState.Disconnected]로 돌린다(오류 표시 없음).
+     * 3. 소켓을 닫아 블로킹 `connect()`/`readLine()`을 깨운다. 코루틴 취소로는 풀리지 않는
+     *    블로킹 호출이라 소켓을 닫는 것이 유일한 수단이다.
+     *
+     * `Connecting`이 아니면 아무것도 하지 않는다 — 마침 연결에 성공한 순간 눌린 취소가
+     * 살아있는 연결을 끊어버리는 일이 없도록, 그리고 재연결 취소([disconnect])와 역할이
+     * 섞이지 않도록 한다.
+     */
+    override suspend fun cancelConnect() {
+        if (_connectionState.value !is ConnectionState.Connecting) return
+        connectEpoch.incrementAndGet()
+        _connectionState.value = ConnectionState.Disconnected
+        cleanUp()
     }
 
     /**
@@ -132,18 +179,29 @@ class TrackpadRepositoryImpl @Inject constructor(
      * 수동 연결과 자동 재연결이 **같은 코드**를 타도록 여기로 추출했다. 실패 시 어떤 상태로
      * 갈지는 호출자가 정한다(수동 → `Error`, 재연결 → 다음 시도 또는 최종 `Error`).
      *
-     * @return 성공이면 null, 실패면 원인 메시지
+     * @param isStillWanted 이 시도가 아직 유효한지 묻는다. 호출자마다 근거가 다르다 —
+     *   수동 연결은 [connectEpoch], 자동 재연결은 [reconnectEpoch]. 블로킹 접속이 끝난
+     *   **직후**에 확인해서, 취소된 시도가 `Connected`를 써버리는 것을 막는다.
      */
-    private suspend fun openConnection(host: String, port: Int): String? {
+    private suspend fun openConnection(
+        host: String,
+        port: Int,
+        isStillWanted: () -> Boolean,
+    ): ConnectOutcome {
         // 이전 세션/UDP 타깃/heartbeat 루프가 새 핸드셰이크 완료 전까지 남아있지 않도록 즉시 무효화한다.
         val currentGeneration = invalidateCurrentConnection()
         sessionToken = null
         runCatching { udpClient.close() }
         return try {
             val session = tcpClient.connect(host, port)
-            if (session.isNullOrBlank()) {
+            if (!isStillWanted()) {
+                // 취소와 성공이 겹친 경우. 붙어버린 소켓을 반드시 닫는다 —
+                // 안 닫으면 서버에 유령 세션이 남고 앱은 그 사실을 영영 모른다.
                 cleanUp()
-                MESSAGE_HANDSHAKE_FAILED
+                ConnectOutcome.Cancelled
+            } else if (session.isNullOrBlank()) {
+                cleanUp()
+                ConnectOutcome.Failure(MESSAGE_HANDSHAKE_FAILED, ConnectionErrorKind.HANDSHAKE_FAILED)
             } else {
                 sessionToken = session
                 udpClient.connect(host, GestureConfig.UDP_PORT)
@@ -151,7 +209,7 @@ class TrackpadRepositoryImpl @Inject constructor(
                 lastConnectedPort = port
                 _connectionState.value = ConnectionState.Connected(host)
                 startKeepAlive(currentGeneration)
-                null
+                ConnectOutcome.Success
             }
         } catch (e: CancellationException) {
             // 수동 connect()/disconnect()가 이 시도를 취소한 경우다. 여기서 상태를 건드리면
@@ -160,8 +218,23 @@ class TrackpadRepositoryImpl @Inject constructor(
             throw e
         } catch (e: Exception) {
             cleanUp()
-            e.message ?: MESSAGE_CONNECTION_FAILED
+            if (!isStillWanted()) {
+                // 취소가 소켓을 닫아 이 예외를 만든 경우가 대부분이다. 오류로 보고하지 않는다.
+                ConnectOutcome.Cancelled
+            } else {
+                ConnectOutcome.Failure(
+                    e.message ?: MESSAGE_CONNECTION_FAILED,
+                    ConnectionErrorClassifier.classify(e),
+                )
+            }
         }
+    }
+
+    /** [openConnection] 한 번의 결과. 실패와 **취소**를 구분하는 것이 요점이다. */
+    private sealed interface ConnectOutcome {
+        object Success : ConnectOutcome
+        object Cancelled : ConnectOutcome
+        data class Failure(val message: String, val kind: ConnectionErrorKind) : ConnectOutcome
     }
 
     override suspend fun sendEvent(event: TrackpadEvent) {
@@ -245,6 +318,9 @@ class TrackpadRepositoryImpl @Inject constructor(
     override suspend fun disconnect() {
         // 사용자 조작이 항상 이긴다: 대기 중이든 접속 시도 중이든 재연결을 먼저 끊는다.
         cancelReconnect()
+        // 진행 중인 수동 접속 시도도 무효화한다 — 락을 잡기 전에 해야 그 시도가 뒤늦게
+        // 성공해 Disconnected를 Connected로 되살리는 일이 없다.
+        connectEpoch.incrementAndGet()
         connectionMutex.withLock {
             invalidateCurrentConnection()
             cleanUp()
@@ -287,21 +363,30 @@ class TrackpadRepositoryImpl @Inject constructor(
                 delay(policy.delayBeforeAttempt(attempt))
                 if (reconnectEpoch.get() != epoch) return@launch
 
-                val failure = connectionMutex.withLock {
+                val outcome = connectionMutex.withLock {
                     // 락을 기다리는 동안 수동 연결이 끼어들었을 수 있다.
                     if (reconnectEpoch.get() != epoch) return@launch
-                    openConnection(host, port)
+                    openConnection(host, port) { reconnectEpoch.get() == epoch }
                 }
-                // 성공: openConnection이 이미 Connected로 바꾸고 keep-alive를 켰다.
-                // 시도 카운터는 루프를 빠져나가며 사라지므로 다음 유실은 다시 1부터 시작한다.
-                if (failure == null) return@launch
-
-                lastMessage = failure
-                attempt += 1
+                when (outcome) {
+                    // 성공: openConnection이 이미 Connected로 바꾸고 keep-alive를 켰다.
+                    // 시도 카운터는 루프를 빠져나가며 사라지므로 다음 유실은 다시 1부터 시작한다.
+                    ConnectOutcome.Success -> return@launch
+                    // 이 재시도 묶음이 무효가 됐다(수동 연결/해제). 상태는 그쪽이 소유한다.
+                    ConnectOutcome.Cancelled -> return@launch
+                    is ConnectOutcome.Failure -> {
+                        lastMessage = outcome.message
+                        attempt += 1
+                    }
+                }
             }
             if (reconnectEpoch.get() != epoch) return@launch
-            _connectionState.value =
-                ConnectionState.Error("$MESSAGE_RECONNECT_FAILED_PREFIX$lastMessage")
+            // 원인 종류는 마지막 실패가 아니라 "재연결 소진"으로 고정한다 — 사용자가 취할
+            // 조치가 개별 실패 원인과 다르고, 마지막 원인은 원문(message)에 그대로 남는다.
+            _connectionState.value = ConnectionState.Error(
+                "$MESSAGE_RECONNECT_FAILED_PREFIX$lastMessage",
+                ConnectionErrorKind.RECONNECT_FAILED,
+            )
         }
     }
 
@@ -368,7 +453,11 @@ class TrackpadRepositoryImpl @Inject constructor(
             } catch (e: SocketTimeoutException) {
                 missedBeats += 1
                 if (missedBeats >= GestureConfig.HEARTBEAT_MISS_LIMIT) {
-                    reportConnectionLost(forGeneration, MESSAGE_HEARTBEAT_TIMEOUT)
+                    reportConnectionLost(
+                        forGeneration,
+                        MESSAGE_HEARTBEAT_TIMEOUT,
+                        ConnectionErrorKind.HEARTBEAT_TIMEOUT,
+                    )
                     return
                 }
             } catch (e: Exception) {
@@ -389,7 +478,11 @@ class TrackpadRepositoryImpl @Inject constructor(
      * 재연결 조건을 만족하면 `Error`를 **한 프레임도 거치지 않고** 곧바로
      * [ConnectionState.Reconnecting]으로 간다.
      */
-    private fun reportConnectionLost(forGeneration: Int, message: String) {
+    private fun reportConnectionLost(
+        forGeneration: Int,
+        message: String,
+        kind: ConnectionErrorKind = ConnectionErrorKind.CONNECTION_LOST,
+    ) {
         // **Connected였던 세션의 유실만** 처리한다. 정상적인 보고자(heartbeat 루프, 연결 중
         // 발생한 TCP 전송 실패)는 정의상 이 조건을 만족하며, 이 한 줄이 두 가지 사고를 막는다:
         //  - 수동 disconnect() 직후 뒤늦게 실패한 이벤트 전송이 연결을 되살리는 것
@@ -405,7 +498,7 @@ class TrackpadRepositoryImpl @Inject constructor(
         if (reconnectPolicy.isActive && host != null) {
             startReconnect(host, lastConnectedPort, message)
         } else {
-            _connectionState.value = ConnectionState.Error(message)
+            _connectionState.value = ConnectionState.Error(message, kind)
         }
     }
 
