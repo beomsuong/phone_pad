@@ -46,7 +46,11 @@ phone_pad/
     ├── tray_status.py         트레이 순수 로직 (연결 수→상태/툴팁, LAN IP 조회) — pystray 비의존
     ├── tray.py                pystray 어댑터 (pystray/Pillow import는 여기에서만, 선택 의존성)
     ├── requirements.txt       pystray, Pillow (트레이 전용 — 없어도 서버는 콘솔 모드로 동작)
-    └── tests/                 pytest 단위 테스트
+    ├── single_instance.py     중복 실행 방지 (Windows named mutex `Local\PhonePadServer`)
+    ├── logging_setup.py       --noconsole 실행 시 print() → 로그 파일
+    ├── phone_pad_server.spec  PyInstaller 빌드 정의 (onefile + windowed)
+    ├── build_exe.ps1          저장소 밖 임시 venv 생성 → exe 빌드 스크립트
+    └── tests/                 pytest 단위 테스트 (test_single_instance.py, test_logging_setup.py 포함)
 ```
 
 ---
@@ -71,7 +75,7 @@ phone_pad/
 | 언어 | Python 3.x |
 | 네트워크 | 표준 `socket` 모듈 |
 | 커서 제어 | `ctypes.windll.user32.SendInput` |
-| 패키징 | 추후 PyInstaller 단일 exe 고려 |
+| 패키징 | PyInstaller 6.x onefile + windowed (빌드 전용 — `requirements.txt`가 아니라 `build_exe.ps1`이 임시 venv에 설치) |
 
 ---
 
@@ -250,12 +254,12 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - `pc_server/input_controller.py` — `_double_click(button)`, `_drag_start()`/`_drag_end()`/`force_release_drag()` 완료. 드래그 상태는 프로세스 전역(현재 컨트롤러가 프로세스당 하나)
 - `pc_server/server.py` — `handle_client`의 `finally`에서 연결 종료 시 드래그 강제 해제 호출
 
-### 🔶 Phase 4 — 완성도 (재연결·트레이 완료, 나머지 진행 전)
+### 🔶 Phase 4 — 완성도 (재연결·트레이·패키징 완료, UDP 탐색·예외 처리 강화 남음)
 - [x] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료. 서버 단일 사이드(와이어 프로토콜 무변경). 아이콘은 Pillow로 코드에서 생성(대기 회색/연결됨 초록), 메뉴는 상태 라벨·접속 주소(LAN IP:9000)·종료. `--no-tray` 옵션과 미설치 시 콘솔 모드 폴백. 정지 가능한 `ServerRuntime`으로 정상 종료 경로를 만들고 `atexit` 드래그 해제 안전장치를 추가해 섹션 10의 "서버 프로세스 강제 종료 시 드래그 상태" 항목을 해소
 - [ ] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지)
 - [x] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — Android 단일 사이드(프로토콜/서버 무변경: 재연결은 기존 핸드셰이크를 그대로 다시 수행할 뿐이라 서버에는 "새 클라이언트 접속"과 구분되지 않음). **"Connected였던 세션이 유실됐을 때만"** 재시도하며, 첫 `connect()` 실패는 기존처럼 `Error`로 남긴다(틀린 IP에 55초씩 매달리지 않기 위해). 유실은 `Error`를 거치지 않고 곧바로 `ConnectionState.Reconnecting(host, attempt, maxAttempts)`로 가고, 성공하면 `Connected`, 8회 소진 시 `Error("Reconnect failed: <마지막 원인>")`. 재연결 화면에는 "취소" 버튼(= 수동 `disconnect()`)
 - [ ] 예외 처리 강화 (네트워크 오류, 권한 오류 등)
-- [ ] PyInstaller로 단일 exe 패키징
+- [x] PyInstaller로 단일 exe 패키징 — 서버 단일 사이드(와이어 프로토콜 무변경). onefile + windowed(`--noconsole`), `build_exe.ps1`이 **저장소 밖 임시 venv**에서 빌드해 전역 Python을 바꾸지 않는다(pytest 기준선이 pystray 미설치 상태라서). 결과 `pc_server/dist/PhonePadServer.exe` 15.6MB, 빌드 약 40초. 함께 해결: 서버 중복 실행(named mutex, 종료 코드 2)과 windowed 로그 소실(`%LOCALAPPDATA%\PhonePad\server.log`). 실제로 exe를 빌드·실행해 TCP 9000/UDP 9001·중복 실행 가드·로그 기록·exe 안에서 pystray 트레이 윈도 생성까지 확인
 
 **재연결 구현 시 핵심 파일/설계:**
 - `domain/model/ReconnectPolicy.kt` — 순수 클래스(시간·코루틴 비의존). `delayBeforeAttempt(attempt)`(1-based, 1→2→4→8→10s 상한, shift 폭 31 제한으로 Long 오버플로 방지 — 음수 지연은 `delay()`를 즉시 반환시켜 재시도 폭주가 된다), `shouldAttempt`. `Disabled` 인스턴스를 테스트에 주입해 재연결 이전의 "유실 → `Error`" 동작을 그대로 재현 — 기존 heartbeat/직렬화 테스트는 로직을 고치지 않고 이 정책만 끼웠다
@@ -271,6 +275,13 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - 스레드 모델: pystray가 Windows에서 메시지 루프를 메인 스레드가 소유해야 하므로 **트레이가 메인 스레드, 서버가 백그라운드 스레드**(콘솔 모드는 기존처럼 메인 스레드가 서버). 종료 순서: `stop 설정 → 서버 스레드 join(3s) → release_drag → 아이콘 제거 → 정수 반환` — 드래그 해제를 아이콘 제거보다 먼저 둔다(아이콘이 사라진 뒤 버튼이 눌린 채 남으면 단서가 없다). `os._exit`/`sys.exit` 남발 없음
 - 서버 스레드 사망 처리: 서버 스레드가 `BaseException`을 잡아 로그하고 트레이를 내려 종료 코드 1로 끝난다(아이콘만 남는 좀비 방지). `stop()`과 pystray 루프 기동의 경합은 `_stopped`/`_loop_ready` 이중 확인 + lock 기반 test-and-set으로 막고 전용 테스트로 고정
 - 테스트 함정: `pystray.MenuItem`은 콜백의 `action.__code__.co_argcount`로 인자 수를 세므로 `lambda _icon, _item, act=action: act()`처럼 기본 인자 바인딩을 쓰면 3개로 계산해 `ValueError`를 던진다. **pystray 미설치 환경에서는 `_build_menu()`의 pystray 경로가 실행되지 않아 이 결함이 영원히 드러나지 않는다**(실제 venv에서 실행해서 22건 실패로 발견) → `_wrap_action()`으로 수정. 어댑터를 고칠 때는 미설치 환경 테스트만 믿지 말고 venv에 실제 pystray를 설치해 한 번 더 돌릴 것
+
+**패키징 구현 시 핵심 파일/설계:**
+- `pc_server/single_instance.py` — `Local\PhonePadServer` named mutex. **소켓 옵션은 무변경**(`SO_REUSEADDR` 유지 — 재시작 시 TIME_WAIT 재바인드 동작을 지키기 위해). 획득한 핸들을 모듈 전역에 붙들어 둔다(지역 변수면 GC 후 mutex가 풀려 가드가 무력화됨). 같은 프로세스 안에서는 멱등, `ctypes.windll`이 없는 환경이나 mutex 생성 실패 시에는 **서버를 그대로 띄운다**(가드가 서버 기동을 막는 방향의 실패는 피함), `--allow-multiple`로 해제. 중복이면 ASCII 한 줄 + (windowed일 때만) `MessageBoxW` 후 종료 코드 2. `GetLastError` 신뢰성을 위해 `ctypes.WinDLL("kernel32", use_last_error=True)` 사용
+- `pc_server/logging_setup.py` — `sys.stdout`/`sys.stderr`가 `None`일 때만 로그 파일로 교체. 코드 전반의 `print()`는 한 줄도 고치지 않았다(스트림만 바꿈). 줄 단위 flush, 시작 시 1MB 초과면 `.1`로 1세대 회전, 열기 실패 시 `os.devnull` 폴백. 콘솔이 있는 일반 실행은 완전 무변경
+- `pc_server/server.py` — 변경은 **+20줄**(import 2줄, `--allow-multiple`, `main()` 진입부의 `configure_stdio()` + `enforce()` 호출뿐). `ServerRuntime`/`handle_client`/소켓 옵션은 무변경
+- `pc_server/tests/conftest.py` — mutex 이름을 pytest 프로세스 전용으로 격리(가드를 모킹하지 않고 이름만 바꿔 실제 `CreateMutexW` 경로는 그대로 실행). 이게 없으면 **서버가 트레이에 떠 있을 때 `server.main()`을 호출하는 기존 테스트가 종료 코드 2로 깨진다**
+- 빌드 함정: (1) onefile exe는 **프로세스가 2개**(부트로더 + Python 자식)라 로그의 pid가 `Start-Process` pid와 다르고 종료할 때 둘 다 잡아야 한다, (2) windowed 판정은 부모가 결정한다(아래 섹션 10), (3) pystray는 Windows 백엔드를 `importlib`로 동적 선택해 정적 분석에 안 잡히므로 `pystray._win32`를 `hiddenimports`로 명시해야 한다
 
 ### ⬜ Phase 5 — 선택 확장
 - [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
@@ -314,9 +325,15 @@ pip install -r requirements.txt   # 트레이 아이콘용 (선택 — 없으면
 python server.py                  # 시스템 트레이 아이콘과 함께 실행
 python server.py --no-tray        # 트레이 없이 콘솔 모드 (Ctrl+C로 종료)
 # → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) 포트에서 대기
+
+# 단일 exe 빌드 — 임시 venv를 저장소 밖에 만든다(전역 Python은 건드리지 않음)
+./build_exe.ps1                   # → dist/PhonePadServer.exe (약 15.6MB, 빌드 약 40초)
 ```
+**exe 실행:** 더블클릭하면 windowed(`--noconsole`)라 콘솔 창 없이 트레이 아이콘만 뜬다. 그래서 `print()` 로그는 **`%LOCALAPPDATA%\PhonePad\server.log`** 로 간다(줄 단위 flush, 1MB를 넘으면 시작 시 `server.log.1`로 1회 회전). 빌드 산출물(`build/`, `dist/`)은 커밋하지 않는다.
 **트레이 모드:** 아이콘 색이 상태를 보여준다(회색 = 대기 중, 초록 = 연결됨). 툴팁은 `Phone Pad - 연결됨 (N대)`, 메뉴에는 앱에 입력할 **접속 주소(`PC의 LAN IP:9000`)** 가 표시되며 **"종료"** 로 끈다. `pystray`/`Pillow`가 설치돼 있지 않으면 경고 한 줄을 출력하고 자동으로 콘솔 모드로 동작한다(서버 기능은 트레이 의존성에 막히지 않는다). 서버가 예외로 죽으면(포트 바인드 실패 등) 트레이도 함께 내려가 프로세스가 종료 코드 1로 끝난다 — 아이콘만 남는 좀비는 생기지 않는다.
-**같은 PC에서 서버를 두 번 실행하지 말 것:** Windows에서는 `SO_REUSEADDR` 때문에 이미 점유된 포트에도 bind가 성공해, 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받는다(아래 섹션 10 참조).
+**서버를 두 번 실행하면 자동으로 차단된다:** Windows에서는 `SO_REUSEADDR` 때문에 이미 점유된 포트에도 bind가 성공해 예전에는 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받았다. 이제 두 번째 프로세스가 named mutex(`Local\PhonePadServer`)로 이를 감지해 "이미 실행 중입니다" 안내창(windowed) 또는 stderr 한 줄(콘솔)을 띄우고 **종료 코드 2**로 끝난다 — 첫 인스턴스는 영향받지 않는다. 개발 중 일부러 두 개를 띄우려면 `--allow-multiple`. 단 다른 로그인 세션에서 띄운 서버는 감지하지 못한다(아래 섹션 10 참조).
+**Windows 방화벽(exe):** `python.exe`로 허용해 둔 기존 규칙은 `PhonePadServer.exe`에 적용되지 않으므로 exe로 처음 실행하면 새 방화벽 프롬프트가 뜰 수 있다(미검증 — 이 환경에서 확인 불가). 허용 대상은 아래와 같다.
+
 **Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다).
 
 **트러블슈팅:** 커서가 갑자기 멈추고 앱이 `Heartbeat timeout`/`Connection lost`를 띄우면 TCP 9000 경로(Wi-Fi 절전, 도즈 모드 등으로 heartbeat 전송이 지연되는 경우 포함)를 먼저 의심한다. TCP 세션이 회수되면 이미 전송 중이던 UDP MOVE도 서버가 조용히 무시하므로 함께 멈춘다.
@@ -351,6 +368,7 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - ViewModel에서 직접 네트워크 호출 금지 — UseCase 경유
 - 새 화면 추가 시 `presentation/<feature>/` 하위 패키지로 분리
 - Python 서버: 이벤트 타입별 처리는 `InputController.handle_event`에 집중
+- **서버에 "실행 진입점 동작"(중복 실행 가드·로깅 설정 등)을 추가할 때는 `server.py`가 아니라 새 모듈로 만들고 `main()`에서 몇 줄로 호출한다.** `ServerRuntime`/`handle_client`는 라이브러리처럼 import되어 테스트되므로, 진입점 전용 동작이 그 안으로 새면 테스트가 실행 환경(예: 트레이에 서버가 떠 있는지)에 끌려다닌다
 - **Python 서버의 `print()` 로그 메시지는 ASCII만 사용한다** — em dash(—) 같은 비ASCII 문자가 한국어 Windows 콘솔(cp949)에서 `UnicodeEncodeError`를 던져, 정작 중요한 순간(예: 연결 종료 시 드래그 강제 해제 성공 로그)에 `except`가 이를 잡아 "실패"로 잘못 보고한 적이 있다. 일반 하이픈(-)이나 영문 기호로 대체할 것
 - **새 기능/버그 수정 시 테스트 코드도 함께 작성**
   - Android: `usecase`/`repository` 등 도메인 로직은 JUnit + MockK 단위 테스트, 제스처 판정 로직(`GestureConfig` 기준값)은 별도 테스트로 검증
@@ -372,7 +390,7 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 |------|------|
 | Android DI | Hilt 2.48 사용 중 (확정) |
 | 바이너리 프로토콜 전환 | Phase 2 성능 테스트 후 결정 |
-| PC 서버 배포 | PyInstaller — Phase 4에서 |
+| PC 서버 배포 | PyInstaller onefile + windowed 완료(`build_exe.ps1`). 코드 서명·설치 관리자·부팅 시 자동 시작 등록은 범위 밖 |
 | PIN 인증 | Phase 5 선택 사항 — UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않아 동일 WiFi 내 스푸핑이 가능함. PIN 인증 설계 시 함께 재검토 |
 | 다중 기기 연결 | 정책 미정 — 서버는 현재 활성 세션 전부를 동시에 처리 가능한 구조(집합 기반)라, 여러 기기가 동시에 연결하면 전부 커서를 움직일 수 있음. 드래그 상태(`_drag_active`)도 프로세스 전역이라, 기기 A가 드래그 중일 때 기기 B의 연결이 끊기면 B의 안전장치가 A의 드래그를 놓아버림(실측 확인) — 버튼이 눌린 채 멈추는 것보다 안전한 실패 방향이라 1:1 전제하에 그대로 둠, 다중 기기 지원 시 세션별 상태 분리 필요 |
 | sub-pixel 이동 정밀도 | `InputController._move`에 한정된 이슈 — 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음. SCROLL은 Android가 잔차를 완전히 처리해 보내므로 해당 없음 — 별도 이슈로 개선 검토 |
@@ -390,8 +408,11 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | 탭홀드 드래그 승격 민감도 | 승격 조건이 "200ms 동안 20px(TAP_MAX_DISTANCE_PX) 이내"라, 고해상도 화면에서 첫 200ms 동안 아주 천천히(약 100px/s 미만) 정밀하게 커서를 미는 동작이 의도치 않게 드래그로 승격될 수 있음. 스펙이 요구한 "탭/드래그 사각지대 없음"의 결과이므로 결함은 아니나 실기기에서 가장 먼저 체감될 항목 — 조정 시 승격 판정 전용의 더 엄격한 정지 반경(예: 8px)을 별도로 두는 방향을 검토(임계 시간 자체를 건드리면 사각지대가 재발함) |
 | DRAG_START/DRAG_END 전송 순서 완전 보장 아님 | `TcpClient.send()`를 전용 단일 스레드 디스패처로 직렬화해 위험을 크게 줄였지만, `TrackpadViewModel`이 이벤트마다 별도 코루틴을 `launch`하는 구조라 그 코루틴들이 디스패처에 도달하는 순서 자체까지 수학적으로 보장하지는 않는다. 실제 발생 확률은 매우 낮고(같은 UI 스레드에서 순차 호출되므로), 서버의 멱등 처리와 연결 종료 시 강제 해제 안전장치가 최종 방어선 |
 | 서버 프로세스 강제 종료 시 드래그 상태 | **대부분 해소(Phase 4 트레이).** 트레이 "종료"·Ctrl+C·예외 종료는 `atexit` 안전장치와 정상 종료 경로가 `force_release_drag()`를 호출한다(정상·예외 종료 양쪽을 별도 자식 프로세스로 실측, `LEFTUP` 발사 확인). **남은 경계:** `taskkill /F` 같은 하드 킬은 인터프리터가 정리 기회를 얻지 못해 여전히 버튼이 눌린 채 남을 수 있다 — 프로세스 안에서는 막을 수 없는 영역 |
-| 서버 중복 실행 (Windows `SO_REUSEADDR`) | 기존 코드가 리슨 소켓에 `SO_REUSEADDR`를 설정하는데, **Windows에서는 이 옵션이 이미 점유된 포트에도 bind를 성공시킨다**(실측). 서버를 두 번 띄우면 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받는다 — 트레이가 생기면서 이 실수가 눈에 보이게 됐을 뿐 이전부터 있던 동작. 고치려면 `SO_EXCLUSIVEADDRUSE`나 named mutex가 필요한데 기존 소켓 동작(재시작 시 TIME_WAIT 재바인드 등) 변경이라 이번엔 손대지 않았다 — PyInstaller 패키징 항목과 함께 다룰 것. (이 때문에 서버 사망 경로 테스트는 포트 충돌 대신 이 머신에 없는 주소 `203.0.113.1`에 bind해 진짜 `OSError [WinError 10049]`를 발생시킨다) |
+| 서버 중복 실행 (Windows `SO_REUSEADDR`) | **해소(Phase 4 패키징).** `SO_REUSEADDR`가 Windows에서 이미 점유된 포트에도 bind를 성공시키는 동작 **자체는 그대로 두고**(재시작 시 TIME_WAIT 재바인드 유지) 프로세스 단위 named mutex(`Local\PhonePadServer`)로 막는다. 두 번째 인스턴스는 안내 후 종료 코드 2. 빌드된 exe를 두 번 실행해 콘솔·windowed 두 경로 모두 실측. **남은 경계:** `Local\` 네임스페이스라 **다른 로그인 세션**에서 띄운 서버는 감지하지 못하며 그 경우 포트 경합은 그대로다(필요해지면 `Global\` + 권한 처리로 확장). 참고: 서버 사망 경로 테스트가 포트 충돌 대신 이 머신에 없는 주소 `203.0.113.1`에 bind해 `OSError [WinError 10049]`를 만드는 이유는 소켓 동작을 바꾸지 않았으므로 그대로 유효하다 |
 | 트레이 실환경 검증 잔여 | 콘솔에서의 **진짜 Ctrl+C**(자동화하면 `CTRL_C_EVENT`가 실행 셸까지 죽여서 단위 테스트로만 커버), 아이콘 시각 품질(다크 테마 대비)과 팝업 메뉴의 한글 폰트/잘림, 실기기 연동 회귀(프로토콜 무변경이라 회귀는 없어야 함). 트레이 렌더링·상태 갱신·종료는 임시 venv에서 실제 Windows 트레이로 확인함 |
-| PyInstaller `--noconsole` 시 로그 소실 | `sys.stdout is None`이어도 CPython `print()`는 조용히 no-op이라(실측) 서버가 죽지는 않는다. 다만 그 상태에서는 트레이 폴백 경고·서버 사망 로그가 아무 데도 보이지 않으므로, 패키징 시 파일 로깅이나 트레이 알림으로 대체할 것 |
+| PyInstaller `--noconsole` 시 로그 소실 | **해소(Phase 4 패키징).** `logging_setup.configure_stdio()`가 `sys.stdout`/`sys.stderr`가 `None`일 때만 `%LOCALAPPDATA%\PhonePad\server.log`로 교체한다. 기존 `print()` 호출은 그대로 두고 스트림만 바꿨다. 콘솔 실행은 완전 무변경. 로그 회전은 시작 시 1회뿐이라 한 프로세스를 아주 오래 켜 두면 1MB를 넘어 계속 자랄 수 있다(현재 로그량에서는 문제 없어 과설계를 피함) |
+| exe 하드 킬 시 `_MEI` 잔여 | onefile exe는 부트로더가 `%TEMP%\_MEI<랜덤>`에 약 15MB를 풀고 자식 프로세스로 Python을 돌린다. `taskkill /F`로 죽이면 이 디렉터리가 남는다(정상 종료는 정리됨). 프로세스가 **2개**라 강제 종료할 때 둘 다 잡아야 한다 |
+| exe의 windowed 판정은 부모가 결정 | GUI 서브시스템 exe여도 부모가 콘솔 핸들을 물려주면(`subprocess.Popen` 등) `sys.stdout`이 살아 있어 로그가 파일이 아니라 부모 콘솔로 간다. 더블클릭/`Start-Process`는 핸들을 안 물려주므로 파일 로깅이 동작한다. 배치 스크립트로 exe를 돌릴 때 로그가 "안 남는" 게 아니라 콘솔로 가는 것 |
+| exe 트레이 "종료" 경로 미검증 | 우클릭 팝업 메뉴 선택을 스크립트로 재현할 수 없어 exe에서 트레이 "종료"를 눌러 보는 검증은 못 했다(pystray가 exe 안에서 로드되어 트레이 윈도를 만드는 것까지는 확인). 사람이 한 번 손으로 확인하면 `_MEI` 정리도 함께 검증된다 |
 | 트레이 LAN IP 캐시 | 접속 주소 라벨의 LAN IP는 서버 구동 중 한 번만 조회해 캐시한다(매 폴링마다 소켓을 열 이유가 없어서). Wi-Fi를 바꿔 PC의 IP가 바뀌면 서버를 재시작해야 새 주소가 보인다 |
 | 앱 백그라운드 진입 시 드래그 미종료 | 드래그 홀드 중 Android 앱이 백그라운드로 가서 `TrackpadViewModel`이 파기되면 `DRAG_END`를 보낼 기회가 없다 — 서버 heartbeat 타임아웃(≈15초)이 감지해 강제로 놓을 때까지 PC 버튼이 눌린 채 유지됨. 실기기 미검증 |
