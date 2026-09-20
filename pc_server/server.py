@@ -6,6 +6,8 @@ import sys
 import threading
 import uuid
 
+import logging_setup
+import single_instance
 import tray
 from input_controller import InputController
 
@@ -400,11 +402,29 @@ def parse_args(argv=None):
         action="store_true",
         help="run without the system tray icon (console mode, Ctrl+C to quit)",
     )
+    parser.add_argument(
+        "--allow-multiple",
+        action="store_true",
+        help="skip the single-instance guard (development/debugging only)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    # PyInstaller --noconsole exe 에는 표준 스트림이 없어 print() 가 조용히 사라진다.
+    # 콘솔이 있는 일반 실행에서는 아무것도 바꾸지 않는다. (logging_setup 참조)
+    stdio = logging_setup.configure_stdio()
+
+    # 같은 PC 에서 서버가 두 번 뜨는 것을 프로세스 단위로 막는다.
+    # 소켓 옵션(SO_REUSEADDR)은 그대로 둔다 - single_instance 모듈 주석 참조.
+    guard_exit = single_instance.enforce(
+        allow_multiple=args.allow_multiple, windowed=stdio.windowed
+    )
+    if guard_exit is not None:
+        return guard_exit
+
     controller = InputController()
     registry = SessionRegistry()
 

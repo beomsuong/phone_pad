@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# PyInstaller 산출물 (build_exe.ps1). .spec 과 build_exe.ps1 은 추적한다.
+build/
+dist/
