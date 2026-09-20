@@ -25,7 +25,8 @@ phone_pad/
 │       ├── MainActivity.kt
 │       ├── domain/
 │       │   ├── model/         TrackpadEvent.kt, ConnectionState.kt, GestureSettings.kt,
-│       │   │                   ReconnectPolicy.kt
+│       │   │                   ReconnectPolicy.kt, ConnectionErrorKind.kt,
+│       │   │                   ConnectionErrorClassifier.kt
 │       │   ├── repository/    TrackpadRepository.kt, SettingsRepository.kt (interface)
 │       │   └── usecase/       SendEventUseCase.kt
 │       ├── data/
@@ -34,12 +35,12 @@ phone_pad/
 │       ├── di/                AppModule.kt, DispatcherModule.kt, DataStoreModule.kt,
 │       │                       ReconnectModule.kt
 │       └── presentation/
-│           ├── util/          GestureConfig.kt
+│           ├── util/          GestureConfig.kt, ConnectionErrorMessages.kt
 │           ├── settings/      SettingsScreen.kt, SettingsViewModel.kt, SettingsUiState.kt,
 │           │                   ScrollSpeedSlider.kt
 │           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt,
 │                               MultiTouchGestureTracker.kt, DoubleTapDetector.kt,
-│                               DragHoldDetector.kt
+│                               DragHoldDetector.kt, ConnectionErrorSection.kt
 └── pc_server/                 ← Windows Python 서버
     ├── server.py              소켓/세션/heartbeat + 정지 가능한 ServerRuntime, 콘솔/트레이 실행 모드
     ├── input_controller.py
@@ -50,7 +51,8 @@ phone_pad/
     ├── logging_setup.py       --noconsole 실행 시 print() → 로그 파일
     ├── phone_pad_server.spec  PyInstaller 빌드 정의 (onefile + windowed)
     ├── build_exe.ps1          저장소 밖 임시 venv 생성 → exe 빌드 스크립트
-    └── tests/                 pytest 단위 테스트 (test_single_instance.py, test_logging_setup.py 포함)
+    └── tests/                 pytest 단위 테스트 (test_single_instance.py, test_logging_setup.py 포함,
+                               send_input_stub.py = SendInput 모킹 헬퍼)
 ```
 
 ---
@@ -254,11 +256,11 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - `pc_server/input_controller.py` — `_double_click(button)`, `_drag_start()`/`_drag_end()`/`force_release_drag()` 완료. 드래그 상태는 프로세스 전역(현재 컨트롤러가 프로세스당 하나)
 - `pc_server/server.py` — `handle_client`의 `finally`에서 연결 종료 시 드래그 강제 해제 호출
 
-### 🔶 Phase 4 — 완성도 (재연결·트레이·패키징 완료, UDP 탐색·예외 처리 강화 남음)
+### 🔶 Phase 4 — 완성도 (재연결·트레이·패키징·예외 처리 완료, UDP 자동 탐색 남음 — 다른 세션이 진행 중)
 - [x] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료. 서버 단일 사이드(와이어 프로토콜 무변경). 아이콘은 Pillow로 코드에서 생성(대기 회색/연결됨 초록), 메뉴는 상태 라벨·접속 주소(LAN IP:9000)·종료. `--no-tray` 옵션과 미설치 시 콘솔 모드 폴백. 정지 가능한 `ServerRuntime`으로 정상 종료 경로를 만들고 `atexit` 드래그 해제 안전장치를 추가해 섹션 10의 "서버 프로세스 강제 종료 시 드래그 상태" 항목을 해소
 - [ ] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지)
 - [x] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — Android 단일 사이드(프로토콜/서버 무변경: 재연결은 기존 핸드셰이크를 그대로 다시 수행할 뿐이라 서버에는 "새 클라이언트 접속"과 구분되지 않음). **"Connected였던 세션이 유실됐을 때만"** 재시도하며, 첫 `connect()` 실패는 기존처럼 `Error`로 남긴다(틀린 IP에 55초씩 매달리지 않기 위해). 유실은 `Error`를 거치지 않고 곧바로 `ConnectionState.Reconnecting(host, attempt, maxAttempts)`로 가고, 성공하면 `Connected`, 8회 소진 시 `Error("Reconnect failed: <마지막 원인>")`. 재연결 화면에는 "취소" 버튼(= 수동 `disconnect()`)
-- [ ] 예외 처리 강화 (네트워크 오류, 권한 오류 등)
+- [x] 예외 처리 강화 — "범위가 모호한 항목"이라 추측으로 넓히지 않고 **코드 조사로 재현/확인된 결함만** 처리했다. 서버/Android 각각 단일 사이드(와이어 프로토콜 무변경). 서버: `SendInput` 반환값(주입된 이벤트 수)을 확인하지 않아 `_drag_start`/`_drag_end`의 "실패하면 상태를 유지한다"는 주석과 코드(무조건 상태 변경)가 어긋나 있던 버그 수정. Android: `Socket(host, port)`에 연결 타임아웃이 없고 첫 연결에는 "취소"도 없어 틀린 IP에서 OS 기본 타임아웃(수십 초) 동안 갇히던 문제, 오류가 영어 예외 원문으로 노출되던 문제 수정. **다루지 않은 것:** UIPI(관리자 권한 창) 차단 감지(불가능 — 아래), IP 형식 검증, 포트 입력 UI, 앱 백그라운드 진입 시 드래그 종료, 서버 기동 실패 안내창
 - [x] PyInstaller로 단일 exe 패키징 — 서버 단일 사이드(와이어 프로토콜 무변경). onefile + windowed(`--noconsole`), `build_exe.ps1`이 **저장소 밖 임시 venv**에서 빌드해 전역 Python을 바꾸지 않는다(pytest 기준선이 pystray 미설치 상태라서). 결과 `pc_server/dist/PhonePadServer.exe` 15.6MB, 빌드 약 40초. 함께 해결: 서버 중복 실행(named mutex, 종료 코드 2)과 windowed 로그 소실(`%LOCALAPPDATA%\PhonePad\server.log`). 실제로 exe를 빌드·실행해 TCP 9000/UDP 9001·중복 실행 가드·로그 기록·exe 안에서 pystray 트레이 윈도 생성까지 확인
 
 **재연결 구현 시 핵심 파일/설계:**
@@ -282,6 +284,16 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - `pc_server/server.py` — 변경은 **+20줄**(import 2줄, `--allow-multiple`, `main()` 진입부의 `configure_stdio()` + `enforce()` 호출뿐). `ServerRuntime`/`handle_client`/소켓 옵션은 무변경
 - `pc_server/tests/conftest.py` — mutex 이름을 pytest 프로세스 전용으로 격리(가드를 모킹하지 않고 이름만 바꿔 실제 `CreateMutexW` 경로는 그대로 실행). 이게 없으면 **서버가 트레이에 떠 있을 때 `server.main()`을 호출하는 기존 테스트가 종료 코드 2로 깨진다**
 - 빌드 함정: (1) onefile exe는 **프로세스가 2개**(부트로더 + Python 자식)라 로그의 pid가 `Start-Process` pid와 다르고 종료할 때 둘 다 잡아야 한다, (2) windowed 판정은 부모가 결정한다(아래 섹션 10), (3) pystray는 Windows 백엔드를 `importlib`로 동적 선택해 정적 분석에 안 잡히므로 `pystray._win32`를 `hiddenimports`로 명시해야 한다
+
+**예외 처리 강화 구현 시 핵심 파일/설계:**
+- `pc_server/input_controller.py` — 모든 `SendInput` 호출이 `_send_input(count, inputs, kind) -> bool` 한 곳을 지난다. 반환값(주입된 이벤트 수)이 `count`보다 적으면 실패로 보고 `input_failures` 카운터를 올리고, 종류별(`MOVE`/`SCROLL`/`CLICK`/`DOUBLE_CLICK`/`DRAG_START`/`DRAG_END`) 5초 rate limit으로 ASCII 로그 1줄을 남긴다(예외는 던지지 않음 — 로그 스트림이 닫혀 있어도 입력 처리는 계속). `_drag_start`는 실패 시 `_drag_active`를 올리지 않고, `_drag_end`/`force_release_drag`는 실패 시 True로 남겨 나중에 재시도한다(눌린 적 없는 버튼을 "눌림"으로 기록해 유령 LEFTUP을 쏘던 버그 수정). 시간·로그는 생성자 주입(`monotonic`/`log`/`failure_log_interval`)이라 테스트에서 sleep 없이 검증. 락 순서는 `_drag_lock` → `_failure_lock` 단방향. **ctypes 호출이 던지는 예외는 삼키지 않고 전파**한다(`server.py`의 기존 `except` 경로와 그 테스트의 검증력을 유지하기 위해)
+- `pc_server/tests/send_input_stub.py` — `patch_send_input()`(성공 = 요청 개수 반환) / `injected_none` / `injected_partial(n)`. `MagicMock` 기본 반환값은 새 계약에서 "0개 주입"으로 읽혀 실패로 판정되므로 기존 patch 45곳을 전부 이걸로 교체했다(호출 횟수·플래그 시퀀스 단언은 약화 없음). `_send_input`의 반환값 검사를 무력화하면 16개 테스트가 실패함을 변이 검사로 확인
+- `presentation/util/GestureConfig.kt` — `CONNECT_TIMEOUT_MS`(5초)는 `SESSION_HANDSHAKE_TIMEOUT_MS`(3초)와 **직렬**로 붙어 최악 8초. 0은 "무한 대기"라 금지(`GestureConfigTest`가 고정)
+- `data/network/TcpClient.kt` — `Socket()` + `connect(InetSocketAddress, timeout)`. 소켓을 **연결 시도 전에** 필드에 등록하는 것이 취소 설계의 전제(블로킹 `connect()`는 코루틴 취소로 풀리지 않아 소켓 close가 유일한 수단). 테스트 주입점 `connectTimeoutMs`/`socketFactory`(`internal`)는 실제 5초를 기다리는 테스트를 만들지 않기 위한 것이며 프로덕션 코드는 건드리지 않는다
+- `data/repository/TrackpadRepositoryImpl.kt` — 경합 장치가 **5종**: `connectionMutex` + `generation`(연결 단위) + `reconnectEpoch`(재시도 묶음) + `reconnectJob.cancel()` + **`connectEpoch`(수동 시도 단위, 신규)**. `connectEpoch`는 수동 `connect`/`cancelConnect`/`disconnect`만 올리고 **재연결 루프는 절대 올리지 않는다**(올리면 락을 기다리던 사용자의 수동 연결이 무효화된다). `cancelConnect()`는 `Connecting`일 때만 동작하며 전부 뮤텍스 **밖**에서 "무효화 → 상태 되돌림(Disconnected, Error 아님) → 소켓 close" 순서로 한다. `openConnection`은 `ConnectOutcome`(Success/**Cancelled**/Failure)을 돌려줘 실패와 취소를 구분 — 뒤늦게 도착한 성공/실패가 취소된 상태를 덮어쓰지 않는다
+- `domain/model/ConnectionErrorKind.kt` / `ConnectionErrorClassifier.kt` / `presentation/util/ConnectionErrorMessages.kt` — **내부 진단 문자열과 사용자 문구를 분리한다.** `ConnectionState.Error.message`는 진단 계약(기존 리터럴 유지)이고 한국어 변환은 `kind`를 보고 표시 계층에서만 한다. 분류기는 예외 타입 → 메시지 키워드 → `ConnectException`=거부 폴백 순, 원인 체인 깊이 5. `kind`는 기본값 `UNKNOWN`이라 1-인자 생성이 가능하지만 동등성에는 포함된다. 재연결 소진은 `RECONNECT_FAILED`, heartbeat 타임아웃은 `HEARTBEAT_TIMEOUT`
+- `presentation/trackpad/ConnectionErrorSection.kt` — 오류 표시 전용 컴포저블. `TrackpadScreen` 변경 면적을 줄이기 위한 분리(연결 화면을 동시에 손보는 작업과의 충돌 완화). `TrackpadScreen`은 첫 연결 중 "취소" 버튼 배선만 추가
+- **QA 생략 근거:** 와이어 프로토콜이 무변경이고 양쪽이 서로의 코드를 소비하지 않아 `protocol-qa`를 돌리지 않았다. 대신 리더가 두 결과를 직접 재실행(server 246 passed/1 skipped, Android `cleanTestDebugUnitTest` 258건 0 실패)하고 취소 로직·분류기·문구를 코드로 검토
 
 ### ⬜ Phase 5 — 선택 확장
 - [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
@@ -370,6 +382,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - Python 서버: 이벤트 타입별 처리는 `InputController.handle_event`에 집중
 - **서버에 "실행 진입점 동작"(중복 실행 가드·로깅 설정 등)을 추가할 때는 `server.py`가 아니라 새 모듈로 만들고 `main()`에서 몇 줄로 호출한다.** `ServerRuntime`/`handle_client`는 라이브러리처럼 import되어 테스트되므로, 진입점 전용 동작이 그 안으로 새면 테스트가 실행 환경(예: 트레이에 서버가 떠 있는지)에 끌려다닌다
 - **Python 서버의 `print()` 로그 메시지는 ASCII만 사용한다** — em dash(—) 같은 비ASCII 문자가 한국어 Windows 콘솔(cp949)에서 `UnicodeEncodeError`를 던져, 정작 중요한 순간(예: 연결 종료 시 드래그 강제 해제 성공 로그)에 `except`가 이를 잡아 "실패"로 잘못 보고한 적이 있다. 일반 하이픈(-)이나 영문 기호로 대체할 것
+- **`pc_server`에서 `SendInput`을 직접 호출하지 않는다** — 반드시 `InputController._send_input(count, inputs, kind)`를 경유한다(반환값 검사·실패 카운터·rate limit 로그가 이 한 곳에 있다). 테스트에서 `SendInput`을 모킹할 때는 `tests/send_input_stub.py`의 `patch_send_input()`을 쓴다(`MagicMock` 기본 반환값은 "0개 주입"으로 읽혀 실패로 판정된다)
+- **사용자에게 보이는 오류 문구와 내부 상태 문자열을 섞지 않는다.** `ConnectionState.Error.message`는 진단용 계약이고, 한국어 문구는 `ConnectionErrorKind` → `ConnectionErrorMessages` 경로로 표시 계층에서만 만든다. 문구 전문을 테스트로 고정하지 말고(다듬을 수 있어야 한다) "원문이 주 메시지를 점령하지 않는다", "모든 kind가 문구를 갖는다" 같은 **계약**을 고정한다
 - **새 기능/버그 수정 시 테스트 코드도 함께 작성**
   - Android: `usecase`/`repository` 등 도메인 로직은 JUnit + MockK 단위 테스트, 제스처 판정 로직(`GestureConfig` 기준값)은 별도 테스트로 검증
   - Python 서버: `input_controller.py`의 `handle_event` 등 이벤트 처리 로직은 `unittest`/`pytest`로 단위 테스트 작성
@@ -415,4 +429,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | exe의 windowed 판정은 부모가 결정 | GUI 서브시스템 exe여도 부모가 콘솔 핸들을 물려주면(`subprocess.Popen` 등) `sys.stdout`이 살아 있어 로그가 파일이 아니라 부모 콘솔로 간다. 더블클릭/`Start-Process`는 핸들을 안 물려주므로 파일 로깅이 동작한다. 배치 스크립트로 exe를 돌릴 때 로그가 "안 남는" 게 아니라 콘솔로 가는 것 |
 | exe 트레이 "종료" 경로 미검증 | 우클릭 팝업 메뉴 선택을 스크립트로 재현할 수 없어 exe에서 트레이 "종료"를 눌러 보는 검증은 못 했다(pystray가 exe 안에서 로드되어 트레이 윈도를 만드는 것까지는 확인). 사람이 한 번 손으로 확인하면 `_MEI` 정리도 함께 검증된다 |
 | 트레이 LAN IP 캐시 | 접속 주소 라벨의 LAN IP는 서버 구동 중 한 번만 조회해 캐시한다(매 폴링마다 소켓을 열 이유가 없어서). Wi-Fi를 바꿔 PC의 IP가 바뀌면 서버를 재시작해야 새 주소가 보인다 |
+| `SendInput` 주입 실패 감지의 한계 | 모든 호출이 `InputController._send_input()`을 지나며 반환값을 검사한다(반환값 계약은 이 머신에서 실측: `MOUSEEVENTF_MOVE` dx=dy=0 1개 → 반환 1). **남은 한계:** ① UIPI(관리자 권한 창에 일반 권한 프로세스가 주입)로 차단되면 Microsoft 문서상 반환값도 `GetLastError`도 실패를 알리지 않아 **감지 불가** — 서버를 관리자로 띄우는 것 외에 코드로 해결할 방법이 없다. ② 실패 경로(잠금 화면/보안 데스크톱)는 단위 테스트로만 커버, 실환경 미재현. ③ 로그의 `last error` 값은 `windll`이 `use_last_error`가 아니라 best-effort(표시용, 분기 근거 아님). ④ 입력이 오래 막혀도 서버는 복구 동작 없이 로그+카운터만 남긴다 |
+| 입력 실패의 사용자 노출 | `InputController.input_failures`로 누적 실패 수를 읽을 수 있지만 트레이/UI에 아직 표시하지 않는다. 누적 전용(리셋 API 없음)이라 트레이에 붙일 때는 "최근 N초 실패" 표현이 필요할 수 있음 |
+| 연결 타임아웃/취소 실기기 검증 | `CONNECT_TIMEOUT_MS`(5초) 만료 체감, `Connecting` 화면의 "취소" 버튼 렌더·반응, 오류 2줄의 소형 화면 잘림, 취소 후 IP 입력값 유지는 실기기 미검증(컴파일·JVM 단위 테스트만 통과). 타임아웃이 실제로 만료되는 경로는 블랙홀 주소가 필요해 단위 테스트로 재현하지 않았고, 고정한 것은 "OS 기본값에 맡기지 않는다"는 계약이다. 취소 직후 최대 5초간 뒤에서 도는 연결 시도는 결과가 버려지므로(`connectEpoch`) 무해하다 |
+| 오류 문구의 다국어 | `ConnectionErrorMessages`가 한국어 문자열을 코드에 직접 담고 있다(단일 로케일 전제). 다국어가 필요해지면 이 파일 하나만 `strings.xml`로 옮기면 된다 |
 | 앱 백그라운드 진입 시 드래그 미종료 | 드래그 홀드 중 Android 앱이 백그라운드로 가서 `TrackpadViewModel`이 파기되면 `DRAG_END`를 보낼 기회가 없다 — 서버 heartbeat 타임아웃(≈15초)이 감지해 강제로 놓을 때까지 PC 버튼이 눌린 채 유지됨. 실기기 미검증 |
