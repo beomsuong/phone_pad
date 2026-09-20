@@ -13,6 +13,7 @@ import pytest
 
 import server
 import tray
+from send_input_stub import patch_send_input
 from input_controller import INPUT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, InputController
 
 LOCALHOST = "127.0.0.1"
@@ -175,7 +176,7 @@ def test_bind_failure_leaves_no_open_udp_socket():
 
 def test_release_drag_releases_an_active_drag():
     controller = InputController()
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         controller.handle_event({"type": "DRAG_START"})
         assert controller.drag_active is True
         assert server.release_drag(controller, "shutdown") is True
@@ -186,7 +187,7 @@ def test_release_drag_releases_an_active_drag():
 def test_release_drag_is_idempotent():
     """정상 종료 경로와 atexit 가 둘 다 호출해도 LEFTUP 은 한 번만 나간다."""
     controller = InputController()
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         controller.handle_event({"type": "DRAG_START"})
         mock_send.reset_mock()
         assert server.release_drag(controller, "shutdown") is True
@@ -197,14 +198,14 @@ def test_release_drag_is_idempotent():
 
 def test_release_drag_without_active_drag_sends_nothing():
     controller = InputController()
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         assert server.release_drag(controller) is False
     mock_send.assert_not_called()
 
 
 def test_release_drag_swallows_send_input_failure():
     controller = InputController()
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         controller.handle_event({"type": "DRAG_START"})
         mock_send.side_effect = OSError("SendInput failed")
         assert server.release_drag(controller, "shutdown") is False  # 예외가 새지 않는다
@@ -230,7 +231,7 @@ def test_atexit_registered_callable_actually_releases_the_drag():
     call = next(c for c in mock_register.call_args_list if c.args[0] is server.release_drag)
     func, controller, reason = call.args[0], call.args[1], call.args[2]
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         controller.handle_event({"type": "DRAG_START"})
         mock_send.reset_mock()
         func(controller, reason)
@@ -313,7 +314,7 @@ def test_tray_quit_while_dragging_releases_the_button():
     controller = InputController()
     runtime = make_runtime(controller=controller, registry=registry)
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         controller.handle_event({"type": "DRAG_START"})
         assert controller.drag_active is True
         mock_send.reset_mock()
@@ -519,7 +520,7 @@ def test_console_mode_keyboard_interrupt_releases_drag(capsys):
             pass
 
     runtime = InterruptingRuntime()
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         controller.handle_event({"type": "DRAG_START"})
         mock_send.reset_mock()
         assert server.run_console(controller, registry, runtime=runtime) == 0

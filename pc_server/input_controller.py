@@ -1,5 +1,6 @@
 import ctypes
 import threading
+import time
 
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
@@ -12,6 +13,27 @@ MOUSEEVENTF_HWHEEL = 0x1000
 
 # 휠 한 노치(클릭) 단위. Windows 표준값.
 WHEEL_DELTA = 120
+
+# 같은 종류의 주입 실패는 이 간격(초) 안에서 로그를 한 줄만 남긴다.
+# MOVE 는 초당 수십 번 들어오므로(AGENTS.md 섹션 4) 입력이 막힌 동안 실패를
+# 그대로 찍으면 콘솔/로그 파일이 폭주한다.
+INPUT_FAILURE_LOG_INTERVAL_SEC = 5.0
+
+
+def _last_error() -> int:
+    """`GetLastError()` best-effort.
+
+    `ctypes.windll` 경로는 `use_last_error=True` 가 아니라서, SendInput 이후
+    ctypes 내부에서 다른 Win32 호출이 끼면 값이 덮어써질 수 있다. 진단 참고용
+    일 뿐이며 이 값으로 분기하면 안 된다. Windows 가 아니면 0.
+    """
+    getter = getattr(ctypes, "GetLastError", None)
+    if getter is None:
+        return 0
+    try:
+        return int(getter())
+    except (OSError, ValueError, TypeError):
+        return 0
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -37,7 +59,9 @@ class INPUT(ctypes.Structure):
 
 
 class InputController:
-    def __init__(self):
+    def __init__(self, monotonic=time.monotonic, log=print,
+                 failure_log_interval=INPUT_FAILURE_LOG_INTERVAL_SEC):
+        """`monotonic`/`log` 는 테스트에서 실제 sleep/콘솔 없이 검증하려고 주입한다."""
         # 드래그 홀드 상태(왼쪽 버튼을 누른 채 유지 중인지).
         # DRAG_START/DRAG_END 는 멱등이어야 하고, TCP 연결이 끊길 때 서버가 강제로
         # 버튼을 놓아야 하므로(버튼이 영원히 눌린 채 멈추는 것 방지) 인스턴스 상태로 둔다.
@@ -46,10 +70,74 @@ class InputController:
         # 여러 개일 수 있으므로, "검사 후 변경"을 원자적으로 만든다.
         self._drag_lock = threading.Lock()
 
+        self._monotonic = monotonic
+        self._log = log
+        self._failure_log_interval = failure_log_interval
+        # 주입 실패 통계. `_drag_lock` 과는 다른 락이며, 항상
+        # drag_lock -> failure_lock 순서로만 잡는다(역순 없음 = 교착 없음).
+        self._failure_lock = threading.Lock()
+        self._input_failures = 0
+        self._failure_logged_at = {}  # kind -> 마지막으로 로그한 monotonic 시각
+
     @property
     def drag_active(self) -> bool:
         """드래그 홀드(왼쪽 버튼 눌림 유지) 중인지."""
         return self._drag_active
+
+    @property
+    def input_failures(self) -> int:
+        """지금까지 누적된 SendInput 주입 실패 횟수(스레드 안전).
+
+        트레이/UI 표시는 아직 이 값을 쓰지 않는다 - 나중에 붙일 수 있게 노출만 한다.
+        """
+        with self._failure_lock:
+            return self._input_failures
+
+    def _send_input(self, count: int, inputs, kind: str) -> bool:
+        """모든 `SendInput` 호출이 지나는 단 하나의 창구. 주입 성공 여부를 돌려준다.
+
+        Windows 의 `SendInput` 은 **입력 큐에 실제로 넣은 이벤트 수**를 반환하고,
+        입력 데스크톱에 접근할 수 없으면(잠금 화면, UAC 보안 데스크톱 등) 요청보다
+        적은 수(보통 0)를 반환한다. 예외를 던지지 않으므로, 반환값을 버리면
+        "버튼을 눌렀다"고 착각한 채 상태만 바뀐다.
+
+        **감지 불가 한계:** UIPI(일반 권한 프로세스가 관리자 권한 창에 주입)로
+        차단된 경우에는 Microsoft 문서상 반환값도 `GetLastError` 도 실패를 알리지
+        않는다. 즉 여기서 True 를 받아도 실제로 입력이 먹혔다는 보장은 없다.
+        """
+        injected = ctypes.windll.user32.SendInput(count, inputs, ctypes.sizeof(INPUT))
+        if injected == count:
+            return True
+        self._note_input_failure(kind, count, injected)
+        return False
+
+    def _note_input_failure(self, kind: str, requested: int, injected) -> None:
+        """실패를 세고, 같은 종류는 rate limit 창당 한 줄만 로그한다.
+
+        이벤트 하나의 실패가 TCP 세션을 끊으면 안 되므로 예외를 밖으로 내보내지
+        않는다. 메시지는 ASCII 만 쓴다(AGENTS.md 섹션 9 - cp949 콘솔).
+        """
+        # 로그를 낼지 정하기 전에 읽는다 - 실패한 그 호출 직후여야 그나마 의미가 있다.
+        error_code = _last_error()
+        with self._failure_lock:
+            self._input_failures += 1
+            total = self._input_failures
+            now = self._monotonic()
+            last = self._failure_logged_at.get(kind)
+            should_log = last is None or (now - last) >= self._failure_log_interval
+            if should_log:
+                self._failure_logged_at[kind] = now
+        if not should_log:
+            return
+        try:
+            self._log(
+                "[!] SendInput %s: injected %s of %d (last error %s, failures %d) - "
+                "input desktop blocked? (UAC prompt / lock screen)"
+                % (kind, injected, requested, error_code, total)
+            )
+        except (OSError, ValueError):
+            # 로그 스트림이 닫혔거나 인코딩이 안 되더라도 입력 처리는 계속돼야 한다.
+            pass
 
     def handle_event(self, event: dict):
         t = event.get("type")
@@ -76,16 +164,16 @@ class InputController:
         elif t == "DRAG_END":
             self._drag_end()
 
-    def _move(self, dx: int, dy: int):
+    def _move(self, dx: int, dy: int) -> bool:
         inp = INPUT(
             type=INPUT_MOUSE,
             _input=_INPUTunion(
                 mi=MOUSEINPUT(dx=dx, dy=dy, dwFlags=MOUSEEVENTF_MOVE)
             ),
         )
-        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        return self._send_input(1, ctypes.byref(inp), "MOVE")
 
-    def _scroll(self, dx_steps: int, dy_steps: int):
+    def _scroll(self, dx_steps: int, dy_steps: int) -> bool:
         """휠 스크롤 이벤트 발생.
 
         부호 규약은 이 함수 한 곳에만 존재한다 — 실기기 미검증이므로 방향이
@@ -97,6 +185,8 @@ class InputController:
 
         dx/dy 가 0인 축은 INPUT 을 만들지 않으며, 둘 다 0이면 SendInput 자체를
         호출하지 않는다.
+
+        반환값은 "요청한 INPUT 이 전부 주입됐는가" - 보낼 것이 없었으면 False.
         """
         deltas = []
         if dy_steps != 0:
@@ -104,7 +194,7 @@ class InputController:
         if dx_steps != 0:
             deltas.append((MOUSEEVENTF_HWHEEL, dx_steps * WHEEL_DELTA))
         if not deltas:
-            return
+            return False
 
         inputs = (INPUT * len(deltas))(
             *[
@@ -119,17 +209,20 @@ class InputController:
                 for flag, delta in deltas
             ]
         )
-        ctypes.windll.user32.SendInput(len(deltas), inputs, ctypes.sizeof(INPUT))
+        return self._send_input(len(deltas), inputs, "SCROLL")
 
-    def _send_button_flag(self, flag: int):
-        """버튼 플래그 하나짜리 INPUT 을 SendInput 1회로 보낸다 (down 또는 up 단독)."""
+    def _send_button_flag(self, flag: int, kind: str) -> bool:
+        """버튼 플래그 하나짜리 INPUT 을 SendInput 1회로 보낸다 (down 또는 up 단독).
+
+        `kind` 는 실패 로그 문구와 rate limit 버킷 이름으로만 쓰인다.
+        """
         inputs = (INPUT * 1)(
             INPUT(
                 type=INPUT_MOUSE,
                 _input=_INPUTunion(mi=MOUSEINPUT(dwFlags=flag)),
             ),
         )
-        ctypes.windll.user32.SendInput(1, inputs, ctypes.sizeof(INPUT))
+        return self._send_input(1, inputs, kind)
 
     def _drag_start(self) -> bool:
         """왼쪽 버튼을 누른 채로 유지(LEFTDOWN 만, UP 없음). 이미 눌려 있으면 무시(멱등).
@@ -141,7 +234,10 @@ class InputController:
             if self._drag_active:
                 return False
             # SendInput 이 실패하면 상태를 바꾸지 않는다(버튼이 안 눌렸으므로).
-            self._send_button_flag(MOUSEEVENTF_LEFTDOWN)
+            # 여기서 True 로 올려 두면 DRAG_END 가 눌린 적 없는 버튼을 놓으려 하고,
+            # 연결 종료 안전장치까지 헛돈다.
+            if not self._send_button_flag(MOUSEEVENTF_LEFTDOWN, "DRAG_START"):
+                return False
             self._drag_active = True
             return True
 
@@ -154,7 +250,9 @@ class InputController:
         with self._drag_lock:
             if not self._drag_active:
                 return False
-            self._send_button_flag(MOUSEEVENTF_LEFTUP)
+            if not self._send_button_flag(MOUSEEVENTF_LEFTUP, "DRAG_END"):
+                # 버튼은 여전히 눌린 상태다. `_drag_active` 를 True 로 남긴다.
+                return False
             self._drag_active = False
             return True
 
@@ -167,7 +265,7 @@ class InputController:
         """
         return self._drag_end()
 
-    def _click(self, button: str):
+    def _click(self, button: str) -> bool:
         down_flag = MOUSEEVENTF_LEFTDOWN if button == "left" else MOUSEEVENTF_RIGHTDOWN
         up_flag = MOUSEEVENTF_LEFTUP if button == "left" else MOUSEEVENTF_RIGHTUP
 
@@ -181,9 +279,9 @@ class InputController:
                 _input=_INPUTunion(mi=MOUSEINPUT(dwFlags=up_flag)),
             ),
         )
-        ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+        return self._send_input(2, inputs, "CLICK")
 
-    def _double_click(self, button: str):
+    def _double_click(self, button: str) -> bool:
         """더블클릭: down-up-down-up 4개 INPUT 을 SendInput 1회로 원자적으로 전송.
 
         `_click` 을 두 번 호출하면 SendInput 이 두 번 나가고 그 사이에 다른
@@ -208,4 +306,4 @@ class InputController:
                 for flag in flags
             ]
         )
-        ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(INPUT))
+        return self._send_input(4, inputs, "DOUBLE_CLICK")

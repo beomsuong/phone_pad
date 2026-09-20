@@ -12,6 +12,7 @@ import socket
 from unittest.mock import patch
 
 import server
+from send_input_stub import patch_send_input
 from input_controller import (
     INPUT,
     MOUSEEVENTF_LEFTDOWN,
@@ -103,8 +104,12 @@ def test_drag_end_wire_line_releases_button_before_disconnect():
     conn = FakeConn(chunks=[DRAG_START_LINE, DRAG_END_LINE])
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
-        mock_send.side_effect = lambda *a: released_at_recv.append(conn.recv_calls)
+    with patch_send_input() as mock_send:
+        def record_and_inject(count, inputs, size):
+            released_at_recv.append(conn.recv_calls)
+            return count  # 실제 SendInput 계약: 주입한 이벤트 수
+
+        mock_send.side_effect = record_and_inject
         run_client(conn, controller=controller)
 
     # 1번째 recv = DRAG_START, 2번째 recv = DRAG_END. 3번째(EOF) 전에 둘 다 나가야 한다.
@@ -116,7 +121,7 @@ def test_full_drag_sequence_over_tcp_sends_down_then_up():
     conn = FakeConn(chunks=[DRAG_START_LINE, DRAG_END_LINE])
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     assert sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
@@ -127,7 +132,7 @@ def test_drag_lines_split_across_chunks_are_parsed():
     conn = FakeConn(chunks=[b'{"type":"DRAG_ST', b'ART"}\n{"type":"DRAG_END"}\n'])
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     assert sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
@@ -137,7 +142,7 @@ def test_drag_events_do_not_produce_downstream_traffic():
     """서버의 유일한 하향 트래픽은 SESSION 과 HEARTBEAT_ACK 뿐이다."""
     conn = FakeConn(chunks=[DRAG_START_LINE, DRAG_END_LINE])
 
-    with patch("input_controller.ctypes.windll.user32.SendInput"):
+    with patch_send_input():
         run_client(conn)
 
     assert [json.loads(l)["type"] for l in conn.sent_lines()] == ["SESSION"]
@@ -152,7 +157,7 @@ def test_drag_active_at_normal_disconnect_is_force_released():
     conn = FakeConn(chunks=[DRAG_START_LINE, b""])
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     assert sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
@@ -166,7 +171,7 @@ def test_drag_active_at_heartbeat_timeout_is_force_released():
     controller = InputController()
     registry = server.SessionRegistry()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(conn, controller=controller, registry=registry)
 
     assert sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
@@ -180,7 +185,7 @@ def test_drag_active_at_socket_exception_is_force_released():
     conn = FakeConn(chunks=[DRAG_START_LINE, ConnectionResetError("client vanished")])
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     assert sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
@@ -192,7 +197,7 @@ def test_no_extra_leftup_when_drag_ended_normally():
     conn = FakeConn(chunks=[DRAG_START_LINE, DRAG_END_LINE, b""])
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     assert sent_flags(mock_send) == [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]
@@ -204,7 +209,7 @@ def test_no_drag_means_no_send_input_at_disconnect():
     controller = InputController()
 
     with patch.object(controller, "_click"), \
-            patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+            patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     mock_send.assert_not_called()
@@ -216,8 +221,9 @@ def test_force_release_failure_does_not_break_disconnect_cleanup():
     controller = InputController()
     registry = server.SessionRegistry()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
-        mock_send.side_effect = [None, OSError("SendInput failed")]
+    with patch_send_input() as mock_send:
+        # 1 = LEFTDOWN 성공(주입 1개), 그다음 강제 해제에서 예외
+        mock_send.side_effect = [1, OSError("SendInput failed")]
         run_client(conn, controller=controller, registry=registry)
 
     assert registry.snapshot() == set()
@@ -229,7 +235,7 @@ def test_drag_survives_across_reconnect_and_is_released_by_second_connection():
     다음 연결 종료에서 중복 LEFTUP 이 나가지 않는다."""
     controller = InputController()
 
-    with patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+    with patch_send_input() as mock_send:
         run_client(FakeConn(chunks=[DRAG_START_LINE, b""]), controller=controller)
         assert controller._drag_active is False
         mock_send.reset_mock()
@@ -273,7 +279,7 @@ def test_other_events_still_work_in_same_connection_as_drag():
 
     with patch.object(controller, "_scroll") as mock_scroll, \
             patch.object(controller, "_double_click") as mock_double, \
-            patch("input_controller.ctypes.windll.user32.SendInput") as mock_send:
+            patch_send_input() as mock_send:
         run_client(conn, controller=controller)
 
     mock_scroll.assert_called_once_with(0, -3)
