@@ -162,6 +162,63 @@ object GestureConfig {
     const val UDP_PORT = 9001
 
     /**
+     * 서버 자동 탐색 전용 UDP 포트 (브로드캐스트 DISCOVER / 유니캐스트 SERVER 응답).
+     *
+     * [UDP_PORT](MOVE 전용)와 **섞지 않는다**. 9001은 세션 토큰으로 인증된 이동 좌표만 받는
+     * 채널이고, 탐색은 인증 이전 단계라 같은 LAN의 누구나 보낼 수 있다. 한 포트에 두 성격을
+     * 얹으면 "UDP는 MOVE만"이라는 섹션 4 원칙이 무너진다.
+     */
+    const val DISCOVERY_PORT = 9002
+
+    /**
+     * 탐색 1회의 총 수신 창 (ms) — 첫 브로드캐스트부터 결과를 확정하기까지.
+     *
+     * 같은 LAN 안의 서버는 보통 수 ms 안에 응답하므로 1.5초는 두 자릿수 여유다. 이 값은
+     * 동시에 "서버를 못 찾았다"고 사용자에게 말하기까지의 대기 시간이기도 해서, 체감을 해치지
+     * 않는 선(수동 IP 입력이라는 fallback이 늘 있다)에서 짧게 잡았다.
+     * 반드시 마지막 재전송 시각([DISCOVERY_PROBE_COUNT] · [DISCOVERY_PROBE_INTERVAL_MS])보다
+     * 충분히 커야 한다 — 마지막 패킷을 보내고 답을 기다릴 시간이 남지 않으면 재전송이 무의미하다
+     * (`GestureConfigTest`가 강제).
+     */
+    const val DISCOVERY_TIMEOUT_MS = 1500L
+
+    /**
+     * 한 번의 탐색에서 DISCOVER를 브로드캐스트하는 횟수.
+     *
+     * UDP는 재전송이 없어 브로드캐스트 한 발은 AP가 조용히 버리면 그대로 유실된다.
+     * 3회면 단발 유실 확률이 사실상 사라지고, 패킷 수는 (대상 주소 수 × 3)으로 여전히 무시할 수준이다.
+     */
+    const val DISCOVERY_PROBE_COUNT = 3
+
+    /** 재전송 간격 (ms) — 0 / 300 / 600ms 시점에 보낸다. */
+    const val DISCOVERY_PROBE_INTERVAL_MS = 300L
+
+    /**
+     * 수신 루프 1회의 소켓 타임아웃 (ms).
+     *
+     * 블로킹 `receive()`는 코루틴 취소로 풀리지 않는다. 짧게 끊어 반복해야 취소 확인과
+     * 재전송 시각 확인을 할 수 있고, 화면을 떠난 뒤에도 소켓이 남아 있는 시간이 이 값으로 제한된다.
+     * 너무 짧으면 의미 없는 깨어남만 늘어나므로 총 창의 1/7 수준으로 둔다.
+     */
+    const val DISCOVERY_RECEIVE_POLL_MS = 200
+
+    /**
+     * 목록에 담을 최대 서버 수.
+     *
+     * 가정용 LAN에 Phone Pad 서버가 8대를 넘을 일은 없다. 상한을 두는 진짜 이유는 응답을
+     * 위조하는 쪽이 목록을 무한히 부풀려 화면과 메모리를 채우지 못하게 하기 위해서다.
+     */
+    const val DISCOVERY_MAX_RESULTS = 8
+
+    /**
+     * 표시용 서버 이름의 최대 길이 (자).
+     *
+     * 서버도 같은 값으로 자르지만([DISCOVERY_PORT] 스펙), 클라이언트는 **서버를 믿지 않는다** —
+     * 응답은 누구나 위조할 수 있으므로 화면을 밀어내는 긴 이름은 이쪽에서도 자른다.
+     */
+    const val DISCOVERY_MAX_NAME_LENGTH = 64
+
+    /**
      * TCP 연결(3-way handshake)을 포기하기까지의 최대 시간 (ms).
      *
      * 이 값이 없으면(= `Socket(host, port)`) OS 기본 타임아웃에 맡기게 되는데, Android에서는

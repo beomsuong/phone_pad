@@ -10,7 +10,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -35,6 +37,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.phone_pad_app.domain.model.ConnectionState
+import com.example.phone_pad_app.domain.model.DiscoveredServer
+import com.example.phone_pad_app.domain.model.DiscoveryState
 import com.example.phone_pad_app.presentation.settings.SettingsScreen
 import com.example.phone_pad_app.presentation.settings.SettingsViewModel
 import com.example.phone_pad_app.presentation.util.GestureConfig
@@ -75,15 +79,21 @@ fun TrackpadScreen(
     when (state) {
         is ConnectionState.Disconnected -> ConnectPanel(
             hostInput = uiState.hostInput,
+            discovery = uiState.discovery,
             onHostChange = viewModel::onHostInputChange,
             onConnect = viewModel::connect,
+            onSearchServers = viewModel::startDiscovery,
+            onSelectServer = viewModel::selectServer,
             onOpenSettings = { showSettings = true },
             error = null,
         )
         is ConnectionState.Error -> ConnectPanel(
             hostInput = uiState.hostInput,
+            discovery = uiState.discovery,
             onHostChange = viewModel::onHostInputChange,
             onConnect = viewModel::connect,
+            onSearchServers = viewModel::startDiscovery,
+            onSelectServer = viewModel::selectServer,
             onOpenSettings = { showSettings = true },
             error = state,
         )
@@ -125,8 +135,11 @@ fun TrackpadScreen(
 @Composable
 private fun ConnectPanel(
     hostInput: String,
+    discovery: DiscoveryState,
     onHostChange: (String) -> Unit,
     onConnect: () -> Unit,
+    onSearchServers: () -> Unit,
+    onSelectServer: (DiscoveredServer) -> Unit,
     onOpenSettings: () -> Unit,
     error: ConnectionState.Error?,
 ) {
@@ -136,7 +149,12 @@ private fun ConnectPanel(
             .padding(32.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        // 탐색 결과(최대 8줄)가 붙으면 소형 화면·키보드 노출 시 아래 버튼이 잘릴 수 있어
+        // 세로 스크롤을 허용한다. 목록 쪽은 같은 방향 스크롤을 겹치지 않도록 일반 Column이다.
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.verticalScroll(rememberScrollState()),
+        ) {
             Text(text = "Phone Pad", style = MaterialTheme.typography.headlineMedium)
             Spacer(modifier = Modifier.height(8.dp))
             Text(
@@ -167,6 +185,13 @@ private fun ConnectPanel(
             ) {
                 Text("연결")
             }
+            // 수동 IP 입력은 그대로 두고, 자동 탐색을 그 아래에 "도우미"로 붙인다
+            // (고른 서버는 입력란을 채울 뿐 자동으로 연결하지 않는다).
+            ServerDiscoverySection(
+                state = discovery,
+                onSearch = onSearchServers,
+                onSelect = onSelectServer,
+            )
             Spacer(modifier = Modifier.height(8.dp))
             // 설정 진입은 여기(연결 전)에만 둔다 — 연결 후 화면은 전체가 제스처 표면이라
             // 버튼을 놓으면 그만큼 트랙패드 면적을 잃고 오터치도 생긴다.

@@ -18,6 +18,69 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `탐색 포트는 9002이며 TCP와 MOVE UDP 포트와 겹치지 않는다`() {
+        // 확정 스펙: 탐색은 전용 포트를 쓴다. 9001(MOVE 전용, 세션 토큰 검증)에 섞으면
+        // "UDP는 MOVE만"이라는 AGENTS.md 섹션 4 원칙이 무너진다.
+        assertEquals(9002, GestureConfig.DISCOVERY_PORT)
+        assertTrue(GestureConfig.DISCOVERY_PORT != GestureConfig.UDP_PORT)
+        assertTrue(GestureConfig.DISCOVERY_PORT != GestureConfig.DEFAULT_PORT)
+    }
+
+    @Test
+    fun `탐색 상수는 확정 스펙 값과 일치한다`() {
+        assertEquals(1500L, GestureConfig.DISCOVERY_TIMEOUT_MS)
+        assertEquals(3, GestureConfig.DISCOVERY_PROBE_COUNT)
+        assertEquals(300L, GestureConfig.DISCOVERY_PROBE_INTERVAL_MS)
+        assertEquals(8, GestureConfig.DISCOVERY_MAX_RESULTS)
+        // 서버도 같은 값으로 이름을 자른다 (양쪽 동시 갱신 대상)
+        assertEquals(64, GestureConfig.DISCOVERY_MAX_NAME_LENGTH)
+    }
+
+    @Test
+    fun `마지막 재전송 뒤에도 응답을 기다릴 시간이 남는다`() {
+        // 이 불변식이 깨지면 마지막 브로드캐스트가 나가는 순간(또는 나가지도 못하고) 창이 닫혀
+        // 재전송이 유실 대비 장치로서 무의미해진다.
+        val lastProbeAt =
+            (GestureConfig.DISCOVERY_PROBE_COUNT - 1) * GestureConfig.DISCOVERY_PROBE_INTERVAL_MS
+        assertTrue("마지막 재전송이 창 밖이다", lastProbeAt < GestureConfig.DISCOVERY_TIMEOUT_MS)
+        // 왕복 여유: 마지막 재전송 후 최소 한 번의 폴링 주기 이상은 남아야 한다.
+        assertTrue(
+            GestureConfig.DISCOVERY_TIMEOUT_MS - lastProbeAt >
+                GestureConfig.DISCOVERY_RECEIVE_POLL_MS
+        )
+    }
+
+    @Test
+    fun `수신 폴링 간격은 0이 아니고 총 창보다 짧다`() {
+        // 0은 소켓 soTimeout에서 "무한 대기"를 의미한다 — 블로킹 receive가 취소로 풀리지 않는데
+        // 무한 대기까지 걸리면 화면을 떠난 뒤에도 소켓이 남는다.
+        assertTrue(GestureConfig.DISCOVERY_RECEIVE_POLL_MS > 0)
+        assertTrue(
+            GestureConfig.DISCOVERY_RECEIVE_POLL_MS < GestureConfig.DISCOVERY_TIMEOUT_MS
+        )
+        // 재전송 시각을 놓치지 않으려면 폴링이 재전송 간격보다 촘촘해야 한다.
+        assertTrue(
+            GestureConfig.DISCOVERY_RECEIVE_POLL_MS <= GestureConfig.DISCOVERY_PROBE_INTERVAL_MS
+        )
+    }
+
+    @Test
+    fun `탐색 재전송은 2회 이상이고 결과 상한은 양수다`() {
+        // 1회면 UDP 단발 유실이 곧 탐색 실패다.
+        assertTrue(GestureConfig.DISCOVERY_PROBE_COUNT >= 2)
+        assertTrue(GestureConfig.DISCOVERY_MAX_RESULTS > 0)
+        assertTrue(GestureConfig.DISCOVERY_MAX_NAME_LENGTH > 0)
+    }
+
+    @Test
+    fun `탐색 창은 연결 타임아웃보다 짧다`() {
+        // 탐색은 "잠깐 훑어보는" 동작이다. 연결 시도보다 오래 걸리면 수동 입력이 더 빨라진다.
+        assertTrue(
+            GestureConfig.DISCOVERY_TIMEOUT_MS < GestureConfig.CONNECT_TIMEOUT_MS.toLong()
+        )
+    }
+
+    @Test
     fun `세션 핸드셰이크 타임아웃은 양수다`() {
         assertTrue(GestureConfig.SESSION_HANDSHAKE_TIMEOUT_MS > 0)
     }

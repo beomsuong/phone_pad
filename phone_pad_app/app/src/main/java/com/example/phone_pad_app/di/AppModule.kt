@@ -1,7 +1,9 @@
 package com.example.phone_pad_app.di
 
 import com.example.phone_pad_app.data.repository.DataStoreSettingsRepository
+import com.example.phone_pad_app.data.repository.ServerDiscoveryRepositoryImpl
 import com.example.phone_pad_app.data.repository.TrackpadRepositoryImpl
+import com.example.phone_pad_app.domain.repository.ServerDiscoveryRepository
 import com.example.phone_pad_app.domain.repository.SettingsRepository
 import com.example.phone_pad_app.domain.repository.TrackpadRepository
 import dagger.Binds
@@ -26,4 +28,11 @@ abstract class AppModule {
     abstract fun bindSettingsRepository(
         impl: DataStoreSettingsRepository
     ): SettingsRepository
+
+    /** 서버 자동 탐색(UDP 9002 브로드캐스트) 저장소. 연결 저장소와 별개다. */
+    @Binds
+    @Singleton
+    abstract fun bindServerDiscoveryRepository(
+        impl: ServerDiscoveryRepositoryImpl
+    ): ServerDiscoveryRepository
 }

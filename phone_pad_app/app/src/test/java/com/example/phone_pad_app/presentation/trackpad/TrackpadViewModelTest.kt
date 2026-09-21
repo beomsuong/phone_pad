@@ -3,6 +3,7 @@ package com.example.phone_pad_app.presentation.trackpad
 import com.example.phone_pad_app.domain.model.ConnectionState
 import com.example.phone_pad_app.domain.model.TrackpadEvent
 import com.example.phone_pad_app.domain.repository.TrackpadRepository
+import com.example.phone_pad_app.domain.usecase.DiscoverServersUseCase
 import com.example.phone_pad_app.domain.usecase.SendEventUseCase
 import io.mockk.coVerify
 import io.mockk.every
@@ -31,13 +32,19 @@ class TrackpadViewModelTest {
     private val repository: TrackpadRepository = mockk(relaxed = true)
     private val sendEventUseCase: SendEventUseCase = mockk(relaxed = true)
 
+    /**
+     * 자동 탐색은 이 파일의 관심사가 아니라 relaxed 목으로 둔다 —
+     * 정책은 [TrackpadViewModelDiscoveryTest]가 고정한다.
+     */
+    private val discoverServersUseCase: DiscoverServersUseCase = mockk(relaxed = true)
+
     private lateinit var viewModel: TrackpadViewModel
 
     @Before
     fun setUp() {
         Dispatchers.setMain(dispatcher)
         every { repository.connectionState } returns MutableStateFlow(ConnectionState.Disconnected)
-        viewModel = TrackpadViewModel(sendEventUseCase, repository)
+        viewModel = TrackpadViewModel(sendEventUseCase, repository, discoverServersUseCase)
     }
 
     @After
