@@ -6,6 +6,7 @@ import sys
 import threading
 import uuid
 
+import discovery
 import logging_setup
 import single_instance
 import tray
@@ -224,12 +225,18 @@ class ServerRuntime:
         udp_port: int = UDP_PORT,
         accept_timeout: float = ACCEPT_TIMEOUT_S,
         stop_event: threading.Event = None,
+        discovery_port: int = None,
     ):
         self.controller = controller
         self.registry = registry
         self.host = host
         self.requested_tcp_port = tcp_port
         self.requested_udp_port = udp_port
+        # 탐색 응답자는 **기본 비활성**이다. 기본값을 9002 로 두면 테스트가
+        # ServerRuntime 을 만들 때마다 실제 포트를 잡으려 들어, 서버가 떠 있는
+        # 동안 무관한 테스트가 깨진다. main() 만 이 값을 넘긴다.
+        self.requested_discovery_port = discovery_port
+        self.discovery = None
         self.accept_timeout = accept_timeout
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         # 바인드가 끝나고 accept 루프에 진입했음을 알리는 신호 (테스트/기동 동기화용)
@@ -279,6 +286,14 @@ class ServerRuntime:
         self._udp_thread.start()
         print(f"Phone Pad Server listening on UDP port {self.udp_port} (MOVE only) ...")
         print(f"Phone Pad Server listening on TCP port {self.tcp_port} ...")
+        if self.requested_discovery_port is not None:
+            # 바인딩 실패는 서버 기동을 막지 않는다 (응답자가 로그만 남기고 꺼진다).
+            self.discovery = discovery.DiscoveryResponder(
+                tcp_port=self.tcp_port,
+                host=self.host,
+                discovery_port=self.requested_discovery_port,
+            )
+            self.discovery.start()
         self.ready.set()
         try:
             while not self.stop_event.is_set():
@@ -308,10 +323,16 @@ class ServerRuntime:
     def stop(self):
         """정지 요청. 아무 스레드에서나 호출 가능."""
         self.stop_event.set()
+        responder = self.discovery
+        if responder is not None:
+            responder.stop()
 
     def close(self):
         """리슨 소켓과 UDP 소켓을 닫는다. 여러 번 호출해도 안전하다."""
         self.ready.clear()
+        responder, self.discovery = self.discovery, None
+        if responder is not None:
+            responder.stop()
         for sock in (self.tcp_socket, self.udp_socket):
             if sock is None:
                 continue
@@ -407,6 +428,11 @@ def parse_args(argv=None):
         action="store_true",
         help="skip the single-instance guard (development/debugging only)",
     )
+    parser.add_argument(
+        "--no-discovery",
+        action="store_true",
+        help="disable UDP broadcast server discovery (port %d)" % discovery.DISCOVERY_PORT,
+    )
     return parser.parse_args(argv)
 
 
@@ -440,9 +466,15 @@ def main(argv=None) -> int:
         )
         use_tray = False
 
+    runtime = ServerRuntime(
+        controller,
+        registry,
+        discovery_port=None if args.no_discovery else discovery.DISCOVERY_PORT,
+    )
+
     if use_tray:
-        return run_with_tray(controller, registry)
-    return run_console(controller, registry)
+        return run_with_tray(controller, registry, runtime)
+    return run_console(controller, registry, runtime)
 
 
 if __name__ == "__main__":
