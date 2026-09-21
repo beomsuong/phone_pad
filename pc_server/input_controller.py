@@ -3,6 +3,7 @@ import threading
 import time
 
 INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -13,6 +14,24 @@ MOUSEEVENTF_HWHEEL = 0x1000
 
 # 휠 한 노치(클릭) 단위. Windows 표준값.
 WHEEL_DELTA = 120
+
+# --- 키보드 주입 (가상 데스크톱 전환) ---------------------------------------
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+
+VK_LWIN = 0x5B
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
+VK_LCONTROL = 0xA2
+
+# 와이어의 direction -> 화살표 가상 키. **소문자 정확 일치만 허용**한다
+# (AGENTS.md 섹션 4 / 요청 스펙: 그 외 값은 조용히 무시).
+# direction 은 "전환 결과의 방향"이며, 손가락 방향 -> 이 값의 매핑은 Android 한
+# 곳에서만 한다. 서버는 받은 값을 그대로 키 조합으로 바꿀 뿐이다.
+DESKTOP_SWITCH_VK = {
+    "left": VK_LEFT,
+    "right": VK_RIGHT,
+}
 
 # 같은 종류의 주입 실패는 이 간격(초) 안에서 로그를 한 줄만 남긴다.
 # MOVE 는 초당 수십 번 들어오므로(AGENTS.md 섹션 4) 입력이 막힌 동안 실패를
@@ -47,8 +66,22 @@ class MOUSEINPUT(ctypes.Structure):
     ]
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
 class _INPUTunion(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT)]
+    # KEYBDINPUT 은 MOUSEINPUT 보다 작으므로(24 < 32 on x64) union 크기가 변하지
+    # 않는다 = `ctypes.sizeof(INPUT)` 불변. 이 크기는 `SendInput` 의 세 번째
+    # 인자라서, 바뀌면 마우스까지 포함해 **모든 주입이 통째로 실패**한다.
+    # 테스트(`test_input_struct_size_is_unchanged_by_keyboard_support`)로 고정한다.
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
 
 
 class INPUT(ctypes.Structure):
@@ -163,6 +196,10 @@ class InputController:
             self._drag_start()
         elif t == "DRAG_END":
             self._drag_end()
+        elif t == "DESKTOP_SWITCH":
+            # direction 은 "전환 결과의 방향"("left"/"right"). 값이 이상하면
+            # _desktop_switch 가 아무 키도 보내지 않고 False 를 돌려준다.
+            self._desktop_switch(event.get("direction"))
 
     def _move(self, dx: int, dy: int) -> bool:
         inp = INPUT(
@@ -307,3 +344,87 @@ class InputController:
             ]
         )
         return self._send_input(4, inputs, "DOUBLE_CLICK")
+
+    @staticmethod
+    def _key_input(vk: int, keyup: bool = False, extended: bool = False) -> INPUT:
+        """키보드 INPUT 하나를 만든다.
+
+        `wScan` 은 쓰지 않는다(가상 키 코드 방식). 화살표 키는 확장 키이므로
+        `KEYEVENTF_EXTENDEDKEY` 가 반드시 붙어야 하며, 빠지면 일부 환경에서
+        넘패드 방향키로 해석되어 데스크톱 전환이 먹지 않는다.
+        """
+        flags = 0
+        if extended:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        if keyup:
+            flags |= KEYEVENTF_KEYUP
+        return INPUT(
+            type=INPUT_KEYBOARD,
+            _input=_INPUTunion(ki=KEYBDINPUT(wVk=vk, dwFlags=flags)),
+        )
+
+    def _desktop_switch(self, direction) -> bool:
+        """가상 데스크톱 전환(Ctrl+Win+Left / Ctrl+Win+Right).
+
+        `direction` 은 **"전환 결과의 방향"**이며 `"left"`/`"right"` 소문자 정확
+        일치만 받는다. 누락/None/숫자/`"LEFT"` 같은 값은 **아무 키도 보내지 않고**
+        조용히 False (예외 전파 금지 - 세션이 끊기면 안 된다).
+
+        6개 INPUT 을 `SendInput` **1회**로 원자적으로 보낸다. 나눠 보내면 그 사이에
+        다른 입력(특히 UDP MOVE)이 끼어들어 수정 키가 눌린 상태로 다른 동작이
+        발생할 수 있다.
+        """
+        vk_arrow = DESKTOP_SWITCH_VK.get(direction) if isinstance(direction, str) else None
+        if vk_arrow is None:
+            return False
+
+        # Ctrl down -> Win down -> Arrow down -> Arrow up -> Win up -> Ctrl up
+        sequence = (
+            (VK_LCONTROL, False, False),
+            (VK_LWIN, False, False),
+            (vk_arrow, False, True),
+            (vk_arrow, True, True),
+            (VK_LWIN, True, False),
+            (VK_LCONTROL, True, False),
+        )
+        inputs = (INPUT * len(sequence))(
+            *[self._key_input(vk, keyup, extended) for vk, keyup, extended in sequence]
+        )
+        # 부분 주입이면 Ctrl/Win 이 눌린 채 남을 수 있다. Win 키 고착이 최악의
+        # 결과(시작 메뉴가 열리고 이후 모든 타이핑이 단축키가 된다)이므로 키 업을
+        # 한 번만 더 밀어 넣는다. `_send_input` 이 **예외를 던지는 경로**(SendInput
+        # 자체의 OSError, 또는 부분 주입 직후 실패 기록 안에서의 예외)에서도 정리가
+        # 돌아야 하므로 반환값 분기가 아니라 finally 로 보장한다 - 정리가 가장
+        # 필요한 순간이 바로 "일부만 주입되고 예외가 난" 순간이다.
+        succeeded = False
+        try:
+            succeeded = self._send_input(len(sequence), inputs, "DESKTOP_SWITCH")
+        finally:
+            if not succeeded:
+                self._release_desktop_switch_keys(vk_arrow)
+        return succeeded
+
+    def _release_desktop_switch_keys(self, vk_arrow: int) -> None:
+        """수정 키 고착 방지용 best-effort 정리. 누른 역순으로 키 업 3개.
+
+        키 업은 눌리지 않은 키에 보내도 무해하다. 재귀/재시도는 하지 않으며
+        (실패가 계속되는 상황에서 무한히 도는 것을 막는다), 이 호출에서 나는 어떤
+        예외도 삼킨다 - 원래 실패 처리(False 반환)에 영향을 주면 안 된다.
+        """
+        try:
+            releases = (
+                (vk_arrow, True),
+                (VK_LWIN, False),
+                (VK_LCONTROL, False),
+            )
+            inputs = (INPUT * len(releases))(
+                *[
+                    self._key_input(vk, keyup=True, extended=extended)
+                    for vk, extended in releases
+                ]
+            )
+            self._send_input(len(releases), inputs, "DESKTOP_SWITCH_CLEANUP")
+        except Exception:
+            # 정리 실패는 로그조차 남기지 않는다 - 이미 실패 경로이고, 여기서
+            # 예외가 새면 handle_event 를 부른 쪽이 이벤트 하나 때문에 흔들린다.
+            pass
