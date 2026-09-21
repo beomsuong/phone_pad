@@ -43,6 +43,39 @@ object GestureConfig {
     const val DOUBLE_POINTER_COUNT = 2
 
     /**
+     * 3손가락 구간으로 판정할 동시 포인터 개수.
+     *
+     * **정확히** 이 개수인 구간에서만 수평 스와이프가 `DESKTOP_SWITCH`로 해석된다(4손가락은 범위 밖).
+     * 동시에 "이 개수 **이상**이 한 번이라도 눌렸는가"는 제스처 단위 래치의 조건이기도 하다 —
+     * 래치가 걸리면 그 제스처가 끝날 때까지 MOVE/SCROLL/클릭이 전부 억제된다
+     * ([MultiTouchGestureTracker][com.example.phone_pad_app.presentation.trackpad.MultiTouchGestureTracker] 참조).
+     */
+    const val THREE_POINTER_COUNT = 3
+
+    /**
+     * 3손가락 수평 스와이프를 데스크톱 전환으로 인정할 최소 이동 거리 (px).
+     *
+     * 구간 시작 centroid로부터의 **수평** 이동 거리이며, 이 거리를 넘는 순간(손을 뗄 때가 아니라)
+     * 곧바로 `DESKTOP_SWITCH`가 한 번 나간다.
+     *
+     * 기본값 120px의 근거:
+     * - 반드시 [TAP_MAX_DISTANCE_PX](20px)보다 **충분히** 커야 한다. 데스크톱 전환은 되돌리기
+     *   번거로운 전역 동작이라, 3손가락을 내려놓다 생기는 미세한 어긋남이나 손떨림이 전환으로
+     *   새면 안 된다. 탭 한계의 6배로 두어 "의도적으로 쓸었다"는 것이 분명할 때만 발사한다.
+     * - 한 구간에 한 번만 발사되므로(반복 전환 금지) 값을 넉넉히 잡아도 연속 전환이
+     *   불가능해지지는 않는다 — 손을 떼었다 다시 쓸면 새 구간이 된다.
+     */
+    const val THREE_FINGER_SWIPE_MIN_DISTANCE_PX = 120f
+
+    /**
+     * 3손가락 스와이프를 "수평"으로 인정할 우세 배수 — `|dx| >= 배수 * |dy|` 일 때만 인정한다.
+     *
+     * 대각선·수직 스와이프(작업 보기 등 다른 제스처의 자리)를 좌/우 전환으로 오인하지 않기 위한
+     * 조건이다. 2배는 약 26.6도 안쪽의 스와이프만 수평으로 본다는 뜻이다.
+     */
+    const val THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE = 2f
+
+    /**
      * 휠 스크롤 1스텝(노치)에 해당하는 centroid 이동 거리 (px).
      *
      * 2손가락 드래그의 픽셀 이동을 `{"type":"SCROLL","dx":..,"dy":..}`의 정수 스텝으로 나눌 때 쓰는

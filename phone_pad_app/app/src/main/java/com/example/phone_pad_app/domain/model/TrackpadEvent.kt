@@ -50,4 +50,22 @@ sealed class TrackpadEvent {
      * (서버도 TCP 연결이 끊길 때 강제로 버튼을 놓는 안전장치를 따로 가진다).
      */
     object DragEnd : TrackpadEvent()
+
+    /**
+     * 3손가락 수평 스와이프로 만들어진 가상 데스크톱 전환.
+     * `{"type":"DESKTOP_SWITCH","direction":"left"}` (TCP, AGENTS.md 섹션 4)
+     *
+     * [direction]은 **손가락이 움직인 방향이 아니라 "전환 결과의 방향"** 이다
+     * ([MultiTouchGestureTracker.DIRECTION_LEFT][com.example.phone_pad_app.presentation.trackpad.MultiTouchGestureTracker.DIRECTION_LEFT] /
+     * [DIRECTION_RIGHT][com.example.phone_pad_app.presentation.trackpad.MultiTouchGestureTracker.DIRECTION_RIGHT]):
+     * 서버는 받은 값을 `Ctrl+Win+Left` / `Ctrl+Win+Right`로 옮기기만 한다.
+     *
+     * 손가락 방향 → 와이어 방향 뒤집기는 **Android의 판정기 한 곳에서만** 한다
+     * (`MultiTouchGestureTracker`). 양쪽이 각자 뒤집으면 원위치가 되므로, 스크롤 방향 규약
+     * (AGENTS.md 섹션 10)과 같은 원칙으로 매핑 지점을 하나로 못 박는다.
+     *
+     * CLICK/DOUBLE_CLICK과 같은 등급의 저빈도 · 사용자 명시 이벤트라 전송 실패를 조용히
+     * 버리지 않는다(MOVE/SCROLL과 다름).
+     */
+    data class DesktopSwitch(val direction: String) : TrackpadEvent()
 }

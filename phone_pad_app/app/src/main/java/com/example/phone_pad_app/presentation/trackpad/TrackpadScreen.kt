@@ -113,6 +113,7 @@ fun TrackpadScreen(
             onClick = viewModel::sendClick,
             onDoubleClick = viewModel::sendDoubleClick,
             onRightClick = viewModel::sendRightClick,
+            onDesktopSwitch = viewModel::sendDesktopSwitch,
             onDragStart = viewModel::sendDragStart,
             onDragEnd = viewModel::sendDragEnd,
             onDisconnect = viewModel::disconnect,
@@ -225,6 +226,7 @@ private fun TrackpadSurface(
     onClick: () -> Unit,
     onDoubleClick: () -> Unit,
     onRightClick: () -> Unit,
+    onDesktopSwitch: (String) -> Unit,
     onDragStart: () -> Unit,
     onDragEnd: () -> Unit,
     onDisconnect: () -> Unit,
@@ -370,6 +372,26 @@ private fun TrackpadSurface(
                                     timestampMs = lastTimestamp,
                                 )
 
+                                // 3번째 손가락이 닿는 순간 = 이 제스처는 더 이상 탭 계열이 아니다.
+                                // 대기 중인 지연 클릭을 취소가 아니라 지금 발사하고(F-1/F-3과 같은
+                                // 이유), 데스크톱 전환을 사이에 둔 무관한 두 탭이 더블탭으로 묶이지
+                                // 않도록 감지기도 리셋한다(F-4와 같은 이유).
+                                // 진행 중이던 드래그 홀드는 위 handleDragHold가 손가락 개수 변화로
+                                // 이미 DRAG_END를 냈고, DragHoldDetector는 같은 제스처 안에서
+                                // 재무장하지 않는다(기존 규칙).
+                                if (decision.pointerCount >= GestureConfig.THREE_POINTER_COUNT) {
+                                    flushPendingClick()
+                                    doubleTapDetector.reset()
+                                }
+
+                                val desktopSwitch = decision.desktopSwitch
+                                if (desktopSwitch != null) {
+                                    // 방향은 트래커가 이미 "전환 결과의 방향"으로 뒤집어 놓았다 —
+                                    // 여기서 다시 손대면 매핑이 두 곳으로 갈라진다.
+                                    onDesktopSwitch(desktopSwitch)
+                                    pressed.forEach { it.consume() }
+                                }
+
                                 val move = decision.move
                                 val scroll = decision.scroll
                                 if (move != null || scroll != null) {
@@ -460,7 +482,8 @@ private fun TrackpadSurface(
 
         Text(
             text = "터치하여 커서 이동\n탭으로 클릭\n더블탭으로 더블클릭\n" +
-                "길게 눌렀다 움직여 드래그\n두 손가락 탭으로 우클릭\n두 손가락 드래그로 스크롤",
+                "길게 눌렀다 움직여 드래그\n두 손가락 탭으로 우클릭\n두 손가락 드래그로 스크롤\n" +
+                "세 손가락으로 좌우로 쓸어 데스크톱 전환",
             color = Color.White.copy(alpha = 0.15f),
             modifier = Modifier.align(Alignment.Center),
             fontSize = 16.sp,

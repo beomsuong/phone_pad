@@ -128,6 +128,21 @@ class TrackpadViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 3손가락 수평 스와이프 → 가상 데스크톱 전환.
+     * `{"type":"DESKTOP_SWITCH","direction":"left"}` (TCP)
+     *
+     * [direction]은 **전환 결과의 방향**([MultiTouchGestureTracker.DIRECTION_LEFT] /
+     * [MultiTouchGestureTracker.DIRECTION_RIGHT])이다. 손가락 방향 → 와이어 방향 뒤집기는
+     * [MultiTouchGestureTracker]가 이미 끝낸 뒤라 여기서는 그대로 전달만 한다 —
+     * 이 계층이 한 번 더 뒤집으면 매핑이 두 곳으로 갈라진다.
+     */
+    fun sendDesktopSwitch(direction: String) {
+        viewModelScope.launch {
+            runCatching { sendEventUseCase(TrackpadEvent.DesktopSwitch(direction)) }
+        }
+    }
+
     /** 2손가락 탭 → 우클릭. `{"type":"CLICK","button":"right"}` (TCP) */
     fun sendRightClick() {
         viewModelScope.launch {

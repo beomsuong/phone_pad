@@ -142,6 +142,41 @@ class TrackpadViewModelTest {
     }
 
     @Test
+    fun `sendDesktopSwitch는 DESKTOP_SWITCH 이벤트를 UseCase로 보낸다`() {
+        viewModel.sendDesktopSwitch(MultiTouchGestureTracker.DIRECTION_RIGHT)
+
+        coVerify(exactly = 1) {
+            sendEventUseCase(TrackpadEvent.DesktopSwitch(direction = "right"))
+        }
+        // 데스크톱 전환은 클릭/이동 계열로 번역되지 않는다
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Click::class)) }
+        coVerify(exactly = 0) { sendEventUseCase(ofType(TrackpadEvent.Move::class)) }
+    }
+
+    @Test
+    fun `sendDesktopSwitch는 방향을 뒤집지 않고 트래커가 준 값을 그대로 넘긴다`() {
+        // 뒤집기는 MultiTouchGestureTracker 한 곳에서만 한다 — 이 계층이 한 번 더 뒤집으면
+        // 서버와 방향이 어긋난다(AGENTS.md 섹션 10 "스크롤 방향 규약"과 같은 원칙).
+        viewModel.sendDesktopSwitch(MultiTouchGestureTracker.DIRECTION_LEFT)
+        viewModel.sendDesktopSwitch(MultiTouchGestureTracker.DIRECTION_RIGHT)
+
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DesktopSwitch("left")) }
+        coVerify(exactly = 1) { sendEventUseCase(TrackpadEvent.DesktopSwitch("right")) }
+    }
+
+    @Test
+    fun `판정기의 방향 상수와 도메인 이벤트의 direction 값이 같다`() {
+        assertEquals(
+            MultiTouchGestureTracker.DIRECTION_LEFT,
+            TrackpadEvent.DesktopSwitch(MultiTouchGestureTracker.DIRECTION_LEFT).direction,
+        )
+        assertEquals(
+            MultiTouchGestureTracker.DIRECTION_RIGHT,
+            TrackpadEvent.DesktopSwitch(MultiTouchGestureTracker.DIRECTION_RIGHT).direction,
+        )
+    }
+
+    @Test
     fun `sendMove는 MOVE 이벤트를 보낸다 - 클릭 경로와 섞이지 않는다`() {
         viewModel.sendMove(1.5f, -2f)
 

@@ -2,6 +2,7 @@ package com.example.phone_pad_app.presentation.trackpad
 
 import com.example.phone_pad_app.domain.model.GestureSettings
 import com.example.phone_pad_app.presentation.util.GestureConfig
+import kotlin.math.abs
 import kotlin.math.hypot
 
 /** 트래커가 방출하기로 결정한 커서 이동 델타 (이미 이동 감도 배율이 곱해진 값). */
@@ -24,12 +25,19 @@ data class ScrollDelta(val dx: Int, val dy: Int)
  * @param move null이 아니면 그대로 `onMove(dx, dy)`를 호출하고 포인터 변화를 consume 한다.
  * @param scroll null이 아니면 그대로 `onScroll(dx, dy)`를 호출한다. [move]와 동시에 non-null이 되는
  *        일은 없다 — MOVE는 1손가락 구간, SCROLL은 2손가락 구간 전용이기 때문이다.
+ * @param desktopSwitch null이 아니면 그대로 `onDesktopSwitch(direction)`를 호출한다. 값은
+ *        `{"type":"DESKTOP_SWITCH","direction":...}`의 `direction` 필드와 같은 어휘
+ *        ([MultiTouchGestureTracker.DIRECTION_LEFT] / [MultiTouchGestureTracker.DIRECTION_RIGHT])이며
+ *        **전환 결과의 방향**이다(손가락 방향이 아니다 — 뒤집기는 트래커 안에서 끝난다).
+ *        [move]/[scroll]과 동시에 non-null이 되는 일은 없다 — 3손가락이 한 번이라도 눌리면
+ *        그 제스처의 MOVE/SCROLL이 전부 억제되기 때문이다(아래 3손가락 래치).
  * @param segmentStarted 이 이벤트에서 새 구간이 시작됐는지 (최초 down 또는 손가락 개수 변화에 의한 재시작).
  * @param pointerCount 이 이벤트 시점에 눌려 있던 포인터 개수.
  */
 data class GestureDecision(
     val move: MoveDelta? = null,
     val scroll: ScrollDelta? = null,
+    val desktopSwitch: String? = null,
     val segmentStarted: Boolean = false,
     val pointerCount: Int = 0,
 )
@@ -64,7 +72,16 @@ data class GestureEndDecision(
  * - 손가락 개수가 바뀌면 진행 중이던 구간을 취소하고 그 시점 좌표/시각으로 새 구간을 시작한다.
  * - MOVE는 1손가락 구간에서만 방출한다.
  * - SCROLL은 2손가락 구간에서, 그 구간이 `isDrag`(누적 이동이 [GestureConfig.TAP_MAX_DISTANCE_PX] 초과)가
- *   된 이후에만 방출한다. 3손가락 이상 구간은 여전히 추적만 한다.
+ *   된 이후에만 방출한다.
+ * - DESKTOP_SWITCH는 **정확히 [GestureConfig.THREE_POINTER_COUNT]손가락인 구간**에서, 구간 시작
+ *   centroid 대비 수평 이동이 [GestureConfig.THREE_FINGER_SWIPE_MIN_DISTANCE_PX] 이상이고
+ *   [GestureConfig.THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE]배 수평 우세일 때 **임계를 넘는 그
+ *   프레임에 즉시, 구간당 한 번만** 방출한다(계속 밀어도 반복 전환하지 않는다).
+ * - **3손가락 래치:** 한 제스처(첫 down ~ 모든 손가락 up) 안에서 포인터가 한 번이라도
+ *   [GestureConfig.THREE_POINTER_COUNT]개 이상이 되면, 그 제스처의 나머지 동안 MOVE·SCROLL·클릭을
+ *   전부 억제하고 DESKTOP_SWITCH만 허용한다. 3손가락을 어긋나게 떼면 `3→2→1→0` 꼬리가 생기는데,
+ *   그 꼬리가 [GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS] 밖이면 "정상 탭"으로 보여 스와이프
+ *   직후에 좌/우클릭이 새기 때문이다. 유예 시간 튜닝이 아니라 제스처 단위 래치로 원천 차단한다.
  * - 제스처 종료 시 탭 분류는 마지막 구간의 손가락 개수를 기준으로 한다:
  *   1손가락 탭 → 좌클릭, 2손가락 탭 → 우클릭, 그 외 → 클릭 없음.
  * - 단, 마지막 구간이 **포인터 개수 감소**로 시작됐고 [GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS]
@@ -128,6 +145,23 @@ class MultiTouchGestureTracker(
     private var hasSegment = false
 
     /**
+     * 이 **구간**에서 이미 DESKTOP_SWITCH를 방출했는지.
+     *
+     * 한 구간(3손가락을 유지하는 동안)에 최대 1회 — 임계를 넘긴 뒤 계속 밀어도 데스크톱이
+     * 계속 넘어가면 안 된다. 구간이 새로 시작되면(3→2→3 등) 다시 1회 가능하다.
+     */
+    private var desktopSwitchEmittedInSegment = false
+
+    /**
+     * 이 **제스처**에서 포인터가 한 번이라도 3개 이상이었는지 (3손가락 래치).
+     *
+     * 구간이 아니라 제스처 단위다 — 3손가락을 어긋나게 떼며 생기는 `3→2→1→0` 꼬리를
+     * 통째로 무력화하는 것이 목적이라, 구간 단위였다면 꼬리마다 다시 풀려 의미가 없다.
+     * [reset]/[onGestureEnd] 전까지 유지된다.
+     */
+    private var threeFingerLatched = false
+
+    /**
      * 직전 구간의 요약 — 손가락을 어긋나게 떼서 생기는 짧은 꼬리 구간을 보정할 때만 사용한다.
      * ([GestureConfig.MULTI_TOUCH_RELEASE_GRACE_MS] 참조)
      */
@@ -157,6 +191,11 @@ class MultiTouchGestureTracker(
             return GestureDecision(pointerCount = 0)
         }
 
+        // 3손가락 래치: 한 번 걸리면 이 제스처가 끝날 때까지 풀리지 않는다.
+        if (pointerCount >= GestureConfig.THREE_POINTER_COUNT) {
+            threeFingerLatched = true
+        }
+
         // 최초 시작이거나 손가락 개수가 바뀌었으면 진행 중이던 분류를 버리고 새 구간을 시작한다.
         if (!hasSegment || pointerCount != segmentPointerCount) {
             startSegment(pointerCount, x, y, timestampMs)
@@ -183,7 +222,9 @@ class MultiTouchGestureTracker(
         }
 
         // 1손가락 구간에서만 커서 이동을 방출한다. 멀티터치 구간은 추적만 한다.
+        // 래치가 걸렸으면(이 제스처에 3손가락이 있었으면) 1손가락으로 줄어든 꼬리에서도 방출하지 않는다.
         val move = if (
+            !threeFingerLatched &&
             pointerCount == GestureConfig.SINGLE_POINTER_COUNT &&
             totalMoved > GestureConfig.MOVE_MIN_DISTANCE_PX
         ) {
@@ -197,13 +238,55 @@ class MultiTouchGestureTracker(
 
         // 2손가락 구간이 드래그로 확정된 뒤부터 centroid 이동을 휠 스텝으로 방출한다.
         // isDrag를 기준으로 삼으므로 2손가락 탭(우클릭, isDrag=false로 끝남)과 상호 배타적이다.
-        val scroll = if (pointerCount == GestureConfig.DOUBLE_POINTER_COUNT && isDrag) {
+        val scroll = if (
+            !threeFingerLatched &&
+            pointerCount == GestureConfig.DOUBLE_POINTER_COUNT &&
+            isDrag
+        ) {
             accumulateScroll(dx, dy)
         } else {
             null
         }
 
-        return GestureDecision(move = move, scroll = scroll, pointerCount = pointerCount)
+        // 정확히 3손가락인 구간에서만 데스크톱 전환을 판정한다 (4손가락은 범위 밖 —
+        // 래치 때문에 아무 이벤트도 나가지 않는다).
+        val desktopSwitch = if (pointerCount == GestureConfig.THREE_POINTER_COUNT) {
+            resolveDesktopSwitch(x, y)
+        } else {
+            null
+        }
+
+        return GestureDecision(
+            move = move,
+            scroll = scroll,
+            desktopSwitch = desktopSwitch,
+            pointerCount = pointerCount,
+        )
+    }
+
+    /**
+     * 구간 시작 centroid 대비 수평 이동이 임계를 넘겼으면 **전환 결과의 방향**을 돌려준다.
+     * 이미 이 구간에서 한 번 방출했거나, 거리가 모자라거나, 수평 우세가 아니면 null.
+     *
+     * 방향 뒤집기가 여기서 끝난다 (Windows 정밀 터치패드 관례):
+     * 손가락이 왼쪽으로 가면 콘텐츠가 밀려나며 **오른쪽** 데스크톱이 드러난다.
+     * 서버는 이 매핑을 모르고 받은 값을 키 조합으로 옮기기만 한다 — 양쪽이 각자 뒤집으면
+     * 원위치가 되므로 매핑 지점은 이 한 곳뿐이다.
+     */
+    private fun resolveDesktopSwitch(x: Float, y: Float): String? {
+        if (desktopSwitchEmittedInSegment) return null
+
+        val totalDx = x - segmentStartX
+        val totalDy = y - segmentStartY
+        val horizontal = abs(totalDx)
+        if (horizontal < GestureConfig.THREE_FINGER_SWIPE_MIN_DISTANCE_PX) return null
+        // 대각선·수직 스와이프는 좌/우 전환으로 해석하지 않는다.
+        if (horizontal < GestureConfig.THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE * abs(totalDy)) {
+            return null
+        }
+
+        desktopSwitchEmittedInSegment = true
+        return if (totalDx < 0f) DIRECTION_RIGHT else DIRECTION_LEFT
     }
 
     /**
@@ -254,6 +337,10 @@ class MultiTouchGestureTracker(
      */
     private fun resolveTap(timestampMs: Long, lastPointerCount: Int): TapResolution {
         if (!hasSegment) return TapResolution(null, 0f, 0f)
+
+        // 3손가락 래치: 이 제스처에 3손가락이 한 번이라도 있었다면 어떤 꼬리도 탭이 아니다.
+        // (3손가락 "탭" 자체도 클릭이 아니므로, 스와이프 유무와 무관하게 무이벤트가 맞다.)
+        if (threeFingerLatched) return TapResolution(null, segmentStartX, segmentStartY)
 
         // F-2: 직전 구간이 이미 드래그/스크롤이었다면, 손가락을 마저 떼는 짧은 꼬리는
         // 새 탭으로 재해석하지 않는다 — 유예 시간 안에 끝났는지와 무관하게 무조건 무시.
@@ -312,6 +399,8 @@ class MultiTouchGestureTracker(
         isDrag = false
         scrollRemainderX = 0f
         scrollRemainderY = 0f
+        desktopSwitchEmittedInSegment = false
+        threeFingerLatched = false
         hasPrevSegment = false
         prevPointerCount = 0
         prevStartTimeMs = 0L
@@ -339,6 +428,9 @@ class MultiTouchGestureTracker(
         isDrag = false
         scrollRemainderX = 0f
         scrollRemainderY = 0f
+        // 구간 단위 — 3→2→3처럼 구간이 새로 시작되면 다시 한 번 전환할 수 있다.
+        // (제스처 단위인 threeFingerLatched는 여기서 건드리지 않는다.)
+        desktopSwitchEmittedInSegment = false
     }
 
     companion object {
@@ -347,5 +439,17 @@ class MultiTouchGestureTracker(
 
         /** `{"type":"CLICK","button":"right"}` (AGENTS.md 섹션 4) */
         const val BUTTON_RIGHT = "right"
+
+        /**
+         * `{"type":"DESKTOP_SWITCH","direction":"left"}` — **왼쪽 데스크톱으로 전환**
+         * (서버: `Ctrl+Win+Left`). 손가락은 **오른쪽**으로 스와이프한 경우다.
+         */
+        const val DIRECTION_LEFT = "left"
+
+        /**
+         * `{"type":"DESKTOP_SWITCH","direction":"right"}` — **오른쪽 데스크톱으로 전환**
+         * (서버: `Ctrl+Win+Right`). 손가락은 **왼쪽**으로 스와이프한 경우다.
+         */
+        const val DIRECTION_RIGHT = "right"
     }
 }

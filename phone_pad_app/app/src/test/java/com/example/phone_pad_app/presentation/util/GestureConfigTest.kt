@@ -76,6 +76,41 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `3손가락 구간 기준은 3손가락이며 1,2손가락과 구분된다`() {
+        // DESKTOP_SWITCH 판정의 유일한 구간 조건 (AGENTS.md 섹션 5)
+        assertEquals(3, GestureConfig.THREE_POINTER_COUNT)
+        assertTrue(GestureConfig.THREE_POINTER_COUNT > GestureConfig.DOUBLE_POINTER_COUNT)
+        assertTrue(GestureConfig.DOUBLE_POINTER_COUNT > GestureConfig.SINGLE_POINTER_COUNT)
+    }
+
+    @Test
+    fun `3손가락 스와이프 임계는 확정 스펙 값과 일치한다`() {
+        assertEquals(120f, GestureConfig.THREE_FINGER_SWIPE_MIN_DISTANCE_PX, 0.001f)
+        assertEquals(2f, GestureConfig.THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE, 0.001f)
+    }
+
+    @Test
+    fun `3손가락 스와이프 임계는 탭 최대 이동 거리보다 충분히 크다`() {
+        // 데스크톱 전환은 되돌리기 번거로운 전역 동작이다. 3손가락을 내려놓을 때 생기는
+        // 어긋남이나 손떨림(탭 한계 수준)이 전환으로 새면 안 되므로 여유가 커야 한다.
+        assertTrue(
+            GestureConfig.THREE_FINGER_SWIPE_MIN_DISTANCE_PX >
+                GestureConfig.TAP_MAX_DISTANCE_PX * 2f
+        )
+        // 더블탭 허용 거리(탭 한계의 2배)보다도 커야 "확실히 쓸었다"는 신호가 된다.
+        assertTrue(
+            GestureConfig.THREE_FINGER_SWIPE_MIN_DISTANCE_PX >
+                GestureConfig.DOUBLE_TAP_DISTANCE_PX
+        )
+    }
+
+    @Test
+    fun `수평 우세 배수는 1보다 커서 대각선을 실제로 걸러낸다`() {
+        // 1 이하면 |dx| >= |dy|인 45도 대각선까지 좌우 전환으로 해석된다.
+        assertTrue(GestureConfig.THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE > 1f)
+    }
+
+    @Test
     fun `스크롤 1스텝 거리는 탭 최대 이동 거리보다 크다`() {
         // 스크롤은 isDrag(= 탭 최대 이동 거리 초과) 이후에만 시작된다. 스텝 단위가 그보다 작으면
         // 스크롤이 걸리는 순간 이미 1스텝 이상이 쌓여 있어 첫 프레임에 툭 튄다.

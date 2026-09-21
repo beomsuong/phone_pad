@@ -288,6 +288,14 @@ class TrackpadRepositoryImpl @Inject constructor(
                 // 전송 실패를 반드시 Error로 알린다 (서버도 연결 종료 시 강제 해제 안전장치를 가진다).
                 sendOverTcp(DRAG_END_JSON)
             }
+
+            is TrackpadEvent.DesktopSwitch -> {
+                // 이동 좌표가 아니므로 TCP (session 필드 없음, AGENTS.md 섹션 4).
+                // CLICK/DOUBLE_CLICK과 같은 등급(저빈도 · 사용자 명시 행동)이라 전송 실패를
+                // 조용히 버리지 않고 reportConnectionLost로 합류시킨다 — 데스크톱이 안 넘어갔는데
+                // 사용자가 이유를 모르는 상태로 남으면 안 된다.
+                sendOverTcp("""{"type":"DESKTOP_SWITCH","direction":"${event.direction}"}""")
+            }
         }
     }
 

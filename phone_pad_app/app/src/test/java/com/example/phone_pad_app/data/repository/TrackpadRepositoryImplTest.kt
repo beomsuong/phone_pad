@@ -6,6 +6,7 @@ import com.example.phone_pad_app.domain.model.ConnectionErrorKind
 import com.example.phone_pad_app.domain.model.ConnectionState
 import com.example.phone_pad_app.domain.model.ReconnectPolicy
 import com.example.phone_pad_app.domain.model.TrackpadEvent
+import com.example.phone_pad_app.presentation.trackpad.MultiTouchGestureTracker
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import io.mockk.clearMocks
 import io.mockk.coEvery
@@ -242,6 +243,66 @@ class TrackpadRepositoryImplTest {
         repository.sendEvent(TrackpadEvent.DragEnd)
 
         assertEquals(ConnectionState.Error("tcp down", ConnectionErrorKind.CONNECTION_LOST), repository.connectionState.first())
+    }
+
+    @Test
+    fun `DesktopSwitch left는 확정된 와이어 리터럴 그대로 TCP에 나간다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(
+            TrackpadEvent.DesktopSwitch(MultiTouchGestureTracker.DIRECTION_LEFT)
+        )
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        // AGENTS.md 섹션 4의 와이어 포맷을 리터럴로 고정한다 (서버 handle_event와의 계약).
+        // 공백 없음, 필드 순서 type → direction.
+        assertEquals("""{"type":"DESKTOP_SWITCH","direction":"left"}""", json.captured)
+        assertFalse("session 필드가 없는 평문 이벤트다", json.captured.contains("session"))
+        // 이동 좌표가 아니므로 UDP로 새면 안 된다
+        coVerify(exactly = 0) { udpClient.send(any()) }
+    }
+
+    @Test
+    fun `DesktopSwitch right도 같은 형식으로 나간다`() = runTest {
+        connectSuccessfully()
+
+        repository.sendEvent(
+            TrackpadEvent.DesktopSwitch(MultiTouchGestureTracker.DIRECTION_RIGHT)
+        )
+
+        val json = slot<String>()
+        coVerify(exactly = 1) { tcpClient.send(capture(json)) }
+        assertEquals("""{"type":"DESKTOP_SWITCH","direction":"right"}""", json.captured)
+    }
+
+    @Test
+    fun `DesktopSwitch는 direction 값을 뒤집지 않고 그대로 싣는다`() = runTest {
+        // 손가락 방향 → 와이어 방향 매핑은 MultiTouchGestureTracker 한 곳에서만 한다.
+        // data 계층이 한 번 더 뒤집으면 서버와 방향이 어긋난다.
+        connectSuccessfully()
+
+        repository.sendEvent(TrackpadEvent.DesktopSwitch("left"))
+        repository.sendEvent(TrackpadEvent.DesktopSwitch("right"))
+
+        coVerifyOrder {
+            tcpClient.send("""{"type":"DESKTOP_SWITCH","direction":"left"}""")
+            tcpClient.send("""{"type":"DESKTOP_SWITCH","direction":"right"}""")
+        }
+    }
+
+    @Test
+    fun `DesktopSwitch 전송 실패는 CLICK과 같이 Error로 알린다`() = runTest {
+        // MOVE/SCROLL의 "조용한 실패"가 아니라 저빈도 · 사용자 명시 행동 경로다.
+        connectSuccessfully()
+        coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
+
+        repository.sendEvent(TrackpadEvent.DesktopSwitch("left"))
+
+        assertEquals(
+            ConnectionState.Error("tcp down", ConnectionErrorKind.CONNECTION_LOST),
+            repository.connectionState.first(),
+        )
     }
 
     @Test
