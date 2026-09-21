@@ -71,7 +71,7 @@ Phone Pad 기능 작업을 요청 범위에 따라 가벼운 경로(단일 에�
 **실행 모드:** 에이전트 팀 — 단, 이 저장소/환경에는 `TeamCreate`/`TaskCreate` 도구가 없다(2026-09-17 실행에서 확인). `TeamCreate`를 시도하지 말고 아래 방식으로 동일한 의도(스펙 불일치 방지 + 즉시 경계면 검증)를 구현한다:
 
 1. **리더가 스펙을 먼저 확정한다.** android-dev/server-dev가 실시간으로 SendMessage 협상을 하는 대신, 리더가 `AGENTS.md`와 사용자 요청을 근거로 이벤트 JSON 필드명·타입·채널·(필요 시) 세션/핸드셰이크 형식을 정확히 정의해 `_workspace/00_input/request.md`에 적는다. 여기 적힌 스펙은 두 에이전트 모두에게 동일하게 전달되므로, 필드명이 갈라질 여지가 없다.
-2. **android-dev와 server-dev를 한 메시지에서 병렬로 호출한다** (`Agent` 도구, `subagent_type`: 각각 "android-dev"/"server-dev", `model: "opus"`). 프롬프트에 request.md 경로, 구현 범위, "스펙을 임의로 바꾸지 말 것"을 명시한다. 이 두 호출은 서로 독립적이므로 병렬 실행이 안전하다.
+2. **android-dev와 server-dev를 한 메시지에서 병렬로 호출한다** (`Agent` 도구, `subagent_type`: 각각 "android-dev"/"server-dev", `model: "opus"`). 프롬프트에 request.md 경로, 구현 범위, "스펙을 임의로 바꾸지 말 것"을 명시한다. **병렬 실행 중이므로 `git stash`/`checkout`/`reset` 등 작업 트리를 되돌리는 git 명령을 금지한다고 반드시 명시한다** — 한 에이전트가 기준선 비교를 하려고 `git stash`를 쓰면 다른 에이전트의 미커밋 작업이 함께 사라진다(2026-09-20 실제 발생, 기준선은 `git show HEAD:<path>`/`git diff`로 읽기만 하도록 안내). 두 에이전트가 시작 직후 레이트 리밋으로 중단되면 `git status`로 코드 변경이 0인지 확인한 뒤 동일 프롬프트로 재호출한다. 이 두 호출은 서로 독립적이므로 병렬 실행이 안전하다.
 3. 두 에이전트의 완료 알림(SubagentHandback)을 받으면, **protocol-qa를 호출**(`Agent` 도구, `subagent_type: "protocol-qa"`, `model: "opus"`)해 request.md + 양쪽 summary + 실제 코드를 "양쪽 동시 읽기"로 대조하게 한다. QA는 코드를 고치지 않고 리포트만 작성한다(`_workspace/*_protocol-qa_report.md`).
 4. **실패 항목 처리:** QA 리포트의 실패 항목 중,
    - 수정 방법이 명확하고 규모가 작으면(수 줄 이내) 리더가 직접 `Edit`으로 고치고, 관련 테스트를 실행해 회귀가 없는지 확인한다(가능하면 QA가 제안한 회귀 테스트도 추가한다)

@@ -26,24 +26,28 @@ phone_pad/
 │       ├── domain/
 │       │   ├── model/         TrackpadEvent.kt, ConnectionState.kt, GestureSettings.kt,
 │       │   │                   ReconnectPolicy.kt, ConnectionErrorKind.kt,
-│       │   │                   ConnectionErrorClassifier.kt
-│       │   ├── repository/    TrackpadRepository.kt, SettingsRepository.kt (interface)
-│       │   └── usecase/       SendEventUseCase.kt
+│       │   │                   ConnectionErrorClassifier.kt, DiscoveredServer.kt, DiscoveryState.kt
+│       │   ├── repository/    TrackpadRepository.kt, SettingsRepository.kt, ServerDiscoveryRepository.kt (interface)
+│       │   └── usecase/       SendEventUseCase.kt, DiscoverServersUseCase.kt
 │       ├── data/
-│       │   ├── network/       TcpClient.kt, UdpClient.kt, SessionHandshake.kt
-│       │   └── repository/    TrackpadRepositoryImpl.kt, DataStoreSettingsRepository.kt
+│       │   ├── network/       TcpClient.kt, UdpClient.kt, SessionHandshake.kt,
+│       │   │                   DiscoveryProtocol.kt, ServerDiscoveryClient.kt
+│       │   └── repository/    TrackpadRepositoryImpl.kt, DataStoreSettingsRepository.kt,
+│       │                       ServerDiscoveryRepositoryImpl.kt
 │       ├── di/                AppModule.kt, DispatcherModule.kt, DataStoreModule.kt,
 │       │                       ReconnectModule.kt
 │       └── presentation/
-│           ├── util/          GestureConfig.kt, ConnectionErrorMessages.kt
+│           ├── util/          GestureConfig.kt, ConnectionErrorMessages.kt, DiscoveryMessages.kt
 │           ├── settings/      SettingsScreen.kt, SettingsViewModel.kt, SettingsUiState.kt,
 │           │                   ScrollSpeedSlider.kt
 │           └── trackpad/      TrackpadScreen.kt, TrackpadViewModel.kt, TrackpadUiState.kt,
 │                               MultiTouchGestureTracker.kt, DoubleTapDetector.kt,
-│                               DragHoldDetector.kt, ConnectionErrorSection.kt
+│                               DragHoldDetector.kt, ConnectionErrorSection.kt,
+│                               ServerDiscoverySection.kt
 └── pc_server/                 ← Windows Python 서버
     ├── server.py              소켓/세션/heartbeat + 정지 가능한 ServerRuntime, 콘솔/트레이 실행 모드
     ├── input_controller.py
+    ├── discovery.py           UDP 9002 서버 탐색 응답자 (표준 라이브러리만, 기본 비활성 — main()만 켠다)
     ├── tray_status.py         트레이 순수 로직 (연결 수→상태/툴팁, LAN IP 조회) — pystray 비의존
     ├── tray.py                pystray 어댑터 (pystray/Pillow import는 여기에서만, 선택 의존성)
     ├── requirements.txt       pystray, Pillow (트레이 전용 — 없어도 서버는 콘솔 모드로 동작)
@@ -52,7 +56,7 @@ phone_pad/
     ├── phone_pad_server.spec  PyInstaller 빌드 정의 (onefile + windowed)
     ├── build_exe.ps1          저장소 밖 임시 venv 생성 → exe 빌드 스크립트
     └── tests/                 pytest 단위 테스트 (test_single_instance.py, test_logging_setup.py 포함,
-                               send_input_stub.py = SendInput 모킹 헬퍼, test_desktop_switch.py)
+                               send_input_stub.py = SendInput 모킹 헬퍼, test_desktop_switch.py, test_discovery.py)
 ```
 
 ---
@@ -163,6 +167,19 @@ phone_pad/
 ```
 서버는 `session`이 TCP로 발급된 활성 목록에 없으면(문자열이 아니거나, 미등록이거나, 연결이 이미 끊겼으면) 조용히 무시한다 — 크래시하지 않는다.
 
+**UDP 9002 — 서버 자동 탐색 전용** (✅ 구현됨, Phase 4). 연결 **이전** 단계라 이벤트 채널이 아니다 — "이동 좌표만 UDP" 원칙은 이벤트 채널에 대한 것이고, 그래서 9001에 섞지 않고 전용 포트로 분리했다.
+```jsonc
+// 클라이언트 → 서버: 브로드캐스트 UDP 패킷 1개, 개행 없음 (19바이트)
+{"type":"DISCOVER"}
+// 서버 → 클라이언트: 요청 발신 주소로 유니캐스트, 패킷 1개, 개행 없음. 키 순서 type→name→port, 압축 JSON
+{"type":"SERVER","name":"MY-PC","port":9000}
+```
+- `name` = PC 호스트명(표시용, **문자 수 64자**로 절단, 비면 `"PC"`). `port` = 서버의 **TCP** 포트(실제 바인딩 값). UDP MOVE 포트는 응답에 없다 — 앱은 `GestureConfig.UDP_PORT`(9001)를 그대로 쓴다(서버가 비표준 UDP 포트로 뜨는 경우는 범위 밖).
+- **서버 IP는 응답 본문에 넣지 않는다** — 클라이언트가 응답 패킷의 **발신 주소**를 쓴다(멀티 NIC/VPN에서 서버가 자기 IP를 잘못 추정하는 문제 회피 + 본문 주소 위조 차단). **세션 토큰 등 비밀은 절대 넣지 않는다**(인증 이전 단계, 같은 LAN 누구나 볼 수 있다). 응답으로 세션/입력 상태를 바꾸지 않는다.
+- 서버는 정확히 `type == "DISCOVER"`인 JSON 객체에만 응답하고, 깨진 JSON·dict가 아닌 값·다른 type(`"discover"` 소문자 포함)·**256바이트 초과**·비UTF-8은 조용히 무시한다. **발신 IP당 초당 5회**까지만 응답(남용/증폭 방지). `SO_REUSEADDR`를 쓰지 않는다.
+- **응답 `name`은 `ensure_ascii` 때문에 비ASCII가 유니코드 escape 시퀀스로 나간다**(실측: 호스트명 `최범서` → 59바이트). 그래서 클라이언트 파서는 escape(서로게이트 쌍 포함)를 해석해야 하고, 수신 상한은 이름 64자 최악값(비BMP 807바이트)을 넘어야 한다 — Android `MAX_RESPONSE_BYTES = 1024`. 파서는 부호 붙은 위조 escape를 거부한다. **`name`이 문자열이 아니거나 `port`가 정수 1..65535가 아니면 앱은 그 서버를 무시한다**(서버는 항상 이 형식을 보낸다).
+- 앱은 자기 요청 에코·비IPv4 발신 주소도 무시한다. 한 탐색 = 0/300/600ms에 3회 × 대상 주소(255.255.255.255 + 인터페이스별 서브넷 브로드캐스트) 전송, 1.5초 수신 창, `host:port` 중복 제거, 최대 8개. 대상이 6개 이상이면 서버 응답 제한(5회/초)이 잉여 프로브를 자르지만 서버가 목록에서 사라지는 시나리오는 없다(QA 실측 — 대상 1/2/3/6개에서 응답 3/5/5/5).
+
 ---
 
 ## 5. 제스처 설계
@@ -216,6 +233,10 @@ DRAG_HOLD_THRESHOLD_MS = TAP_MAX_DURATION_MS  // 탭홀드 드래그 승격까�
 DEFAULT_PORT           = 9000
 UDP_PORT               = 9001   // MOVE 전용 UDP 포트
 SESSION_HANDSHAKE_TIMEOUT_MS = 3000  // TCP 연결 후 SESSION 줄 대기 최대 시간
+DISCOVERY_PORT = 9002 / DISCOVERY_TIMEOUT_MS = 1500 / DISCOVERY_PROBE_COUNT = 3 / DISCOVERY_PROBE_INTERVAL_MS = 300
+DISCOVERY_RECEIVE_POLL_MS = 200 / DISCOVERY_MAX_RESULTS = 8 / DISCOVERY_MAX_NAME_LENGTH = 64
+                                    // 불변식은 GestureConfigTest가 강제: (PROBE_COUNT-1)*PROBE_INTERVAL < TIMEOUT-RECEIVE_POLL,
+                                    // 0 < RECEIVE_POLL <= PROBE_INTERVAL, TIMEOUT < CONNECT_TIMEOUT_MS
 HEARTBEAT_INTERVAL_MS  = 5000L  // heartbeat 전송 주기 (서버 HEARTBEAT_INTERVAL_S=5.0과 반드시 동시 갱신)
 HEARTBEAT_MISS_LIMIT   = 3      // 연속 미응답 한계 (서버 HEARTBEAT_MISS_LIMIT=3과 반드시 동시 갱신)
 RECONNECT_MAX_ATTEMPTS = 8      // 자동 재연결 총 시도 횟수 (Android 전용 — 서버와 동기화 불필요)
@@ -274,9 +295,9 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - `pc_server/input_controller.py` — `_double_click(button)`, `_drag_start()`/`_drag_end()`/`force_release_drag()` 완료. 드래그 상태는 프로세스 전역(현재 컨트롤러가 프로세스당 하나)
 - `pc_server/server.py` — `handle_client`의 `finally`에서 연결 종료 시 드래그 강제 해제 호출
 
-### 🔶 Phase 4 — 완성도 (재연결·트레이·패키징·예외 처리 완료, UDP 자동 탐색 남음 — 다른 세션이 진행 중)
+### ✅ Phase 4 — 완성도 (완료: 트레이·재연결·패키징·예외 처리·UDP 자동 탐색)
 - [x] PC 트레이 아이콘 (`pystray`) — 연결 상태 표시 + 종료. 서버 단일 사이드(와이어 프로토콜 무변경). 아이콘은 Pillow로 코드에서 생성(대기 회색/연결됨 초록), 메뉴는 상태 라벨·접속 주소(LAN IP:9000)·종료. `--no-tray` 옵션과 미설치 시 콘솔 모드 폴백. 정지 가능한 `ServerRuntime`으로 정상 종료 경로를 만들고 `atexit` 드래그 해제 안전장치를 추가해 섹션 10의 "서버 프로세스 강제 종료 시 드래그 상태" 항목을 해소
-- [ ] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지)
+- [x] UDP 브로드캐스트 자동 서버 탐색 (수동 IP 입력은 fallback 유지) — **교차 경계면**(새 UDP 포트 9002 + 메시지 2종), android-dev/server-dev 병렬 + protocol-qa 검증. 연결 화면의 "서버 찾기" 버튼 → 결과 목록 → 선택하면 IP/포트 입력란만 채운다(**자동 연결 안 함** — 탐색 응답은 인증이 없어 위조 가능). 자세한 설계는 아래 "UDP 자동 탐색 구현 시 핵심 파일/설계"
 - [x] 재연결 로직 (연결 끊김 감지 → 자동 재시도) — Android 단일 사이드(프로토콜/서버 무변경: 재연결은 기존 핸드셰이크를 그대로 다시 수행할 뿐이라 서버에는 "새 클라이언트 접속"과 구분되지 않음). **"Connected였던 세션이 유실됐을 때만"** 재시도하며, 첫 `connect()` 실패는 기존처럼 `Error`로 남긴다(틀린 IP에 55초씩 매달리지 않기 위해). 유실은 `Error`를 거치지 않고 곧바로 `ConnectionState.Reconnecting(host, attempt, maxAttempts)`로 가고, 성공하면 `Connected`, 8회 소진 시 `Error("Reconnect failed: <마지막 원인>")`. 재연결 화면에는 "취소" 버튼(= 수동 `disconnect()`)
 - [x] 예외 처리 강화 — "범위가 모호한 항목"이라 추측으로 넓히지 않고 **코드 조사로 재현/확인된 결함만** 처리했다. 서버/Android 각각 단일 사이드(와이어 프로토콜 무변경). 서버: `SendInput` 반환값(주입된 이벤트 수)을 확인하지 않아 `_drag_start`/`_drag_end`의 "실패하면 상태를 유지한다"는 주석과 코드(무조건 상태 변경)가 어긋나 있던 버그 수정. Android: `Socket(host, port)`에 연결 타임아웃이 없고 첫 연결에는 "취소"도 없어 틀린 IP에서 OS 기본 타임아웃(수십 초) 동안 갇히던 문제, 오류가 영어 예외 원문으로 노출되던 문제 수정. **다루지 않은 것:** UIPI(관리자 권한 창) 차단 감지(불가능 — 아래), IP 형식 검증, 포트 입력 UI, 앱 백그라운드 진입 시 드래그 종료, 서버 기동 실패 안내창
 - [x] PyInstaller로 단일 exe 패키징 — 서버 단일 사이드(와이어 프로토콜 무변경). onefile + windowed(`--noconsole`), `build_exe.ps1`이 **저장소 밖 임시 venv**에서 빌드해 전역 Python을 바꾸지 않는다(pytest 기준선이 pystray 미설치 상태라서). 결과 `pc_server/dist/PhonePadServer.exe` 15.6MB, 빌드 약 40초. 함께 해결: 서버 중복 실행(named mutex, 종료 코드 2)과 windowed 로그 소실(`%LOCALAPPDATA%\PhonePad\server.log`). 실제로 exe를 빌드·실행해 TCP 9000/UDP 9001·중복 실행 가드·로그 기록·exe 안에서 pystray 트레이 윈도 생성까지 확인
@@ -320,6 +341,14 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - 테스트 함정: 실제 키 주입 금지 — 부분 주입 시 Win 키 고착이나 테스트 중 데스크톱 전환이 일어난다. 전부 `patch_send_input()`으로 모킹하고, 모킹으로 검증 불가능한 "OS가 KEYBDINPUT 구조체를 읽는가"만 무해한 키 업 단독 호출로 실측했다(`VK_LCONTROL` 키 업 1개 → `injected 1 of 1`, 틀린 cbSize → `0 of 1`)
 - 병렬 작업 함정: 에이전트가 검증 중 `git stash`를 써서 병렬 에이전트의 미커밋 작업까지 함께 stash된 사고가 있었다(즉시 pop해 복구). 병렬 실행 중에는 stash 금지를 프롬프트에 명시할 것
 
+**UDP 자동 탐색 구현 시 핵심 파일/설계:**
+- `pc_server/discovery.py` — 표준 라이브러리만. 순수 함수 `handle_discovery_packet(data, name, tcp_port) -> bytes | None`(소켓 비의존), `ResponseRateLimiter`(시간 주입 — sleep 없이 결정적 테스트, 발신자 테이블 상한), `DiscoveryResponder`(`0.0.0.0:9002` 데몬 스레드, 0.5s 폴링 + stop Event, 포트 0 바인딩 지원). **9002 바인딩 실패는 서버 기동을 막지 않는다**(ASCII 로그 `[!] Discovery disabled: ...` 후 탐색만 꺼짐 — 수동 IP 입력이 fallback). 수신 중 예외는 스레드를 죽이지 않는다. **Windows `recvfrom`은 정상 동작 중에도 `OSError`를 던진다**(`WSAEMSGSIZE` = 버퍼보다 큰 데이터그램, `WSAECONNRESET` = 응답 상대의 ICMP unreachable) — 그래서 "로그(throttle) + 계속, 연속 50회면 탐색만 포기"로 만들었다(`except OSError: break`면 리스너가 조용히 죽는다). 수신 버퍼(2048)는 요청 상한(256)보다 커야 초과 패킷 검사가 성립한다
+- `pc_server/server.py` — 변경 +34/-2. `ServerRuntime(discovery_port=None)` **기본 비활성**(기본값이 실포트를 잡으면 서버가 떠 있는 동안 `ServerRuntime`을 만드는 무관한 테스트가 깨진다 — 트레이/단일 인스턴스 때와 같은 교훈), `serve()`에서 시작·`stop()`/`close()`에서 정지, `main()`만 `DISCOVERY_PORT`를 넘긴다, `--no-discovery`. `handle_client`/`udp_listener`/`handle_udp_packet`/`SessionRegistry`/소켓 옵션은 무변경
+- `data/network/DiscoveryProtocol.kt` — 순수 파서. 어떤 입력에도 예외 없음. **서버 주소의 유일한 출처는 발신 주소**(본문의 `host`/`ip`는 무시 — 테스트로 고정). 정규식 기반 JSON 값 추출 + 직접 만든 unescape(서로게이트 쌍·따옴표/역슬래시·잘린/알 수 없는 escape·부호 붙은 hex 거부). `ServerDiscoveryClient`는 소켓/시간/대상 주소/포트/창을 `internal var`로 주입 가능(실제 1.5초를 기다리는 테스트 없음, 루프백 왕복 소수만). 블로킹 `receive`는 코루틴 취소로 안 풀리므로 **200ms 폴링 루프 + 매 회 `isActive` 확인**으로 빠져나온다(취소 후 최대 200ms 소켓이 살아 있음 — `TcpClient.connect()`의 소켓 close 방식과 달리 루프가 짧아 닫기 경쟁을 안 만들려는 선택)
+- `TrackpadViewModel.startDiscovery/selectServer` — 탐색 중 재호출은 무시(버튼도 비활성), 선택하면 `hostInput`·`port`만 채운다, 사용자가 호스트를 직접 고치면 `port`가 기본값으로 돌아간다(선택한 서버의 비표준 포트가 다른 IP로 새는 것 방지), 연결 시작 시 진행 중 탐색 취소. 화면은 `ServerDiscoverySection.kt`로 분리(`TrackpadScreen.kt` +27줄, 제스처 코드 무접촉). 문구는 `DiscoveryMessages`(모든 상태가 문구를 갖는 계약을 테스트로 고정)
+- 함정: ① `runCatching`이 suspend 호출의 `CancellationException`을 삼켜 **연결 시작으로 취소한 탐색이 "서버를 찾지 못했습니다"로 표시**됐다(신규 ViewModel 테스트가 잡음) → `try/catch(CancellationException){throw}` ② **KDoc·주석에 유니코드 escape 리터럴을 쓰면 kapt Java 스텁 주석으로 복사되어 `illegal unicode escape`로 `:app:kaptDebugKotlin`이 깨진다**(실측 — 코드/문자열 리터럴은 무해) ③ `runTest {}` 안에서 새 `StandardTestDispatcher`를 만들면 `Detected use of different schedulers`로 무더기 실패 → 디스패처를 필드로 두고 `runTest(dispatcher)` ④ 루프백 실소켓 테스트에서 닫힌 포트로 보내면 Windows ICMP unreachable이 다음 `recv`를 깨워 "창이 끝날 때까지 기다림"을 측정할 수 없다(받기만 하고 답하지 않는 소켓으로 재현)
+- **QA 발견(리더가 수정):** F-1 — 서버가 이름을 문자 수 64자로 자르지만 `ensure_ascii` escape로 바이트가 커져 비BMP 이름은 예전 상한 512에서 수신 버퍼가 잘려 서버가 목록에서 사라질 수 있었다(Windows 컴퓨터 이름은 15자·제한 문자라 실기기 도달 불가지만 계약이 안 닫혀 있었음) → `MAX_RESPONSE_BYTES = 1024` + 최악값(비BMP 64자, 807B) 회귀 테스트. W-1 — `toIntOrNull(16)`이 부호를 허용해 위조 escape가 엉뚱한 문자가 됐다 → hex 자릿수 검사 + 테스트
+
 ### ⬜ Phase 5 — 선택 확장
 - [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
 - [x] 3손가락 스와이프 → 가상 데스크톱 전환 — **교차 경계면**(새 이벤트 `DESKTOP_SWITCH`), android-dev/server-dev 병렬 + protocol-qa 검증. 좌/우만(수직 스와이프·4손가락은 범위 밖). 자세한 설계는 아래 "3손가락 스와이프 구현 시 핵심 파일/설계"
@@ -332,8 +361,8 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 ```
 Android                                          PC Server
    |                                                 |
-   |-- UDP broadcast (탐색) --------------------->   |   (Phase 4 예정, 미구현 — 현재는 수동 IP 입력)
-   |<-- UDP response (IP:port) -------------------   |   (Phase 4 예정, 미구현)
+   |-- UDP 9002 broadcast {type:DISCOVER} ------->   |   ✅ 구현됨 ("서버 찾기" 버튼, 수동 IP 입력은 fallback)
+   |<-- UDP 9002 unicast {type:SERVER,name,port} -   |   ✅ 구현됨 (서버 주소 = 응답 발신 주소)
    |                                                 |
    |-- TCP connect ------------------------------>   |
    |<-- {"type":"SESSION","session":"<32hex>"} ---   |   ✅ 구현됨 (연결 직후 첫 줄)
@@ -362,7 +391,8 @@ cd pc_server
 pip install -r requirements.txt   # 트레이 아이콘용 (선택 — 없으면 콘솔 모드로 동작)
 python server.py                  # 시스템 트레이 아이콘과 함께 실행
 python server.py --no-tray        # 트레이 없이 콘솔 모드 (Ctrl+C로 종료)
-# → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) 포트에서 대기
+python server.py --no-discovery   # UDP 9002 자동 탐색 응답 끄기 (수동 IP 입력만)
+# → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) / UDP 9002(서버 탐색) 포트에서 대기
 
 # 단일 exe 빌드 — 임시 venv를 저장소 밖에 만든다(전역 Python은 건드리지 않음)
 ./build_exe.ps1                   # → dist/PhonePadServer.exe (약 15.6MB, 빌드 약 40초)
@@ -372,7 +402,7 @@ python server.py --no-tray        # 트레이 없이 콘솔 모드 (Ctrl+C로 �
 **서버를 두 번 실행하면 자동으로 차단된다:** Windows에서는 `SO_REUSEADDR` 때문에 이미 점유된 포트에도 bind가 성공해 예전에는 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받았다. 이제 두 번째 프로세스가 named mutex(`Local\PhonePadServer`)로 이를 감지해 "이미 실행 중입니다" 안내창(windowed) 또는 stderr 한 줄(콘솔)을 띄우고 **종료 코드 2**로 끝난다 — 첫 인스턴스는 영향받지 않는다. 개발 중 일부러 두 개를 띄우려면 `--allow-multiple`. 단 다른 로그인 세션에서 띄운 서버는 감지하지 못한다(아래 섹션 10 참조).
 **Windows 방화벽(exe):** `python.exe`로 허용해 둔 기존 규칙은 `PhonePadServer.exe`에 적용되지 않으므로 exe로 처음 실행하면 새 방화벽 프롬프트가 뜰 수 있다(미검증 — 이 환경에서 확인 불가). 허용 대상은 아래와 같다.
 
-**Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다).
+**Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다). **자동 탐색을 쓰려면 UDP 9002 인바운드도 허용해야 한다**(안 열려 있으면 "서버 찾기"만 실패하고 수동 IP 연결은 그대로 동작한다).
 
 **트러블슈팅:** 커서가 갑자기 멈추고 앱이 `Heartbeat timeout`/`Connection lost`를 띄우면 TCP 9000 경로(Wi-Fi 절전, 도즈 모드 등으로 heartbeat 전송이 지연되는 경우 포함)를 먼저 의심한다. TCP 세션이 회수되면 이미 전송 중이던 UDP MOVE도 서버가 조용히 무시하므로 함께 멈춘다.
 
@@ -412,6 +442,11 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - **사용자에게 보이는 오류 문구와 내부 상태 문자열을 섞지 않는다.** `ConnectionState.Error.message`는 진단용 계약이고, 한국어 문구는 `ConnectionErrorKind` → `ConnectionErrorMessages` 경로로 표시 계층에서만 만든다. 문구 전문을 테스트로 고정하지 말고(다듬을 수 있어야 한다) "원문이 주 메시지를 점령하지 않는다", "모든 kind가 문구를 갖는다" 같은 **계약**을 고정한다
 - **`ctypes.sizeof(INPUT)`은 `SendInput`의 cbSize 인자이므로 절대 변해서는 안 된다.** `_INPUTunion`에 새 구조체를 추가할 때는 그 구조체가 `MOUSEINPUT`보다 작은지 확인하고 크기를 고정하는 테스트를 함께 둔다. 이 값이 틀리면 키보드뿐 아니라 마우스 주입까지 전부 실패하며(실측: 틀린 cbSize → `injected 0 of 1`) 예외가 나지 않아 조용히 죽는다
 - **키보드 수정 키(Ctrl/Win 등)를 누르는 주입은 반드시 `try/finally`로 키 업 정리를 보장한다** — 반환값 분기만으로는 예외 경로에서 키가 눌린 채 남는다
+- **`ServerRuntime`의 새 선택 인자는 기본값을 "비활성"으로 둔다** — 기본값이 실제 포트를 잡으면 서버가 떠 있는 동안 무관한 테스트가 깨진다(트레이/단일 인스턴스/탐색에서 세 번 겪은 교훈). 켜는 것은 `main()`의 몫
+- **Windows UDP 수신 루프에서 `except OSError: break`를 쓰지 않는다** — 정상 동작 중에도 `WSAEMSGSIZE`/`WSAECONNRESET`이 `recvfrom`에서 `OSError`로 올라와 리스너가 조용히 죽는다. 정지 신호/소켓 닫힘과 구분해서 계속 돌 것
+- **KDoc·주석에 유니코드 escape 리터럴을 적지 않는다** — kapt 스텁 주석으로 복사되어 `illegal unicode escape`로 빌드가 깨진다. 말로 풀어 쓸 것
+- **suspend 호출을 `runCatching`으로 감싸지 않는다** — `CancellationException`까지 삼켜 취소를 실패로 보고한다. `try/catch(CancellationException){throw}/catch(Exception)`을 쓴다
+- **테스트는 하나의 `TestDispatcher`를 필드로 두고 `runTest(dispatcher)`로 넘긴다** — `runTest {}` 안에서 새 디스패처를 만들면 `Detected use of different schedulers`로 무더기 실패한다
 - **새 기능/버그 수정 시 테스트 코드도 함께 작성**
   - Android: `usecase`/`repository` 등 도메인 로직은 JUnit + MockK 단위 테스트, 제스처 판정 로직(`GestureConfig` 기준값)은 별도 테스트로 검증
   - Python 서버: `input_controller.py`의 `handle_event` 등 이벤트 처리 로직은 `unittest`/`pytest`로 단위 테스트 작성
@@ -464,4 +499,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | 3손가락 제스처 실기기 검증 | 임계 120px의 체감, 제조사 시스템 제스처(스크린샷/분할화면 등)가 3손가락 터치를 가로채는지, 실제 터치에서 `pointerCount == 3`이 안정적으로 보고되는지 미검증. 임계값이 dp가 아니라 px라(기존 모든 제스처 상수와 동일 규약) 고해상도 기기에서는 상대적으로 짧게 느껴질 수 있음. `TrackpadScreen`의 3번째 손가락 flush/consume 배선은 Compose 의존이라 자동 테스트가 없다(판정 로직은 순수 클래스로 전부 커버) |
 | 데스크톱 전환 실기기 미검증 | 키 코드·플래그·순서·`sizeof(INPUT)`·주입 성공은 테스트와 실측으로 고정했으나, Ctrl+Win+Left/Right가 실제로 데스크톱을 넘기는지는 사람이 한 번 확인해야 한다(테스트 중 실제 전환은 고의로 실행하지 않음). 주입이 2개(Ctrl↓ Win↓)만 성공한 뒤 정리 키 업이 나가면 Win 키 업이 시작 메뉴를 열 수 있다(Win 고착보다는 낫다고 판단, 실기기 확인 항목). 정리 키 업마저 실패하는 경우는 코드로 더 막을 수 없다. 실패 1회당 `input_failures`가 2 증가(본 시퀀스 + 정리) — 트레이에 노출할 때 감안할 것 |
 | 3손가락 래치의 UX 대가 | 2손가락 스크롤 중 세 번째 손가락이 스치면 그 제스처의 남은 스크롤이 전부 억제된다(어긋난 릴리스의 클릭 오발동 차단과 맞바꾼 스펙). 4→3 전환은 새 구간이 시작되므로 전환이 발사될 수 있다(구간 단위 정의의 귀결, 실해 없음). 실기기에서 거슬리면 재논의 |
+| 자동 탐색 실기기/방화벽 미검증 | 실제 Wi-Fi에서 브로드캐스트가 닿는지(AP가 제한 브로드캐스트를 버리는지, Android 10+ 멀티캐스트/브로드캐스트 전력 제어), 결과 목록 렌더·탭 선택 배선(`ServerDiscoverySection`은 Compose UI 테스트 없음), 1.5초 창의 체감, **UDP 9002 인바운드 방화벽**(exe는 `python.exe`와 다른 바이너리라 새 프롬프트 — 미검증)은 실측하지 못했다. 서버는 같은 PC에서 `255.255.255.255`와 서브넷 브로드캐스트 양쪽으로 응답을 실측했고 종료 후 9002 재바인딩·잔여 프로세스 0을 확인했다. exe를 재빌드해 9002가 뜨는지도 미확인(`discovery.py`는 stdlib 전용이고 `server.py`가 정적 import해 hidden import 문제는 없을 것) |
+| 탐색 응답 위조 가능 | 인증 이전 단계라 같은 LAN의 누구나 `SERVER` 응답을 위조해 목록에 줄을 올릴 수 있다. 선택은 입력란만 채우고 연결은 사용자가 누르게 했지만 이름만 보고 누르면 공격자 주소로 붙는다 — 근본 해결은 PIN 인증과 함께(위 "PIN 인증" 행). 반대로 같은 LAN의 누구나 PC 이름·TCP 포트를 알 수 있다(스펙이 의도한 트레이드오프, 토큰은 절대 넣지 않음) |
+| 탐색의 한계 | IPv6 전용 네트워크 미지원(브로드캐스트는 IPv4 개념 — mDNS 등 별도 설계 필요), 응답에 TCP 포트만 있어 서버가 비표준 UDP(MOVE) 포트로 뜨면 앱이 알 수 없음(현재 `main()`은 항상 9001), 서버 recv 오류가 50회 연속이면 탐색 스레드가 포기하는데 `start()`는 이미 `True`를 돌려준 뒤라 9002를 점유한 채 응답이 없다(QA W-6, 발생 조건이 좁아 허용), 취소 후 최대 200ms 소켓이 살아 있음, 같은 IP 뒤의 두 앱은 응답 제한(IP 단위 5회/초)을 공유 |
+| 서버 두 번째 인스턴스의 9002 | 탐색 소켓은 `SO_REUSEADDR`를 쓰지 않아 **두 번째 인스턴스의 9002 bind는 실패**한다(응답이 두 개 나가지 않음 — named mutex와 별개의 두 번째 방어선). `--allow-multiple`로 일부러 두 개를 띄우면 두 번째는 탐색이 꺼진 채 동작한다 |
 | 앱 백그라운드 진입 시 드래그 미종료 | 드래그 홀드 중 Android 앱이 백그라운드로 가서 `TrackpadViewModel`이 파기되면 `DRAG_END`를 보낼 기회가 없다 — 서버 heartbeat 타임아웃(≈15초)이 감지해 강제로 놓을 때까지 PC 버튼이 눌린 채 유지됨. 실기기 미검증 |
