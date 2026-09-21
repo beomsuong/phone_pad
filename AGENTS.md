@@ -52,7 +52,7 @@ phone_pad/
     ├── phone_pad_server.spec  PyInstaller 빌드 정의 (onefile + windowed)
     ├── build_exe.ps1          저장소 밖 임시 venv 생성 → exe 빌드 스크립트
     └── tests/                 pytest 단위 테스트 (test_single_instance.py, test_logging_setup.py 포함,
-                               send_input_stub.py = SendInput 모킹 헬퍼)
+                               send_input_stub.py = SendInput 모킹 헬퍼, test_desktop_switch.py)
 ```
 
 ---
@@ -132,6 +132,18 @@ phone_pad/
 {"type":"DRAG_START"}
 {"type":"DRAG_END"}
 
+// 가상 데스크톱 전환 — ✅ 구현됨 (Phase 5). 3손가락 수평 스와이프. TCP, session 필드 없음.
+// direction은 "전환 결과의 방향"이며 손가락 방향이 아니다 — 손가락 왼쪽 스와이프 → "right",
+// 오른쪽 스와이프 → "left"(Windows 정밀 터치패드 관례). 이 뒤집기는 Android의
+// MultiTouchGestureTracker 한 곳에서만 하고 서버는 받은 값을 Ctrl+Win+Left/Right로 옮기기만 한다
+// (섹션 10 "스크롤 방향 규약"과 같은 원칙 — 두 사이드가 같이 뒤집으면 원위치).
+// 서버는 6개 INPUT(Ctrl↓ Win↓ 화살표↓ 화살표↑ Win↑ Ctrl↑)을 SendInput 1회로 원자적으로 보내고,
+// 주입이 부분 성공이거나 예외가 나면 Ctrl/Win/화살표 키 업 3개를 best-effort로 한 번 더 보낸다
+// (수정 키 고착 방지). direction이 "left"/"right" 소문자 정확 일치가 아니면 서버는 아무 키도
+// 보내지 않고 조용히 무시한다(세션 유지).
+{"type":"DESKTOP_SWITCH","direction":"left"}
+{"type":"DESKTOP_SWITCH","direction":"right"}
+
 // heartbeat — ✅ 구현됨. 클라이언트 → 서버, HEARTBEAT_INTERVAL_MS(5000ms)마다.
 // 연결 유지 신호일 뿐 마우스 명령이 아니므로 InputController.handle_event로
 // 넘기지 않는다. 서버는 항상 클라이언트 주도로만 반응한다(서버가 먼저 보내지 않음).
@@ -165,7 +177,7 @@ phone_pad/
 | 2손가락 탭 | CLICK(right) | Phase 2 | ✅ 완료 |
 | 2손가락 상하좌우 드래그 | SCROLL(dx, dy) | Phase 2 | ✅ 완료 |
 | 탭홀드 + 드래그 | DRAG_START → MOVE → DRAG_END | Phase 3 | ✅ 완료 |
-| 3손가락 스와이프 | 가상 데스크톱 전환 등 | Phase 4 | ⬜ 미구현 |
+| 3손가락 좌우 스와이프 | DESKTOP_SWITCH(direction) | Phase 5 | ✅ 완료 |
 
 ### 엣지 케이스 (구현 시 주의)
 - 드래그 도중 손가락 개수 변화(1→2) → 현재 제스처 취소 후 새 제스처로 재시작 (`MultiTouchGestureTracker`가 구간 단위로 구현)
@@ -176,6 +188,9 @@ phone_pad/
 - **스크롤 뒤 클릭 오발동 방지**: 2손가락 구간은 `isDrag`(탭 한계 초과) 이후부터만 SCROLL을 방출하며, `isDrag`는 구간 내내 sticky해서 우클릭 배제 조건과 그대로 겹치므로 탭/스크롤 사각지대가 없다. 단, **직전 구간이 드래그(스크롤)였다면 그 뒤에 붙는 어떤 짧은 꼬리도 탭으로 재해석하지 않는다** — 꼬리 보정(`MULTI_TOUCH_RELEASE_GRACE_MS`)의 유예 시간 안이든 밖이든 무조건 클릭 없음. 이게 없으면 "스크롤하고 손을 뗐을 뿐인데 커서 위치가 클릭되는" 사고가 난다
 - **더블탭 지연이 모든 1손가락 클릭에 적용됨**: 탭이 끝나도 `DOUBLE_TAP_INTERVAL_MS`(300ms) 동안 즉시 CLICK을 보내지 않고 두 번째 탭을 기다린다 — 더블클릭을 지원하는 이상 피할 수 없는 트레이드오프다. 이 대기 중에 다른 종류의 제스처(드래그/스크롤/우클릭)가 시작되면 대기 중인 클릭을 **취소하지 않고 즉시 내보낸다("flush")** — 취소하면 사용자가 실제로 한 클릭이 사라지고, 그대로 두면 드래그로 커서가 옮겨간 뒤 엉뚱한 위치에서 클릭이 나가거나 우클릭 컨텍스트 메뉴가 뜬 직후 클릭이 도착해 메뉴 항목을 눌러버릴 수 있다. 우클릭 시에는 더블탭 감지기도 함께 리셋해, 우클릭 앞뒤의 무관한 좌탭 두 개가 우연히 더블탭으로 묶이지 않게 한다
 - 정확히 `DOUBLE_TAP_INTERVAL_MS` 경계에서 두 번째 탭이 오면(판정은 `System.currentTimeMillis()`, 발사는 코루틴 `delay`라 시간축이 미세하게 다름) 아주 드물게 CLICK과 DOUBLE_CLICK이 둘 다 나갈 수 있음 — 영향이 미미해(실제 창은 한 프레임 수준) 현재는 허용
+- **3손가락 래치**: 한 제스처(첫 down ~ 모든 손가락 up) 안에서 포인터가 한 번이라도 3개 이상이 되면, 그 제스처의 나머지 동안 MOVE·SCROLL·클릭(좌/우)이 전부 억제되고 `DESKTOP_SWITCH`만 허용된다. 3손가락을 어긋나게 떼면 `3→2→1→0` 꼬리가 생기는데, 그 꼬리가 `MULTI_TOUCH_RELEASE_GRACE_MS`(50ms) **밖**이면 기존 로직이 "정상 탭"으로 취급해 스와이프 직후 좌/우클릭이 샌다. 래치는 유예 시간 튜닝에 의존하지 않고 이를 원천 차단한다(MOVE/SCROLL/탭 판정 3곳에서 차단). 드래그 홀드는 `DragHoldDetector`가 개수 변화 시 재무장하지 않으므로 추가 장치가 필요 없었다. **대가:** 2손가락 스크롤 중 세 번째 손가락이 스치면 그 제스처의 남은 스크롤이 전부 죽는다
+- 데스크톱 전환은 **임계를 넘는 그 프레임에 즉시**(손을 뗄 때가 아니라) 발사되고, **한 구간에 최대 1회**다(계속 밀어도 반복 전환 없음). 3→2→3처럼 구간이 새로 시작되면 다시 1회 가능. 3번째 손가락이 닿는 순간 대기 중인 지연 클릭은 flush하고 더블탭 감지기를 리셋한다
+- 3손가락 "탭"(스와이프 없이 뗌)은 아무 이벤트도 없다. 정확히 3손가락인 구간에서만 판정하며 4손가락은 범위 밖(래치 때문에 무이벤트). 수직 스와이프(작업 보기)도 범위 밖
 
 ### 감도 상수 (`GestureConfig.kt`)
 
@@ -190,6 +205,9 @@ TAP_MAX_DURATION_MS    = 200L   // 탭 판정 최대 지속 시간
 MOVE_MIN_DISTANCE_PX   = 5f     // 커서 이동 최소 거리 (떨림 억제)
 SINGLE_POINTER_COUNT   = 1      // 1손가락 구간 판정 기준 (탭 → 좌클릭, MOVE 방출)
 DOUBLE_POINTER_COUNT   = 2      // 2손가락 구간 판정 기준 (탭 → 우클릭)
+THREE_POINTER_COUNT    = 3      // 3손가락 구간 판정 기준 (DESKTOP_SWITCH 전용) + 3손가락 래치 조건(이 개수 이상)
+THREE_FINGER_SWIPE_MIN_DISTANCE_PX = 120f  // 구간 시작 centroid 대비 수평 이동 임계 — TAP_MAX_DISTANCE_PX의 6배(전역 동작이라 오발동 여유를 크게). GestureConfigTest가 강제
+THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE = 2f  // |dx| >= 2*|dy|일 때만 수평 스와이프로 인정 (약 26.6도 이내)
 MULTI_TOUCH_RELEASE_GRACE_MS = 50L  // 손가락 어긋나게 떼기 보정 유예 시간
 SCROLL_SENSITIVITY_PX_PER_STEP = 40f  // 휠 1스텝에 해당하는 centroid 이동 거리. 반드시 TAP_MAX_DISTANCE_PX보다 커야 함(사각지대 방지)
 DOUBLE_TAP_INTERVAL_MS = 300L    // 두 탭을 하나의 더블탭으로 묶을 최대 간격 (모든 좌클릭이 겪는 지연이기도 함)
@@ -295,9 +313,16 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - `presentation/trackpad/ConnectionErrorSection.kt` — 오류 표시 전용 컴포저블. `TrackpadScreen` 변경 면적을 줄이기 위한 분리(연결 화면을 동시에 손보는 작업과의 충돌 완화). `TrackpadScreen`은 첫 연결 중 "취소" 버튼 배선만 추가
 - **QA 생략 근거:** 와이어 프로토콜이 무변경이고 양쪽이 서로의 코드를 소비하지 않아 `protocol-qa`를 돌리지 않았다. 대신 리더가 두 결과를 직접 재실행(server 246 passed/1 skipped, Android `cleanTestDebugUnitTest` 258건 0 실패)하고 취소 로직·분류기·문구를 코드로 검토
 
+**3손가락 스와이프 구현 시 핵심 파일/설계:**
+- `presentation/trackpad/MultiTouchGestureTracker.kt` — 방향 매핑(손가락 왼쪽 → `"right"`)이 `resolveDesktopSwitch()` **한 곳에만** 있다(`DIRECTION_LEFT`/`DIRECTION_RIGHT` 상수). 서버·ViewModel·Screen·Repository는 값을 그대로 전달만 한다. 판정은 구간 단위(`desktopSwitchEmittedInSegment`), 래치는 제스처 단위(`threeFingerLatched`). `GestureDecision.desktopSwitch`는 `move`/`scroll`과 구조적으로 동시에 non-null이 될 수 없다(정확히 3손가락 구간 = 정의상 래치 상태). 기존 1·2손가락 트래커 테스트 36개는 무수정 통과
+- `data/repository/TrackpadRepositoryImpl.kt` — `DesktopSwitch`는 CLICK/DOUBLE_CLICK과 같은 등급: 전송 실패가 `sendOverTcp()` → `reportConnectionLost`로 합류(MOVE/SCROLL처럼 조용히 버리지 않음). 와이어 리터럴 고정 테스트 있음
+- `pc_server/input_controller.py` — `KEYBDINPUT`을 `_INPUTunion`에 추가(`KEYBDINPUT` 24B < `MOUSEINPUT` 32B라 `sizeof(INPUT)`=40 불변, 테스트로 고정). `_desktop_switch()`는 6개 INPUT을 `_send_input` 창구로 1회 전송. 화살표만 `KEYEVENTF_EXTENDEDKEY`. **수정 키 고착 방지 정리(`_release_desktop_switch_keys`)는 반환값 분기가 아니라 `try/finally`로 보장한다** — QA F-1: `_send_input`이 예외를 던지는 경로(SendInput 자체의 `OSError`, 또는 부분 주입 직후 실패 기록 안의 예외)에서 정리가 건너뛰어져 실제로 Ctrl+Win이 눌린 채 남을 수 있었다(리더가 수정 + 회귀 테스트 2건). 정리 호출 자체의 예외는 삼키고 재귀/재시도는 하지 않는다
+- 테스트 함정: 실제 키 주입 금지 — 부분 주입 시 Win 키 고착이나 테스트 중 데스크톱 전환이 일어난다. 전부 `patch_send_input()`으로 모킹하고, 모킹으로 검증 불가능한 "OS가 KEYBDINPUT 구조체를 읽는가"만 무해한 키 업 단독 호출로 실측했다(`VK_LCONTROL` 키 업 1개 → `injected 1 of 1`, 틀린 cbSize → `0 of 1`)
+- 병렬 작업 함정: 에이전트가 검증 중 `git stash`를 써서 병렬 에이전트의 미커밋 작업까지 함께 stash된 사고가 있었다(즉시 pop해 복구). 병렬 실행 중에는 stash 금지를 프롬프트에 명시할 것
+
 ### ⬜ Phase 5 — 선택 확장
 - [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
-- [ ] 3손가락 스와이프 → 가상 데스크톱 전환
+- [x] 3손가락 스와이프 → 가상 데스크톱 전환 — **교차 경계면**(새 이벤트 `DESKTOP_SWITCH`), android-dev/server-dev 병렬 + protocol-qa 검증. 좌/우만(수직 스와이프·4손가락은 범위 밖). 자세한 설계는 아래 "3손가락 스와이프 구현 시 핵심 파일/설계"
 - [ ] 다중 클라이언트 지원 정책 결정
 
 ---
@@ -318,6 +343,7 @@ Android                                          PC Server
    |-- TCP: SCROLL -------------------------------->  |   ✅ 구현됨 (정수 스텝, session 없음)
    |-- TCP: DRAG_START (제자리 200ms 유지 시) ------>  |   ✅ 구현됨 (버튼을 누른 채 유지)
    |-- UDP: MOVE (버튼 눌린 채로 커서만 이동) ------>  |   기존 MOVE 채널 그대로 재사용
+   |-- TCP: DESKTOP_SWITCH (3손가락 좌우 스와이프) ->  |   ✅ 구현됨 (Ctrl+Win+Left/Right)
    |-- TCP: DRAG_END (손을 떼면) -------------------->  |   ✅ 구현됨 (버튼 뗌). 연결이
    |                                                 |   끊기면 서버가 강제로 놓음(안전장치)
    |-- UDP: {session, type:MOVE, dx, dy} --------->  |   ✅ 구현됨
@@ -384,6 +410,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - **Python 서버의 `print()` 로그 메시지는 ASCII만 사용한다** — em dash(—) 같은 비ASCII 문자가 한국어 Windows 콘솔(cp949)에서 `UnicodeEncodeError`를 던져, 정작 중요한 순간(예: 연결 종료 시 드래그 강제 해제 성공 로그)에 `except`가 이를 잡아 "실패"로 잘못 보고한 적이 있다. 일반 하이픈(-)이나 영문 기호로 대체할 것
 - **`pc_server`에서 `SendInput`을 직접 호출하지 않는다** — 반드시 `InputController._send_input(count, inputs, kind)`를 경유한다(반환값 검사·실패 카운터·rate limit 로그가 이 한 곳에 있다). 테스트에서 `SendInput`을 모킹할 때는 `tests/send_input_stub.py`의 `patch_send_input()`을 쓴다(`MagicMock` 기본 반환값은 "0개 주입"으로 읽혀 실패로 판정된다)
 - **사용자에게 보이는 오류 문구와 내부 상태 문자열을 섞지 않는다.** `ConnectionState.Error.message`는 진단용 계약이고, 한국어 문구는 `ConnectionErrorKind` → `ConnectionErrorMessages` 경로로 표시 계층에서만 만든다. 문구 전문을 테스트로 고정하지 말고(다듬을 수 있어야 한다) "원문이 주 메시지를 점령하지 않는다", "모든 kind가 문구를 갖는다" 같은 **계약**을 고정한다
+- **`ctypes.sizeof(INPUT)`은 `SendInput`의 cbSize 인자이므로 절대 변해서는 안 된다.** `_INPUTunion`에 새 구조체를 추가할 때는 그 구조체가 `MOUSEINPUT`보다 작은지 확인하고 크기를 고정하는 테스트를 함께 둔다. 이 값이 틀리면 키보드뿐 아니라 마우스 주입까지 전부 실패하며(실측: 틀린 cbSize → `injected 0 of 1`) 예외가 나지 않아 조용히 죽는다
+- **키보드 수정 키(Ctrl/Win 등)를 누르는 주입은 반드시 `try/finally`로 키 업 정리를 보장한다** — 반환값 분기만으로는 예외 경로에서 키가 눌린 채 남는다
 - **새 기능/버그 수정 시 테스트 코드도 함께 작성**
   - Android: `usecase`/`repository` 등 도메인 로직은 JUnit + MockK 단위 테스트, 제스처 판정 로직(`GestureConfig` 기준값)은 별도 테스트로 검증
   - Python 서버: `input_controller.py`의 `handle_event` 등 이벤트 처리 로직은 `unittest`/`pytest`로 단위 테스트 작성
@@ -433,4 +461,7 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | 입력 실패의 사용자 노출 | `InputController.input_failures`로 누적 실패 수를 읽을 수 있지만 트레이/UI에 아직 표시하지 않는다. 누적 전용(리셋 API 없음)이라 트레이에 붙일 때는 "최근 N초 실패" 표현이 필요할 수 있음 |
 | 연결 타임아웃/취소 실기기 검증 | `CONNECT_TIMEOUT_MS`(5초) 만료 체감, `Connecting` 화면의 "취소" 버튼 렌더·반응, 오류 2줄의 소형 화면 잘림, 취소 후 IP 입력값 유지는 실기기 미검증(컴파일·JVM 단위 테스트만 통과). 타임아웃이 실제로 만료되는 경로는 블랙홀 주소가 필요해 단위 테스트로 재현하지 않았고, 고정한 것은 "OS 기본값에 맡기지 않는다"는 계약이다. 취소 직후 최대 5초간 뒤에서 도는 연결 시도는 결과가 버려지므로(`connectEpoch`) 무해하다 |
 | 오류 문구의 다국어 | `ConnectionErrorMessages`가 한국어 문자열을 코드에 직접 담고 있다(단일 로케일 전제). 다국어가 필요해지면 이 파일 하나만 `strings.xml`로 옮기면 된다 |
+| 3손가락 제스처 실기기 검증 | 임계 120px의 체감, 제조사 시스템 제스처(스크린샷/분할화면 등)가 3손가락 터치를 가로채는지, 실제 터치에서 `pointerCount == 3`이 안정적으로 보고되는지 미검증. 임계값이 dp가 아니라 px라(기존 모든 제스처 상수와 동일 규약) 고해상도 기기에서는 상대적으로 짧게 느껴질 수 있음. `TrackpadScreen`의 3번째 손가락 flush/consume 배선은 Compose 의존이라 자동 테스트가 없다(판정 로직은 순수 클래스로 전부 커버) |
+| 데스크톱 전환 실기기 미검증 | 키 코드·플래그·순서·`sizeof(INPUT)`·주입 성공은 테스트와 실측으로 고정했으나, Ctrl+Win+Left/Right가 실제로 데스크톱을 넘기는지는 사람이 한 번 확인해야 한다(테스트 중 실제 전환은 고의로 실행하지 않음). 주입이 2개(Ctrl↓ Win↓)만 성공한 뒤 정리 키 업이 나가면 Win 키 업이 시작 메뉴를 열 수 있다(Win 고착보다는 낫다고 판단, 실기기 확인 항목). 정리 키 업마저 실패하는 경우는 코드로 더 막을 수 없다. 실패 1회당 `input_failures`가 2 증가(본 시퀀스 + 정리) — 트레이에 노출할 때 감안할 것 |
+| 3손가락 래치의 UX 대가 | 2손가락 스크롤 중 세 번째 손가락이 스치면 그 제스처의 남은 스크롤이 전부 억제된다(어긋난 릴리스의 클릭 오발동 차단과 맞바꾼 스펙). 4→3 전환은 새 구간이 시작되므로 전환이 발사될 수 있다(구간 단위 정의의 귀결, 실해 없음). 실기기에서 거슬리면 재논의 |
 | 앱 백그라운드 진입 시 드래그 미종료 | 드래그 홀드 중 Android 앱이 백그라운드로 가서 `TrackpadViewModel`이 파기되면 `DRAG_END`를 보낼 기회가 없다 — 서버 heartbeat 타임아웃(≈15초)이 감지해 강제로 놓을 때까지 PC 버튼이 눌린 채 유지됨. 실기기 미검증 |

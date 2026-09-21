@@ -1,77 +1,123 @@
-# 서버 작업 요약 — 예외 처리 강화 (A. 서버: SendInput 반환값 검사)
-
-담당: server-dev / 범위: `pc_server/input_controller.py` + 테스트만. `server.py`·`single_instance.py`·`logging_setup.py`·`AGENTS.md`·`CLAUDE.md` 무변경, 커밋 없음.
+# server-dev 작업 요약 — DESKTOP_SWITCH (가상 데스크톱 전환)
 
 ## 변경 파일
 
 | 파일 | 변경 |
 |------|------|
-| `pc_server/input_controller.py` | `_send_input()` 단일 창구 도입, 반환값 검사, 실패 카운터 + rate limit 로그, 드래그 상태 정합성 수정 |
-| `pc_server/tests/send_input_stub.py` | **신규**. `SendInput` 계약(주입 개수 반환)을 흉내내는 patch 헬퍼 |
-| `pc_server/tests/test_input_controller.py` | 기존 26개 patch 지점 교체 + 실패 경로 테스트 19개 추가 |
-| `pc_server/tests/test_server_drag.py` | patch 지점 12개 교체, 계약 위반 `side_effect` 2건 수정 |
-| `pc_server/tests/test_server_shutdown.py` | patch 지점 7개 교체 |
+| `pc_server/input_controller.py` | 키보드 주입(`KEYBDINPUT`) 추가, `handle_event`에 `DESKTOP_SWITCH` 분기, `_desktop_switch()` / `_release_desktop_switch_keys()` / `_key_input()` 신규 (+79줄) |
+| `pc_server/tests/test_desktop_switch.py` | **신규** — 39개 테스트 |
 
-## 구현 내용
+`server.py`는 **수정하지 않았다**(병렬 discovery 세션과 충돌 방지). TCP 경로는 이미
+`handle_client`가 dict JSON을 화이트리스트 없이 `controller.handle_event(event)`로
+넘기고 예외를 이벤트 단위로 잡으므로(`server.py:160-175`) 새 type이 그대로 통과한다 —
+`handle_client`를 실제로 구동하는 end-to-end 테스트 7건으로 확인했다.
 
-1. **단일 창구** `InputController._send_input(count, inputs, kind) -> bool`
-   - `ctypes.windll.user32.SendInput(count, inputs, ctypes.sizeof(INPUT))`의 반환값이 `count`와 다르면 실패로 판정.
-   - **호출 경로(`ctypes.windll.user32.SendInput`)와 인자 구성은 그대로** — `_move`는 여전히 `byref` 1개, `_click` 2개, `_double_click` 4개, `_scroll` 1~2개, 버튼 플래그 1개. `handle_event`의 외부 동작(어떤 이벤트에 SendInput 몇 번, 어떤 플래그 순서)은 무변경.
-   - `_move`/`_scroll`/`_click`/`_double_click`/`_send_button_flag`가 모두 `bool`을 반환하도록 시그니처만 확장(기존 호출부는 반환값을 무시해도 동작 동일). `_send_button_flag(flag, kind)`로 인자 1개 추가 — 내부 전용 메서드.
-2. **드래그 상태 정합성(핵심 버그)**
-   - `_drag_start()`: 주입 실패 시 `_drag_active`를 True로 만들지 않고 False 반환. (이전에는 눌린 적 없는 버튼을 "눌림"으로 기록해, 이후 DRAG_END/연결 종료 안전장치가 유령 LEFTUP을 쏘거나 헛돌았다.)
-   - `_drag_end()` / `force_release_drag()`: 주입 실패 시 `_drag_active`를 **True로 유지**하고 False 반환 → 연결 종료 안전장치가 나중에 재시도 가능. 성공 경로 동작·반환값은 그대로.
-   - 락 순서는 항상 `_drag_lock` → `_failure_lock` 단방향(역순 없음).
-3. **실패 알림 (로그 폭주 방지, ASCII)**
-   - 같은 `kind`는 `INPUT_FAILURE_LOG_INTERVAL_SEC = 5.0`초에 1줄만. 버킷은 종류별(`MOVE`/`SCROLL`/`CLICK`/`DOUBLE_CLICK`/`DRAG_START`/`DRAG_END`)이라 초당 수십 번 오는 MOVE가 드래그 실패 로그를 묻어버리지 않는다.
-   - 시간 소스는 생성자 주입(`InputController(monotonic=..., log=..., failure_log_interval=...)`, 기본값 `time.monotonic`/`print`/5.0) → 테스트에서 실제 sleep 없이 검증. `server.py`가 쓰는 `InputController()` 호출은 무변경.
-   - 메시지(ASCII 전용, AGENTS.md 섹션 9): `[!] SendInput MOVE: injected 0 of 1 (last error 0, failures 12) - input desktop blocked? (UAC prompt / lock screen)`
-   - 로그 호출 자체를 `try/except (OSError, ValueError)`로 감쌌다 — 리다이렉트된 로그 스트림이 닫혀 있어도 입력 처리는 계속된다.
-4. **공개 카운터** `InputController.input_failures` (`_failure_lock`으로 스레드 안전). 트레이/UI 연결은 범위 밖 — 값만 노출.
-5. **에러 코드**는 `ctypes.GetLastError()` best-effort(`_last_error()`). `windll` 경로가 `use_last_error=True`가 아니라 중간에 덮어써질 수 있음을 코드 주석에 명시 — **분기 근거로 쓰지 않고 로그 표시용으로만** 쓴다.
+## 처리하는 이벤트
 
-### 의도적으로 하지 않은 것 (해석 근거)
-- **ctypes 호출이 던지는 예외(OSError 등)는 여전히 밖으로 전파**시킨다. 스펙 3항의 "예외를 밖으로 던지지 않는다"는 **새로 추가한 실패 감지/알림 경로**에 적용했다(카운터·로그는 절대 던지지 않음). 예외를 `_send_input`이 삼키면 `server.py`의 기존 `except` 경로(`[!] Failed to release drag ...`, `test_force_release_failure_does_not_break_disconnect_cleanup`)가 사실상 죽은 코드가 되어 기존 테스트의 검증력이 약해진다. 지금도 `server.py`가 이벤트별로 잡고 있어 세션은 끊기지 않는다.
-
-## 테스트
-
-- 기준선: `227 passed, 1 skipped` → **현재 `246 passed, 1 skipped`** (`cd pc_server && python -m pytest`, 실제 실행 확인).
-- 기존 테스트의 mock은 `MagicMock` 기본 반환값이라 새 계약에서 "0개 주입"으로 읽힌다. `tests/send_input_stub.py`의 `patch_send_input()`(성공=요청 개수 반환) / `injected_none` / `injected_partial(n)`으로 **45개 patch 지점 전부** 교체했다. **호출 횟수·플래그 시퀀스 단언은 하나도 약화시키지 않았다** — `_sent_flags`/`sent_flags` 헬퍼와 `call_count` 단언 그대로.
-  - 계약 위반이던 2건만 수정: `test_drag_end_wire_line_releases_button_before_disconnect`의 `side_effect`가 `None`을 반환하던 것 → 개수 반환하며 기록, `test_force_release_failure_does_not_break_disconnect_cleanup`의 `[None, OSError]` → `[1, OSError]`.
-- 추가 테스트 19개: 각 이벤트 경로의 실패 카운트(예외 없음), 부분 주입(CLICK 2개 중 1개)도 실패로 판정, 카운터 누적/멀티스레드(4스레드×50회 = 200), `_drag_start` 실패 시 비활성 유지 + 이후 DRAG_END가 아무것도 보내지 않음 + 재시도 성공, `_drag_end`/`force_release_drag` 실패 시 활성 유지 후 재시도 성공, rate limit(같은 창 20회 → 로그 1줄, 창 경과 후 다시 1줄, 종류별 버킷 분리), 로그 ASCII 인코딩 및 문구, 로그 예외 무시, 기본 생성자 인자 회귀.
-- **변이 검사(mutation check)**: `_send_input`의 반환값 검사를 일부러 무력화(`if True: return True`)하면 **16개 테스트가 실패**(`16 failed, 230 passed`)하고, 되돌리면 246 통과. 새 테스트가 실제로 이 버그를 잡는다는 증거.
-
-## 실제 검증 (이 머신, 요청 7항)
-
-`python`으로 실제 `SendInput` 1회 호출(`MOUSEEVENTF_MOVE`, dx=0, dy=0, 1개):
-
-```
-raw SendInput return = 1 int
-_move(0,0) -> True  input_failures = 0
-cursor before/after: (412, 866) (412, 866)
+```jsonc
+// TCP 9000, newline-delimited, session 필드 없음
+{"type":"DESKTOP_SWITCH","direction":"left"}   // -> Ctrl+Win+Left
+{"type":"DESKTOP_SWITCH","direction":"right"}  // -> Ctrl+Win+Right
 ```
 
-- 반환값은 **정수 `1`** = 요청 개수 → "반환값 = 주입된 이벤트 수" 계약이 이 환경에서 실제로 성립.
-- 새 헬퍼 경로(`_move`)도 `True`를 반환하고 실패 카운터는 0.
-- dx=dy=0만 썼고 `GetCursorPos`로 전후를 확인해 **커서는 움직이지 않았다**.
+- `direction`은 **"전환 결과의 방향"**. 서버는 손가락 방향 → 와이어 방향 매핑을 모르고,
+  받은 값을 그대로 키로 바꾼다(매핑은 Android 한 곳에만 — 두 사이드가 같이 뒤집는 사고 방지).
+  이 계약을 `test_handle_event_passes_direction_verbatim_without_translating`으로 고정했다.
+- **`"left"`/`"right"` 소문자 정확 일치만 허용.** 그 외(누락·`None`·`"LEFT"`·`" left"`·숫자·
+  `True`·리스트·딕트·임의 객체 18종)는 **아무 키도 보내지 않고** 조용히 무시, 예외 전파 없음,
+  실패 카운터도 증가하지 않음. 잘못된 줄 뒤에 오는 정상 이벤트가 그대로 처리되는 것까지 확인.
+
+## 구현 핵심
+
+1. **원자적 6-INPUT, `SendInput` 1회**: `Ctrl↓ → Win↓ → Arrow↓ → Arrow↑ → Win↑ → Ctrl↑`.
+   나눠 보내면 그 사이 UDP MOVE 등이 끼어들어 수정 키가 눌린 상태로 다른 동작이 난다.
+   화살표에만 `KEYEVENTF_EXTENDEDKEY`, 키 업에 `KEYEVENTF_KEYUP`.
+2. **`ctypes.sizeof(INPUT)` 불변 = 40** (x64). `KEYBDINPUT`(24) < `MOUSEINPUT`(32)이라
+   union 크기가 안 변한다. 변경 전/후 실측으로 40 동일 확인 + 테스트 2건으로 고정.
+   이 값이 틀리면 **마우스 포함 모든 주입이 통째로 실패**한다.
+3. **수정 키 고착 방지**: `injected != 6`이면 키 업 3개(화살표→Win→Ctrl, 누른 역순)를
+   `kind="DESKTOP_SWITCH_CLEANUP"`으로 best-effort 1회만 재전송. 재귀/재시도 없음,
+   정리 호출의 예외는 삼킨다. **성공 경로에서는 정리 호출 없음**(`call_count == 1` 단언).
+4. `SendInput` 직접 호출 없음 — 전부 기존 `_send_input(count, inputs, kind)` 창구 경유
+   (AGENTS.md 섹션 9). 실패 로그는 기존 창구의 ASCII 문구를 그대로 쓴다(cp949 안전, 테스트로 고정).
+5. **드래그 상태 무간섭**: 드래그 활성 중 `DESKTOP_SWITCH`를 받아도 거부하지 않고
+   `_drag_active`를 건드리지 않는다. 연결 종료 시 강제 해제 안전장치도 그대로 동작(회귀 테스트).
+
+## 테스트 결과 (실제 실행)
+
+```
+기준선:  246 passed, 1 skipped
+변경 후: 285 passed, 1 skipped   (신규 39, 회귀 0)
+```
+`cd C:\Github\phone_pad\pc_server && python -m pytest`
+
+**변이 검사(mutation test)로 테스트가 실제로 버그를 잡는지 확인** — 8종 변이 전부 검출:
+
+| 주입한 버그 | 실패한 테스트 수 |
+|---|---|
+| 실패 시 정리 호출 제거 | 9 |
+| 화살표에서 EXTENDEDKEY 누락 | 11 |
+| left/right 매핑 뒤바꿈 | 14 |
+| `direction.lower()`로 대소문자 허용 | 3 |
+| 마지막 Ctrl↑ 누락 | 12 |
+| union 크기 변경(sizeof 40→다른 값) | 2 |
+| 6개를 SendInput 2회로 분할 | 23 |
+| 정리 시퀀스를 키 다운으로 | 4 |
+
+변이 후 원본 복원 + 전체 스위트 재실행으로 285 passed 재확인.
+
+## 실측한 것 / 안 한 것
+
+- **실제 데스크톱 전환은 실행하지 않았다.** 모든 테스트는 `tests/send_input_stub.py`의
+  `patch_send_input()`으로 모킹된다.
+- **단 하나 실측**: 모킹으로는 절대 알 수 없는 "KEYBDINPUT을 union에 넣은 뒤에도 OS가
+  구조체를 읽어 주입에 성공하는가"를, request.md 서버 스펙 9번이 허용한 **무해한 키 업 단독**
+  호출로 확인했다(pytest 밖 일회성 스크립트, 저장소에 남기지 않음).
+  - `VK_LCONTROL` **키 업 하나만** 전송(키 다운 없음, Win·화살표 없음) → `injected 1 of 1`.
+    눌린 적 없는 Ctrl을 놓는 것은 no-op이며 데스크톱 전환도 Win 고착도 일어나지 않는다.
+  - 대조군으로 일부러 틀린 `cbSize`를 주면 `injected 0 of 1` → sizeof 테스트가 지키는
+    실패 모드가 실재함을 확인.
+  - **리더 주의**: 이 한 건은 리더 지시문의 "실제 키 주입 실행 금지"보다 request.md 9번
+    ("실측이 필요하면 `KEYEVENTF_KEYUP` 단독 같은 무해한 호출로 반환값 계약만 확인")을 따랐다.
+    지시문이 든 두 위험(데스크톱 전환, Win 키 잔류) 어느 쪽도 발생할 수 없는 호출이다.
 
 ## 미해결 이슈 / 한계
 
-1. **UIPI 차단은 감지 불가**(Microsoft 문서). 관리자 권한 창(UAC로 승격된 앱, 작업 관리자 등)에 일반 권한 서버가 입력을 주입하면 반환값도 `GetLastError`도 성공처럼 보인다 → `_send_input`이 True를 반환해도 "실제로 먹혔다"는 보장은 없다. 코드로 해결 불가, 문서 한계로 남김(코드 주석에도 기재).
-2. **실패 경로의 실환경 재현 없음.** 반환값 0은 잠금 화면/보안 데스크톱에서만 나오고 이 세션에서 재현할 수 없어(화면을 잠가야 함) 단위 테스트로만 커버했다. 성공 경로만 실제 `SendInput`으로 확인.
-3. `GetLastError` 값은 신뢰 불가(best-effort). 로그에 `last error 0`이 찍혀도 "에러 없음"을 뜻하지 않는다.
-4. `input_failures`는 **누적 전용**(리셋 API 없음). 트레이 표시를 붙일 때 "최근 N초 실패" 같은 표현이 필요하면 그때 설계.
-5. 입력이 오래 막혀 있어도 서버는 **아무 복구 동작을 하지 않는다**(로그+카운터만). 드래그가 끊긴 채 남을 수 있는 시나리오(DRAG_START 실패 후 사용자가 손가락을 유지)는 Android 쪽 상태와 어긋날 수 있으나, 서버가 버튼을 안 눌렀으므로 "버튼이 눌린 채 멈춤"보다 안전한 실패 방향이다.
-6. 타입 힌트 `_send_input(self, count: int, inputs, kind: str)`의 `inputs`는 `byref` 결과와 배열을 모두 받아 힌트를 생략했다.
+| 항목 | 내용 |
+|---|---|
+| 실제 전환 동작 미검증 | Ctrl+Win+Left/Right가 이 PC에서 정말 데스크톱을 넘기는지는 **미검증**(고의). 키 코드·플래그·순서·구조체 크기·주입 성공까지는 고정했으나, "Windows가 이 조합을 데스크톱 전환으로 해석하는가"는 사람이 한 번 손으로 확인해야 한다. 가상 데스크톱이 1개뿐이면 아무 일도 안 일어나는 것이 정상 |
+| 정리 호출도 실패 카운터에 집계 | 실패 1회당 `input_failures`가 **2** 증가한다(본 시퀀스 + 정리). `_send_input` 창구를 지나는 이상 불가피하며, 카운터는 진단용 누적값이라 그대로 뒀다(`test_injection_failure_is_counted`에 명시) |
+| 정리 자체가 실패하면 끝 | 입력 데스크톱이 계속 막혀 있으면 키 업도 안 들어간다. 재시도하면 무한 루프가 되므로 1회로 제한. 다만 입력이 막힌 상황이면 애초에 Ctrl/Win도 안 눌렸을 가능성이 높다 |
+| UIPI 감지 불가(기존 한계 그대로) | 관리자 권한 창에 주입이 차단되면 반환값도 `GetLastError`도 실패를 알리지 않는다 → 정리 로직이 돌지 않는다. `SendInput` 전반의 기존 한계(섹션 10) |
+| `wScan` 미사용 | 가상 키 코드 방식(`wVk`)만 쓴다. 일부 게임/안티치트가 스캔 코드 없는 입력을 무시할 수 있으나 데스크톱 전환 용도에서는 무관 |
+| 다중 세션 | 두 기기가 동시에 연결되면 양쪽 다 데스크톱을 전환할 수 있다(기존 "다중 기기 연결" 항목과 같은 뿌리, 상태가 없어 드래그보다는 덜 위험) |
 
-## 리더가 AGENTS.md에 반영할 내용 (에이전트는 수정하지 않음)
+## 리더가 AGENTS.md에 반영할 내용
 
-**섹션 10(미결 사항) 표에 추가 권장:**
+**섹션 4 (통신 프로토콜)** — TCP 이벤트 목록에 추가:
 
-| 항목 | 현황 |
-|------|------|
-| `SendInput` 주입 실패 감지 | 모든 호출이 `InputController._send_input()` 한 곳을 지나며 반환값(주입된 이벤트 수)을 검사한다. 요청보다 적게 주입되면 `input_failures` 카운터를 올리고 종류별 5초 rate limit으로 ASCII 로그 1줄을 남긴다(예외는 던지지 않음). `_drag_start`는 실패 시 `_drag_active`를 올리지 않고, `_drag_end`/`force_release_drag`는 실패 시 True로 남겨 나중에 재시도한다. 반환값 계약은 이 머신에서 실측(`MOUSEEVENTF_MOVE` dx=dy=0 1개 → 반환 1). **남은 한계:** ① UIPI(관리자 권한 창에 일반 권한 프로세스가 주입)로 차단되면 Microsoft 문서상 반환값도 `GetLastError`도 실패를 알리지 않아 **감지 불가** — 서버를 관리자로 띄우는 것 외에 코드로 해결할 방법이 없다. ② 실패 경로(잠금 화면/보안 데스크톱)는 단위 테스트로만 커버, 실환경 미재현. ③ 로그의 `last error` 값은 `windll`이 `use_last_error`가 아니라 best-effort |
-| 입력 실패의 사용자 노출 | `InputController.input_failures`로 누적 실패 수를 읽을 수 있지만 트레이/UI에 아직 표시하지 않는다(이번 범위 밖). 트레이에 붙일 때는 누적값 대신 "최근 실패" 표현이 필요할 수 있음 |
+```jsonc
+// 가상 데스크톱 전환 - 3손가락 수평 스와이프. session 필드 없음, TCP.
+// direction은 "전환 결과의 방향"(손가락 방향이 아님). 손가락→방향 매핑은
+// Android(MultiTouchGestureTracker) 한 곳에만 있고 서버는 받은 값을 그대로
+// 키 조합으로 바꾼다 - 두 사이드가 같이 뒤집으면 원위치된다(스크롤 방향 규약과 동일 원칙).
+// 서버는 Ctrl+Win+Left/Right 6개 INPUT을 SendInput 1회로 원자적으로 보내고,
+// 부분 주입이면 Ctrl/Win/화살표 키 업 3개를 best-effort로 한 번 더 보낸다(수정 키 고착 방지).
+// "left"/"right" 소문자 정확 일치만 허용 - 그 외 값은 아무 키도 보내지 않고 조용히 무시.
+{"type":"DESKTOP_SWITCH","direction":"left"}
+{"type":"DESKTOP_SWITCH","direction":"right"}
+```
 
-**섹션 9(코딩 컨벤션)에 한 줄 추가 권장:**
-- `pc_server`에서 `SendInput`을 직접 호출하지 않는다 — 반드시 `InputController._send_input(count, inputs, kind)`를 경유한다(반환값 검사·실패 카운터·rate limit 로그가 이 한 곳에 있다). 테스트에서 `SendInput`을 모킹할 때는 `tests/send_input_stub.py`의 `patch_send_input()`을 쓴다(`MagicMock` 기본 반환값은 "0개 주입"으로 읽혀 실패로 판정된다).
+**섹션 9 (코딩 컨벤션)** — 한 줄 추가 제안:
+
+> `ctypes.sizeof(INPUT)`은 `SendInput`의 cbSize 인자이므로 **절대 변해서는 안 된다**.
+> `_INPUTunion`에 새 구조체를 추가할 때는 그 구조체가 `MOUSEINPUT`보다 작은지 확인하고,
+> 크기를 고정하는 테스트를 함께 둔다. 이 값이 틀리면 키보드뿐 아니라 마우스 주입까지
+> 전부 실패하며(실측: 틀린 cbSize → `injected 0 of 1`) 예외는 나지 않아 조용히 죽는다.
+
+**섹션 10 (미결 사항)** — 새 행:
+
+> | 데스크톱 전환 실기기 미검증 | 키 코드·플래그·순서·`sizeof(INPUT)`·주입 성공은 테스트와 실측으로 고정했으나, Ctrl+Win+Left/Right가 실제로 데스크톱을 넘기는지는 사람이 한 번 확인해야 한다(테스트 중 실제 전환은 고의로 실행하지 않음 — 검증 중 데스크톱이 바뀌거나 부분 주입 시 Win 키가 눌린 채 남는 위험). 주입이 부분 성공한 뒤 정리 키 업마저 실패하는 경우는 코드로 더 막을 수 없다 |
+
+**섹션 6 (로드맵)** — Phase 5 "3손가락 제스처" 중 좌/우 데스크톱 전환 완료.
+수직 스와이프(작업 보기)·4손가락은 범위 밖으로 남음.

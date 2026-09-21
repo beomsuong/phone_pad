@@ -1,218 +1,152 @@
-# 01 android-dev — 예외 처리 강화 (B. Android)
+# android-dev 요약 — 3손가락 스와이프 → DESKTOP_SWITCH (Phase 5 첫 항목)
 
-담당 범위: `request.md`의 **B. Android** 절만. `pc_server/`는 건드리지 않음.
-커밋하지 않음. `AGENTS.md`/`CLAUDE.md` 수정하지 않음. `TrackpadEvent`/와이어 프로토콜 무변경.
+확정 스펙(`_workspace/00_input/request.md`의 "와이어 스펙" + "Android 스펙")을 **그대로** 구현했다.
+스펙에서 벗어난 부분 없음. 커밋하지 않았고 `pc_server/`·`AGENTS.md`·`CLAUDE.md`는 건드리지 않았다.
 
----
+## 와이어 스펙 (구현된 그대로)
 
-## 1. 결과 요약
-
-| 확정 스펙 | 상태 |
-|---|---|
-| 1. `CONNECT_TIMEOUT_MS = 5000` + `Socket()` + `connect(InetSocketAddress, timeout)` | 완료 |
-| 2. 첫 연결(`Connecting`)에 "취소" 버튼 — 오류 없이 `Disconnected` 복귀, 뒤늦은 결과가 상태를 못 덮어씀 | 완료 |
-| 3. 예외 → 한국어 조치 힌트 순수 함수 + 표시 계층 적용 | 완료 |
-| 4. 내부 문자열(`"Heartbeat timeout"` 등)·재연결 로직 유지 | 유지됨 (아래 2.4 참조) |
-| 5. 친절한 문구 = 주 메시지 / 원문 = 보조 줄 | 완료 |
-
-**테스트: 258 passed, 0 failed, 0 skipped** (기준선 217 + 신규 41).
-**UI 미확인 — 컴파일 + JVM 단위 테스트만 검증** (실기기/에뮬레이터 없음).
-
----
-
-## 2. 변경 파일
-
-### 신규 (main)
-| 파일 | 역할 |
-|---|---|
-| `app/src/main/java/.../domain/model/ConnectionErrorKind.kt` | 실패 원인 종류 enum (9개) |
-| `app/src/main/java/.../domain/model/ConnectionErrorClassifier.kt` | `Throwable` → `ConnectionErrorKind` **순수 함수** |
-| `app/src/main/java/.../presentation/util/ConnectionErrorMessages.kt` | `kind`(+원문) → 한국어 문구/보조 줄. **순수 함수**, Compose 비의존 |
-| `app/src/main/java/.../presentation/trackpad/ConnectionErrorSection.kt` | 오류 2줄 렌더 컴포저블 (`TrackpadScreen` 변경 면적 축소용 분리) |
-
-### 수정 (main)
-| 파일 | 변경 |
-|---|---|
-| `presentation/util/GestureConfig.kt` | `CONNECT_TIMEOUT_MS = 5000` 추가 (근거 주석 포함) |
-| `data/network/TcpClient.kt` | `Socket(host, port)` → `Socket()` + `connect(InetSocketAddress, connectTimeoutMs)`. 실패 시 소켓/필드 정리 후 rethrow. 테스트 주입점 `internal var connectTimeoutMs` / `internal var socketFactory` |
-| `domain/model/ConnectionState.kt` | `Error(message)` → `Error(message, kind = UNKNOWN)` (2번째 인자 **기본값 있음**) |
-| `domain/repository/TrackpadRepository.kt` | `suspend fun cancelConnect()` 추가 |
-| `data/repository/TrackpadRepositoryImpl.kt` | `connectEpoch` 도입, `cancelConnect()` 구현, `openConnection`에 `isStillWanted` 람다 + `ConnectOutcome`(Success/Cancelled/Failure), 각 실패 경로에 `kind` 부여 |
-| `presentation/trackpad/TrackpadViewModel.kt` | `cancelConnect()` 추가 (UseCase 무관 — 연결 제어는 기존 `connect`/`disconnect`와 동일 경로) |
-| `presentation/trackpad/TrackpadScreen.kt` | **최소 변경**: `Connecting` 분기에 `onCancel` 1개, `ConnectPanel(errorMessage: String?)` → `error: ConnectionState.Error?`, 오류 렌더 8줄 → `ConnectionErrorSection(error)` 1줄, KDoc 갱신 |
-
-### 신규 (test)
-- `data/network/TcpClientConnectTimeoutTest.kt` (7)
-- `data/repository/TrackpadRepositoryCancelConnectTest.kt` (8)
-- `domain/model/ConnectionErrorClassifierTest.kt` (10)
-- `presentation/util/ConnectionErrorMessagesTest.kt` (12)
-
-### 수정 (test)
-- `presentation/util/GestureConfigTest.kt` (+2)
-- `presentation/trackpad/TrackpadViewModelTest.kt` (+2)
-- `data/repository/TrackpadRepository{Impl,Heartbeat,Reconnect}Test.kt` — **의도된 계약 변경분만**: `Error("...")` 단언에 2번째 인자(`kind`) 추가 12곳 + import 1줄. 메시지 문자열·검증 의미는 하나도 약화시키지 않음
-
----
-
-## 3. 구현한 로직
-
-### 3.1 연결 타임아웃
-```kotlin
-const val CONNECT_TIMEOUT_MS = 5000   // GestureConfig
+```jsonc
+// TCP 9000, newline-delimited, session 필드 없음, 공백 없음, 필드 순서 type → direction
+{"type":"DESKTOP_SWITCH","direction":"left"}   // 왼쪽 데스크톱으로 전환 (= Ctrl+Win+Left)
+{"type":"DESKTOP_SWITCH","direction":"right"}  // 오른쪽 데스크톱으로 전환 (= Ctrl+Win+Right)
 ```
-근거(코드 주석에 기록): 같은 LAN의 살아있는 서버는 handshake가 수 ms~수십 ms /
-혼잡한 Wi-Fi의 TCP 초기 재전송(RTO≈1s, 이후 2s) 2~3회는 덮어야 함 / OS 기본값(Android 20초+)은
-오타 IP에 사용자를 가둠. **`SESSION_HANDSHAKE_TIMEOUT_MS`(3초)와 직렬** → 최악 8초, 그 전에 취소 가능.
 
-`TcpClient.connect()`는 소켓을 **연결 시도 전에** `socket` 필드에 등록한다 — 블로킹 `connect()`는
-코루틴 취소로 풀리지 않으므로 다른 코루틴이 `disconnect()`로 소켓을 닫아 깨우는 것이 유일한 수단이다.
-실패 시 `s.close()` + (`socket === s`일 때만) `disconnect()`로 죽은 소켓을 남기지 않고 예외를 그대로 올린다.
+- `direction`은 **전환 결과의 방향**이다(손가락 방향이 아님).
+- 손가락 방향 → 와이어 방향 매핑은 **`MultiTouchGestureTracker.resolveDesktopSwitch()` 한 곳에만** 있다.
+  - 손가락 **왼쪽** 스와이프 → `"right"`
+  - 손가락 **오른쪽** 스와이프 → `"left"`
+- 전송 채널: **TCP**(CLICK/DOUBLE_CLICK과 완전히 같은 경로 — `sendOverTcp()` → 실패 시 `reportConnectionLost`).
+  MOVE/SCROLL의 "조용한 실패"가 아니다.
 
-### 3.2 첫 연결 취소 (경합 설계 — AGENTS.md 섹션 6 패턴 준수)
-새 카운터 **`connectEpoch`**(기존 `generation`/`reconnectEpoch`와 별개):
-- `connect()` / `cancelConnect()` / `disconnect()`가 올린다. **자동 재연결 루프는 건드리지 않는다**
-  (재연결이 이 값을 올리면 락을 기다리던 사용자의 수동 연결이 영문도 모르고 무효화된다).
-- `openConnection(host, port) { connectEpoch.get() == epoch }` — 블로킹 접속이 끝난 **직후**,
-  `Connected`를 쓰기 **전에** 유효성을 확인한다.
+## 변경 파일
 
-`cancelConnect()`는 전부 **뮤텍스 밖**에서, 이 순서로:
-1. `Connecting`이 아니면 즉시 return (살아있는 연결·재연결을 건드리지 않음)
-2. `connectEpoch++` — 진행 중 시도 선무효화
-3. `_connectionState = Disconnected` — **오류 표시 없음**
-4. `cleanUp()` → 소켓 close로 블로킹 `connect()` 깨움
+### 프로덕션 (`phone_pad_app/app/src/main/java/com/example/phone_pad_app/`)
+| 파일 | 변경 |
+|------|------|
+| `domain/model/TrackpadEvent.kt` | `data class DesktopSwitch(val direction: String)` 추가 (`Click(button)`과 같은 스타일, 기본값 없음) |
+| `data/repository/TrackpadRepositoryImpl.kt` | `sendEvent`의 `when`에 분기 추가 → `sendOverTcp("""{"type":"DESKTOP_SWITCH","direction":"${'$'}{event.direction}"}""")` |
+| `presentation/util/GestureConfig.kt` | `THREE_POINTER_COUNT = 3`, `THREE_FINGER_SWIPE_MIN_DISTANCE_PX = 120f`, `THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE = 2f` 추가 (사용자 설정으로 열지 않음) |
+| `presentation/trackpad/MultiTouchGestureTracker.kt` | `GestureDecision.desktopSwitch: String?` 추가, 3손가락 스와이프 판정(`resolveDesktopSwitch`), 구간당 1회 래치(`desktopSwitchEmittedInSegment`), **제스처 단위 3손가락 래치**(`threeFingerLatched`), companion `DIRECTION_LEFT`/`DIRECTION_RIGHT` |
+| `presentation/trackpad/TrackpadViewModel.kt` | `sendDesktopSwitch(direction)` 추가 — UseCase 경유 (네트워크 직접 호출 없음) |
+| `presentation/trackpad/TrackpadScreen.kt` | `onDesktopSwitch: (String) -> Unit` 배선, 3번째 손가락이 닿는 순간 `flushPendingClick()` + `doubleTapDetector.reset()`, 안내 문구 한 줄 추가 (최소 diff) |
 
-`openConnection`의 반환을 `String?`에서 `ConnectOutcome`(Success/**Cancelled**/Failure)으로 바꿔
-"실패"와 "취소"를 구분한다. Cancelled면 호출자는 상태를 쓰지 않는다. 취소와 접속 성공이 겹치면
-붙어버린 소켓을 `cleanUp()`으로 반드시 닫는다(서버에 유령 세션을 남기지 않기 위해).
-`CancellationException`은 기존대로 별도 catch에서 rethrow.
+### 테스트 (`phone_pad_app/app/src/test/java/com/example/phone_pad_app/`)
+| 파일 | 변경 |
+|------|------|
+| `presentation/trackpad/MultiTouchGestureTrackerDesktopSwitchTest.kt` | **신규 23건** — 방향 매핑, 임계/우세 조건, 구간당 1회, 4손가락, 래치 |
+| `data/repository/TrackpadRepositoryImplTest.kt` | +4건 — 와이어 리터럴 2종 고정, 방향 무변형, 전송 실패 → Error 합류 |
+| `presentation/trackpad/TrackpadViewModelTest.kt` | +3건 — UseCase 위임, 방향 뒤집기 없음, 상수 일치 |
+| `presentation/util/GestureConfigTest.kt` | +4건 — 상수 값 고정 + 불변식(`> TAP_MAX_DISTANCE_PX * 2`, `> DOUBLE_TAP_DISTANCE_PX`, 우세 배수 > 1) |
 
-부수 효과(개선): 수동 연결이 끼어들 때 진행 중이던 **재연결** 시도도 같은 람다
-(`reconnectEpoch` 기준)로 Cancelled 처리되어, 이전처럼 "재연결이 방금 만든 연결을 놔둔 채
-수동 연결이 또 붙는" 이중 접속 창이 닫혔다. 기존 "사용자 조작이 항상 이긴다" 테스트는 그대로 통과.
+**기존 `MultiTouchGestureTrackerTest`(36건)는 한 줄도 고치지 않았다** — "래치가 1·2손가락 동작을 바꾸면 안 된다"는 스펙 6번의 기준을 그대로 만족.
 
-### 3.3 메시지 매핑 (순수 함수 2단)
-`ConnectionErrorClassifier.classify(Throwable?)` — 타입 → 메시지 키워드 → 폴백 순.
-원인 체인을 최대 5단계까지 따라가며, 자기 자신을 cause로 갖는 예외에서도 멈춘다.
+## 설계 메모 (리뷰 포인트)
 
-| 입력 | kind | 사용자 문구(요지) |
-|---|---|---|
-| `ConnectException` / `"refused"` | `CONNECTION_REFUSED` | 서버 실행 여부 + 방화벽 TCP **9000**(상수에서 가져옴) |
-| `SocketTimeoutException` / `"timed out"` | `TIMEOUT` | IP가 맞는지, 같은 Wi-Fi인지 |
-| `UnknownHostException` / `"unable to resolve host"` | `UNKNOWN_HOST` | 주소를 찾을 수 없음, IP 확인 |
-| `NoRouteToHostException`/`PortUnreachableException`/`"unreachable"` | `NETWORK_UNREACHABLE` | Wi-Fi 확인 |
-| 핸드셰이크 null/blank | `HANDSHAKE_FAILED` | Phone Pad 서버가 맞는지/버전 |
-| heartbeat 미응답 한계 | `HEARTBEAT_TIMEOUT` | PC 절전/Wi-Fi 확인 |
-| EOF·전송 실패 | `CONNECTION_LOST` | Wi-Fi·서버 확인 후 재연결 |
-| 재연결 소진 | `RECONNECT_FAILED` | 확인 후 다시 연결 |
-| 그 외 | `UNKNOWN` | `연결 실패: <원문>` (원문 없으면 일반 문구) |
+- **3손가락 래치**: `onPointerEvent`에서 `pointerCount >= 3`을 본 순간 `threeFingerLatched = true`. 이후 그 제스처가
+  끝날 때까지(`onGestureEnd`/`reset`) MOVE·SCROLL·탭 판정(좌/우클릭)이 전부 억제되고 `DESKTOP_SWITCH`만 허용된다.
+  `resolveTap()`의 맨 앞에서도 래치를 먼저 확인하므로 꼬리 보정(`MULTI_TOUCH_RELEASE_GRACE_MS`) 분기 자체를 타지 않는다.
+  → 유예 시간 튜닝에 의존하지 않고 `3→2→1→0` 꼬리의 클릭 누수를 원천 차단.
+- **드래그 홀드**: 별도 코드 추가가 필요 없었다. `DragHoldDetector`는 `pointerCount != 1`이면 `release()`하고
+  같은 제스처 안에서 **재무장하지 않는다**(기존 규칙). 3손가락이 닿으면 기존 경로가 `DRAG_END`를 내고 끝난다.
+- **MOVE/SCROLL과 동시 방출 불가**: `desktopSwitch`는 정확히 3손가락 구간에서만 나오고, 그 구간은 정의상 래치가
+  걸린 상태라 `move`/`scroll`이 구조적으로 null이다. 전용 테스트로 고정.
+- **구간당 1회 / 제스처당 N회**: `desktopSwitchEmittedInSegment`는 `startSegment()`에서 리셋되므로
+  3→2→3 처럼 구간이 새로 시작되면 다시 1회 발사 가능(스펙 4번의 "구간 단위 정의" 준수). 계속 미는 것만으로는 반복 전환 불가.
+- **임계 판정은 "이상"**: `|dx| >= 120px` 이고 `|dx| >= 2 * |dy|`. 경계(정확히 120px, 정확히 2배)에서 발사되어 사각지대가 없다.
 
-`ConnectionErrorMessages.userMessage(kind, raw)` / `detail(kind, raw)` — 둘 다 순수 함수.
-UI는 **친절한 문구를 주 메시지**(`bodyMedium`, error 색), **원문을 보조 줄**(`bodySmall`, onSurfaceVariant)로
-보여준다. `UNKNOWN`에서는 주 메시지가 이미 원문을 품으므로 보조 줄을 생략(중복 방지).
+## 테스트 결과 (강제 재실행)
 
-### 3.4 기존 계약 유지 여부 (스펙 4)
-- 내부 문자열 **전부 그대로**: `"Heartbeat timeout"`, `"Connection lost"`,
-  `"Session handshake failed"`, `"Connection failed"`, `"Send failed"`, `"Reconnect failed: "` 접두사.
-- 재연결 트리거 로직은 문자열이 아니라 `generation` CAS + `reconnectPolicy.isActive`에 의존함을 확인 — 무변경.
-- `ConnectionState.Error`의 `kind`는 **기본값 `UNKNOWN`**이라 1-인자 생성이 계속 컴파일된다.
-  단 `data class` 동등성에는 포함되므로, 리포지토리가 실제로 kind를 세팅하는 12개 단언은
-  2번째 인자를 명시하도록 갱신했다(의도된 계약 변경, 검증 강도는 오히려 상승).
-
----
-
-## 4. 테스트
-
-실행 명령(요구대로 clean 포함, 실제 실행함):
 ```
 cd C:\Github\phone_pad\phone_pad_app
 ./gradlew --offline :app:cleanTestDebugUnitTest :app:testDebugUnitTest
+→ BUILD SUCCESSFUL
 ```
-결과: `BUILD SUCCESSFUL` / XML 리포트 집계 **tests=258, failures=0, errors=0, skipped=0**
-(기준선 217 → +41, 회귀 0).
 
-### 신규 테스트 목록
-**`ConnectionErrorClassifierTest` (10)** — 거부 / 메시지 없는 `ConnectException` / 타임아웃(JVM·Android 문구 둘 다) /
-주소 해석 / 라우팅·포트 불가 / 메시지로만 잡히는 네트워크 없음 / 원인 체인 추적 / 자기 참조 cause 무한루프 방지 /
-단서 없음(null·빈 예외) / 메시지 전용 경로.
+XML 리포트(`app/build/test-results/testDebugUnitTest/*.xml`, 23개 suite) 집계:
 
-**`ConnectionErrorMessagesTest` (12)** — 모든 enum 값이 한글 문구를 가짐(값 추가 시 누락 검출) /
-종류별 조치 힌트 포함(서버·방화벽·포트 상수·IP·Wi-Fi·"Phone Pad") /
-**원인을 아는 종류의 주 메시지에 예외 원문이 섞이지 않음** / 원문은 보조 줄로 보존 /
-`UNKNOWN` 접두사 + 보조 줄 생략 / null·빈·공백 원문 폴백 / **내부 진단 리터럴 4종이 화면에 그대로 나가지 않음**.
+| 항목 | 값 |
+|------|-----|
+| tests | **292** |
+| failures | **0** |
+| errors | **0** |
+| skipped | **0** |
 
-**`TcpClientConnectTimeoutTest` (7)** — 기본 타임아웃이 `CONNECT_TIMEOUT_MS`로 전달됨 /
-대상 host·port 정확성 / 타임아웃 값 주입 가능(**실제 5초 대기 없음**) /
-`SocketTimeoutException` 그대로 전파 / 실패 후 죽은 소켓 미잔류(`isConnected=false`, `soTimeoutMillis=null`) /
-루프백 닫힌 포트로 즉시 실패(실소켓 회귀) / 실패한 연결 뒤 정상 연결 성공(루프백 핸드셰이크까지).
+기준선 258 → 292 (**신규 34건**, **회귀 0**).
 
-**`TrackpadRepositoryCancelConnectTest` (8)** — 전부 가상 시간, 실제 소켓·실제 대기 없음.
-취소 → `Disconnected`(Error 아님) / 취소가 소켓을 닫아 블로킹 접속을 깨움 /
-**뒤늦은 성공이 `Connected`로 덮어쓰지 않음**(+ 소켓 정리 + UDP 미개방) /
-**뒤늦은 실패가 `Error`로 덮어쓰지 않음** / 취소 후 재연결 정상 동작 /
-`Connected` 상태의 취소는 무해 / `Reconnecting` 상태의 취소는 무해(재연결 취소는 `disconnect()` 담당) /
-`Disconnected`에서의 취소는 완전 무동작.
-→ **모든 테스트를 `Disconnected` 상태 또는 `repository.disconnect()`로 종료**(섹션 6 `runTest` 함정 회피).
+### 변이(mutation) 검사 — 새 테스트가 실제로 버그를 잡는지 확인
+실제로 코드를 망가뜨려 돌려 보고 되돌렸다:
 
-**`GestureConfigTest` (+2)** — `CONNECT_TIMEOUT_MS == 5000` / 0(무한 대기) 금지 +
-연결+핸드셰이크 최악 ≤ 10초 + TCP 재전송을 덮는 ≥ 3초.
+| 변이 | 결과 |
+|------|------|
+| 방향 매핑 뒤집기(`totalDx < 0f` → LEFT/RIGHT 교체) + `resolveTap`의 래치 검사 제거 | **9건 실패** (방향 8건 + `스와이프 후 손가락을 어긋나게 떼도 클릭이 새지 않는다`) |
+| MOVE/SCROLL의 `!threeFingerLatched` 가드 2곳 제거 | **2건 실패** |
 
-**`TrackpadViewModelTest` (+2)** — `cancelConnect()`가 `repository.cancelConnect()`만 호출(=`disconnect()` 아님), 그 역도 성립.
+되돌린 뒤 최종 실행에서 292 passed / 0 failed 재확인.
 
----
+## 미해결 이슈 / 한계
 
-## 5. 미해결 이슈 / 한계
+1. **빌드는 검증됨(컴파일·JVM 단위 테스트), 실기기는 미검증.** 특히 다음은 실기기에서만 확인 가능:
+   - 실제 3손가락 터치에서 Android가 `pointerCount == 3`을 안정적으로 주는지(제조사 시스템 제스처와의 충돌 가능성 —
+     일부 기기는 3손가락 스와이프를 스크린샷/분할화면 시스템 제스처로 가로챈다).
+   - 120px 임계의 체감(화면 밀도에 따라 다름 — px 기준이라 고해상도 기기에서는 상대적으로 짧게 느껴진다).
+2. **`TrackpadScreen`의 배선에는 여전히 자동 테스트가 없다**(Compose `awaitEachGesture` 의존 — AGENTS.md 섹션 10의
+   기존 항목과 같은 한계). 판정 로직은 전부 순수 클래스로 분리해 커버했지만, "3번째 손가락이 닿을 때 pending click을
+   flush 한다"는 화면 계층 규칙 자체는 코드 리뷰로만 확인했다.
+3. **px 기준 임계값**: `THREE_FINGER_SWIPE_MIN_DISTANCE_PX`는 dp가 아니라 px다(기존 모든 제스처 상수와 동일한 규약).
+   화면 밀도별 정규화는 이번 범위 밖 — 손대려면 전체 상수를 함께 옮겨야 한다.
+4. **수직/4손가락 제스처는 범위 밖**(스펙대로). 4손가락은 래치 때문에 "아무 이벤트도 나가지 않는" 상태이며 테스트로 고정했다.
+5. **서버 측 `direction` 검증에 의존하지 않는다**: Android는 `DIRECTION_LEFT`/`DIRECTION_RIGHT` 외의 값을 만들지 않지만,
+   `TrackpadEvent.DesktopSwitch(direction)`는 임의 문자열을 받을 수 있다(타입으로 막지 않음 — `Click(button)`과 같은 스타일 유지).
+   잘못된 값이 들어가면 서버가 조용히 무시한다(와이어 스펙).
 
-1. **UI 미확인.** `ConnectingPanel`의 "취소" 버튼 렌더·탭 반응, 오류 2줄의 소형 화면 줄바꿈·잘림,
-   취소 후 IP 입력값(`hostInput`)이 남아 있는지의 **실제 화면 확인은 못 했다**(에뮬레이터/실기기 없음).
-   코드상 `hostInput`은 ViewModel이 별도 보관하므로 취소 후에도 유지된다.
-2. **타임아웃 실제 만료 경로는 단위 테스트로 재현하지 않았다.** 블랙홀 주소가 필요해 환경에 따라
-   불안정하다. 고정한 것은 "OS 기본값에 맡기지 않고 우리 값을 `connect(endpoint, timeout)`에 넘긴다"는 계약이며,
-   실제 5초 만료 체감은 실기기(틀린 IP 입력)로 확인 필요.
-3. **`cancelConnect()`의 `cleanUp()`이 호출자 디스패처(프로덕션에서는 Main)에서 소켓을 닫는다.**
-   기존 `disconnect()`와 동일한 패턴이고 `Socket.close()`는 블로킹하지 않지만, 엄밀히는 IO 디스패처로
-   옮기는 편이 낫다 — 기존 코드와의 일관성을 택했다.
-4. **`Connecting` 직전의 취소 창.** `connect()`가 락을 잡기 전(= 상태가 아직 `Connecting`이 아님)에는
-   취소 버튼 자체가 화면에 없으므로 실사용 영향은 없다. `disconnect()`가 `connectEpoch`를 올려 덮는다.
-5. 범위 밖으로 남긴 것: IP 형식 검증, 포트 입력 UI, 앱 백그라운드 진입 시 드래그 종료, 서버 자동 탐색.
+## 리더가 AGENTS.md에 반영할 내용
 
----
-
-## 6. 리더가 AGENTS.md에 반영할 내용 (제안)
-
-### 섹션 6 — Phase 4 체크박스
+**섹션 4 (통신 프로토콜) — TCP 이벤트 목록에 추가:**
+```jsonc
+// 가상 데스크톱 전환 — ✅ 구현됨 (Phase 5). 3손가락 수평 스와이프. session 필드 없음.
+// direction은 "전환 결과의 방향"이며 손가락 방향이 아니다 — 손가락 왼쪽 스와이프 → "right",
+// 오른쪽 스와이프 → "left"(Windows 정밀 터치패드 관례). 이 뒤집기는 Android의
+// MultiTouchGestureTracker 한 곳에서만 하고 서버는 받은 값을 Ctrl+Win+Left/Right로 옮기기만 한다
+// (섹션 10 "스크롤 방향 규약"과 같은 원칙 — 두 사이드가 같이 뒤집으면 원위치).
+// direction이 "left"/"right" 소문자 정확 일치가 아니면 서버는 아무 키도 보내지 않고 조용히 무시한다.
+{"type":"DESKTOP_SWITCH","direction":"left"}
+{"type":"DESKTOP_SWITCH","direction":"right"}
 ```
-- [x] 예외 처리 강화 (네트워크 오류, 권한 오류 등) — 서버/Android 각각 단일 사이드(와이어 프로토콜 무변경).
-      Android: 연결 타임아웃 5초 + 첫 연결 취소 + 예외 원문 대신 한국어 조치 힌트.
+
+**섹션 5 (제스처 설계) — 표 갱신:**
+`| 3손가락 스와이프 | 가상 데스크톱 전환 등 | Phase 4 | ⬜ 미구현 |`
+→ `| 3손가락 좌우 스와이프 | DESKTOP_SWITCH(direction) | Phase 5 | ✅ 완료 |`
+
+**섹션 5 엣지 케이스 — 추가:**
+> - **3손가락 래치**: 한 제스처(첫 down ~ 모든 손가락 up) 안에서 포인터가 한 번이라도 3개 이상이 되면,
+>   그 제스처의 나머지 동안 MOVE·SCROLL·클릭(좌/우)이 전부 억제되고 `DESKTOP_SWITCH`만 허용된다.
+>   3손가락을 어긋나게 떼면 `3→2→1→0` 꼬리가 생기는데, 그 꼬리가 `MULTI_TOUCH_RELEASE_GRACE_MS`(50ms)
+>   **밖**이면 기존 로직이 "정상 탭"으로 취급해 스와이프 직후 좌/우클릭이 샌다. 래치는 유예 시간 튜닝에
+>   의존하지 않고 이를 원천 차단한다. 드래그 홀드는 `DragHoldDetector`가 개수 변화 시 재무장하지 않으므로
+>   추가 장치가 필요 없었다.
+> - 데스크톱 전환은 **임계를 넘는 그 프레임에 즉시**(손을 뗄 때가 아니라) 발사되고, **한 구간에 최대 1회**다
+>   (계속 밀어도 반복 전환 없음). 3→2→3처럼 구간이 새로 시작되면 다시 1회 가능.
+> - 3손가락 "탭"(스와이프 없이 뗌)은 아무 이벤트도 없다(기존 동작 유지).
+
+**섹션 5 감도 상수 블록 — 추가:**
+```kotlin
+THREE_POINTER_COUNT = 3                        // 3손가락 구간 판정 기준 (DESKTOP_SWITCH 전용)
+THREE_FINGER_SWIPE_MIN_DISTANCE_PX = 120f      // 구간 시작 centroid 대비 수평 이동 임계.
+                                               //   TAP_MAX_DISTANCE_PX(20)의 6배 — 전역 동작이라 오발동 여유를 크게 둔다
+                                               //   (GestureConfigTest가 "> TAP_MAX_DISTANCE_PX*2" 및 "> DOUBLE_TAP_DISTANCE_PX"를 강제)
+THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE = 2f   // |dx| >= 2*|dy| 일 때만 수평 스와이프로 인정 (약 26.6도 이내)
 ```
-("권한 오류"는 이번 범위에서 다루지 않았음 — 조사로 확인된 결함만 처리했다는 점을 함께 적으면 좋겠다.)
+> 이 세 값은 **사용자 설정으로 열지 않는다**(기존 조정 가능 값은 여전히 `MOVE_SENSITIVITY`와
+> `SCROLL_SENSITIVITY_PX_PER_STEP` 두 개뿐).
 
-### 섹션 6 — "예외 처리 강화 구현 시 핵심 파일/설계" (새 소절 제안)
-- `presentation/util/GestureConfig.kt` — `CONNECT_TIMEOUT_MS`(5초)는 `SESSION_HANDSHAKE_TIMEOUT_MS`(3초)와
-  **직렬**로 붙어 최악 8초. 0은 "무한 대기"라 금지(`GestureConfigTest`가 고정).
-- `data/network/TcpClient.kt` — `Socket()` + `connect(InetSocketAddress, timeout)`. 소켓을 **연결 시도 전에**
-  필드에 등록하는 것이 취소 설계의 전제(블로킹 `connect()`는 코루틴 취소로 풀리지 않아 소켓 close가 유일한 수단).
-  테스트 주입점 `connectTimeoutMs`/`socketFactory`(`internal`) — 실제 5초를 기다리는 테스트를 만들지 않기 위한 것.
-- `data/repository/TrackpadRepositoryImpl.kt` — 경합 장치가 이제 **4종**이다:
-  `connectionMutex` + `generation`(연결 단위) + `reconnectEpoch`(재시도 묶음) + **`connectEpoch`(수동 시도 단위, 신규)**.
-  `connectEpoch`는 수동 `connect`/`cancelConnect`/`disconnect`만 올리고 **재연결 루프는 절대 올리지 않는다**
-  (올리면 락을 기다리던 사용자의 수동 연결이 무효화된다). `cancelConnect()`는 전부 뮤텍스 **밖**에서
-  "무효화 → 상태 되돌림 → 소켓 close" 순서로 한다.
-  `openConnection`은 `ConnectOutcome`(Success/**Cancelled**/Failure)을 돌려줘 실패와 취소를 구분한다.
-- `domain/model/ConnectionErrorKind.kt` / `ConnectionErrorClassifier.kt` /
-  `presentation/util/ConnectionErrorMessages.kt` — **내부 진단 문자열과 사용자 문구를 분리한다.**
-  `ConnectionState.Error.message`는 계약(기존 리터럴 유지)이고, 한국어 변환은 `kind`를 보고
-  표시 계층에서만 한다. `kind`는 기본값 `UNKNOWN`이라 1-인자 생성이 계속 가능하지만 동등성에는 포함된다.
-- `presentation/trackpad/ConnectionErrorSection.kt` — 오류 표시 전용 컴포저블.
-  `TrackpadScreen`의 변경 면적을 줄이기 위한 분리(연결 화면을 동시에 손보는 작업과의 충돌 완화).
+**섹션 6 로드맵 Phase 5 — `3손가락 스와이프 → 가상 데스크톱 전환` 체크.**
 
-### 섹션 9 — 컨벤션 추가 제안
-> 사용자에게 보이는 오류 문구와 내부 상태 문자열을 섞지 않는다. `ConnectionState.Error.message`는
-> 진단용 계약이고, 한국어 문구는 `ConnectionErrorKind` → `ConnectionErrorMessages` 경로로 표시 계층에서만 만든다.
-> 문구 전문을 테스트로 고정하지 말고(다듬을 수 있어야 한다) "원문이 주 메시지를 점령하지 않는다",
-> "모든 kind가 문구를 갖는다" 같은 **계약**을 고정한다.
+**섹션 7 세션 흐름 — 한 줄 추가:**
+```
+   |-- TCP: DESKTOP_SWITCH (3손가락 좌우 스와이프) -->  |   ✅ 구현됨 (Ctrl+Win+Left/Right)
+```
 
-### 섹션 10 — 미결 사항 추가 제안
+**섹션 10 미결 사항 — 추가 후보:**
 | 항목 | 현황 |
-|---|---|
-| 연결 타임아웃/취소 실기기 검증 | `CONNECT_TIMEOUT_MS`(5초) 만료 체감, `Connecting` 화면의 "취소" 버튼 렌더·반응, 오류 2줄의 소형 화면 잘림은 실기기 미검증(컴파일·JVM 단위 테스트만 통과). 타임아웃이 실제로 만료되는 경로는 블랙홀 주소가 필요해 단위 테스트로 재현하지 않았고, 고정한 것은 "OS 기본값에 맡기지 않는다"는 계약이다 |
-| 오류 문구의 다국어 | `ConnectionErrorMessages`가 한국어 문자열을 코드에 직접 담고 있다(단일 로케일 전제). 다국어가 필요해지면 이 파일 하나만 `strings.xml`로 옮기면 된다 |
+|------|------|
+| 3손가락 제스처 실기기 검증 | 임계 120px의 체감, 제조사 시스템 제스처(스크린샷/분할화면 등)가 3손가락 터치를 가로채는지, 실제 터치에서 `pointerCount == 3`이 안정적으로 보고되는지 미검증. 임계값이 dp가 아니라 px라 고해상도 기기에서는 상대적으로 짧게 느껴질 수 있음 |

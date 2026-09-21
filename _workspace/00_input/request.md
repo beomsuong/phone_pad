@@ -1,71 +1,55 @@
-# 요청: 예외 처리 강화 (AGENTS.md Phase 4) — 조사로 확인된 실제 결함 2개
+# 요청 — 3손가락 스와이프 → 가상 데스크톱 전환 (Phase 5 첫 항목)
 
-**범위 판단:** 서버(A)·Android(B) 각각 **단일 사이드**, 서로 독립. 와이어 프로토콜/이벤트 변경 없음 → 에이전트 2명 병렬, protocol-qa 생략.
-"예외 처리 강화"는 범위가 모호한 항목이라 추측으로 넓히지 않고, 코드 조사로 **재현/확인된 결함만** 다룬다. 아래 "범위 밖"은 건드리지 말 것.
+## 범위 판단: **교차 경계면** (사유: 새 이벤트 `type` `DESKTOP_SWITCH` 추가 → AGENTS.md 섹션 4 수정 필요)
 
-**병렬 세션 주의:** 다른 세션이 `discovery` worktree에서 UDP 자동 탐색(Android 연결 화면 + 서버 응답기)을 작업 중이다. `server.py`는 이번 작업에서 **건드리지 않는다**(A는 `input_controller.py`만). Android는 `TrackpadScreen.kt`/`ConnectPanel` 변경을 **최소**로 하고 새 로직은 새 파일/순수 함수로 분리해 충돌 면적을 줄일 것.
+실행: android-dev ∥ server-dev 병렬 → protocol-qa 사후 검증. 리더가 아래 스펙을 사전 확정했으므로 **임의로 바꾸지 말 것**.
+다른 세션이 `discovery` 워크트리에서 UDP 자동 탐색(`server.py` 수정 예정)을 진행 중이다 — **서버는 `server.py`를 건드리지 않는다**(TCP 이벤트는 이미 `handle_event`로 전달되는 경로가 있음. 확인 결과 화이트리스트 없음). 커밋 금지, AGENTS.md/CLAUDE.md 수정 금지(리더가 함).
 
----
+## 와이어 스펙 (확정)
 
-## A. 서버 — `SendInput` 반환값을 확인하지 않아 상태가 어긋난다
+```jsonc
+// TCP 9000, newline-delimited, session 필드 없음 (CLICK 등과 동일한 저빈도 이벤트)
+{"type":"DESKTOP_SWITCH","direction":"left"}    // 왼쪽 가상 데스크톱으로 이동 = Ctrl+Win+Left
+{"type":"DESKTOP_SWITCH","direction":"right"}   // 오른쪽 가상 데스크톱으로 이동 = Ctrl+Win+Right
+```
 
-### 확인된 사실 (조사)
-- `pc_server/input_controller.py`의 모든 `ctypes.windll.user32.SendInput(...)` 호출이 **반환값을 버린다** (`_move`, `_scroll`, `_send_button_flag`, `_click`, `_double_click`).
-- `_drag_start()` 주석: "SendInput 이 실패하면 상태를 바꾸지 않는다" / `_drag_end()` 주석: "실패하면 `_drag_active`를 True로 남겨 안전장치가 재시도". **그런데 코드는 반환값을 보지 않고 무조건 `_drag_active`를 바꾼다** — 주석이 설명하는 동작은 ctypes가 예외를 던질 때만 성립하는데 `SendInput`은 실패 시 예외가 아니라 `0`을 반환한다. 즉 주석과 코드가 어긋난 실제 버그다.
-- `SendInput`은 삽입한 이벤트 수를 반환하고, 입력이 막히면(예: 잠금 화면/UAC 보안 데스크톱 등 입력 데스크톱에 접근 불가) 0을 반환한다. **단, Microsoft 문서상 UIPI(관리자 권한 창에 일반 권한 프로세스가 입력을 주입하려는 경우)로 차단된 경우에는 반환값도 `GetLastError`도 실패를 알려주지 않는다** — 이 경우는 감지 불가능한 한계이므로 코드로 해결하려 하지 말고 문서에 한계로 남길 것(리더가 AGENTS.md 반영).
+- `direction`은 **"전환 결과의 방향"**이다(손가락 방향이 아님). 손가락 방향 → 와이어 방향 매핑은 **Android 한 곳**(트래커)에서만 한다.
+  - 손가락이 **왼쪽**으로 스와이프 → `"right"` (콘텐츠가 손가락을 따라 밀려나며 오른쪽 데스크톱이 드러남 = Windows 정밀 터치패드 관례)
+  - 손가락이 **오른쪽**으로 스와이프 → `"left"`
+  - 서버는 이 매핑을 모른다. 서버는 받은 `direction`을 그대로 키 조합으로 바꿀 뿐이다. **두 사이드가 동시에 뒤집지 않도록 매핑은 Android에만 둔다**(섹션 10 "스크롤 방향 규약"과 같은 원칙).
+- `direction`이 `"left"`/`"right"`가 아니면(누락·다른 문자열·문자열이 아닌 값) 서버는 **아무 키도 보내지 않고 조용히 무시**한다(예외 전파 금지, 세션 유지).
+- 수직 스와이프(작업 보기 등)·4손가락은 범위 밖. 이벤트는 좌/우 두 개뿐.
 
-### 확정 스펙
-1. `SendInput` 호출을 **한 곳의 헬퍼**(예: `_send_input(count, inputs) -> bool`)로 모으고, 반환값이 요청한 `count`보다 작으면 "주입 실패"로 판정한다. 각 `_move/_scroll/_click/_double_click/_send_button_flag`는 이 헬퍼를 쓰고, `handle_event`의 외부 동작(어떤 이벤트에 어떤 SendInput을 몇 번 부르는가)은 **바뀌면 안 된다** — 기존 테스트가 SendInput 호출 횟수/플래그 시퀀스를 고정하고 있다.
-2. `_drag_start()`: `SendInput`이 **실패하면 `_drag_active`를 True로 만들지 않고** False를 반환. `_drag_end()`: 실패하면 **`_drag_active`를 True로 유지**(이후 연결 종료 안전장치 `force_release_drag`가 재시도할 수 있게)하고 False를 반환. 성공 경로의 동작/반환값은 그대로.
-3. 실패는 **로그 폭주 없이** 알린다: MOVE는 초당 수십 번 오므로 실패 로그는 **rate limit**(예: 같은 종류는 N초에 1회 — 시간 소스를 주입 가능하게 해 테스트에서 실제 sleep 없이 검증)하고, 메시지는 **ASCII만**(AGENTS.md 섹션 9): 어떤 종류의 입력이 몇 개 중 몇 개 주입됐는지 + 마지막 에러 코드 + "input desktop blocked? (UAC prompt / lock screen)" 힌트. 예외를 밖으로 던지지 않는다(이벤트 하나의 실패가 TCP 세션을 끊으면 안 됨 — 기존 F-4 원칙).
-4. 누적 실패 횟수를 읽을 수 있는 공개 카운터(예: `input_failures`)를 둔다(스레드 안전하게). **트레이 아이콘/UI에 표시하는 것은 이번 범위 밖**이다 — 나중에 트레이에 연결할 수 있게 값만 노출.
-5. 에러 코드는 가능하면 `ctypes.GetLastError()`/`ctypes.get_last_error()`로 best-effort(신뢰 불가할 수 있음을 주석으로). **기존 테스트가 `ctypes.windll.user32.SendInput`을 patch하는 방식을 유지**해야 하므로 호출 경로(`ctypes.windll.user32.SendInput`)는 바꾸지 말 것.
-6. **테스트 주의:** 기존 테스트의 `SendInput` mock은 반환값이 `MagicMock`이다. 이제 반환값을 정수로 비교하므로 mock이 **실제 계약(요청 개수를 반환)을 흉내내도록** 테스트를 갱신해야 한다 — 이건 계약이 의도적으로 바뀐 것이므로 정당한 수정이다. 단, 테스트가 검증하던 **호출 횟수·플래그 시퀀스 단언은 약화시키지 말 것**.
-7. 실제 검증 1건: 이 머신에서 **무해한 실제 `SendInput`**(`MOUSEEVENTF_MOVE`, dx=0, dy=0, 1개)을 호출해 반환값이 `1`인지 확인하고 요약에 기록(계약 "반환값 = 주입된 이벤트 수"가 이 환경에서 실제로 성립하는지). 커서가 움직이면 안 되므로 dx=dy=0만 사용.
+## Android 스펙 (android-dev)
 
-### 서버 테스트
-- 각 이벤트 경로에서 SendInput이 요청 개수보다 적게 반환하면 실패 카운터가 오르고 예외가 없다
-- `_drag_start` 실패 시 `_drag_active` False 유지 / `_drag_end` 실패 시 True 유지 → `force_release_drag`가 이후 재시도해 성공하면 False로
-- rate limit: 같은 창 안 연속 실패는 로그 1줄, 창이 지나면 다시 1줄(주입한 시간 소스로)
-- 성공 경로의 기존 동작 회귀 없음 (기준선 `227 passed, 1 skipped` 이상)
+1. `TrackpadEvent.DesktopSwitch(direction: String)` 추가(`Click(button: String)`과 같은 스타일). 방향 문자열 상수는 `MultiTouchGestureTracker` 안 `BUTTON_LEFT`처럼 companion 상수로 둔다(`DIRECTION_LEFT="left"`, `DIRECTION_RIGHT="right"`).
+2. `TrackpadRepositoryImpl`: TCP로 직렬화. **CLICK/DOUBLE_CLICK과 같은 경로** — 전송 실패는 `sendOverTcp()` → `reportConnectionLost`로 합류(MOVE/SCROLL의 "조용한 실패"가 아님). JSON은 정확히 `{"type":"DESKTOP_SWITCH","direction":"left"}` 형태(공백 없음, 필드 순서 type→direction). **와이어 리터럴을 고정하는 테스트를 둘 것**(섹션 9 컨벤션).
+3. `GestureConfig` 상수 추가(사용자 설정으로 열지 않는다, 기본값만):
+   - `THREE_FINGER_SWIPE_MIN_DISTANCE_PX = 120f` — 3손가락 구간 시작 centroid로부터의 수평 이동 거리. `TAP_MAX_DISTANCE_PX`보다 충분히 커야 함(`GestureConfigTest`로 강제).
+   - `THREE_FINGER_SWIPE_HORIZONTAL_DOMINANCE = 2f` — `|dx| >= 2*|dy|`일 때만 수평 스와이프로 인정(대각선/수직은 무시).
+   - `THREE_POINTER_COUNT = 3`.
+4. `MultiTouchGestureTracker`(순수 Kotlin 유지):
+   - **정확히 3손가락인 구간**에서, 구간 시작 centroid 대비 수평 이동이 `MIN_DISTANCE` 이상이고 수평 우세이면 **그 시점에(손을 뗄 때가 아니라 임계 통과 즉시) 한 번만** `DESKTOP_SWITCH`를 방출한다. 한 구간(=3손가락 유지 동안)에 최대 1회 — 계속 밀어도 반복 전환 금지. 3→2→3처럼 구간이 새로 시작되면 다시 1회 가능(구간 단위 정의를 따른다).
+   - `GestureDecision`에 필드 추가(예: `desktopSwitch: String? = null`). MOVE/SCROLL과 **동시에 non-null 금지**.
+   - **3손가락 래치(핵심 안전장치):** 한 제스처(첫 down ~ 모든 손가락 up) 안에서 손가락이 **한 번이라도 3개 이상**이 되면, 그 제스처의 나머지 동안 **MOVE·SCROLL·클릭(좌/우)·드래그홀드 승격을 전부 억제**하고 `DESKTOP_SWITCH`만 허용한다. 이유: 3손가락을 어긋나게 떼면 `3→2→1→0` 꼬리가 생기는데 `MULTI_TOUCH_RELEASE_GRACE_MS`(50ms) 밖의 꼬리는 지금 로직이 "정상 탭"으로 취급해 **스와이프 직후 우클릭/좌클릭이 샌다**. 래치는 유예 시간 튜닝에 의존하지 않고 이를 원천 차단한다.
+   - 3손가락 "탭"(스와이프 없이 뗌)은 아무 이벤트도 없다(클릭 없음 — 기존 동작 유지).
+   - 이 래치는 기존 1·2손가락 제스처의 동작을 **바꾸면 안 된다** — 기존 트래커 테스트 전부 무수정 통과가 기준.
+5. `TrackpadScreen`/`TrackpadViewModel`/`SendEventUseCase` 배선: 스와이프 결정 시 `viewModel`을 통해 전송(ViewModel은 UseCase 경유). 3번째 손가락이 닿는 순간 **대기 중인 단일 클릭(더블탭 지연)은 flush**(기존 "다른 제스처 시작 → flush" 규칙과 동일), 진행 중인 드래그홀드는 손가락 개수 변화로 기존 규칙대로 `DRAG_END`. 래치 중 `DragHoldDetector` 재무장 금지(기존 규칙). 화면 변경은 최소 diff.
+6. 테스트: 트래커(정상 좌/우 → 올바른 방향 매핑, 임계 미만 무발사, 수직·대각선 무발사, 1구간 1회, 4손가락 무발사, 래치: 스와이프 후 어긋난 꼬리에서 클릭/MOVE/SCROLL 없음, 스와이프 없이 3손가락 탭 → 무이벤트, 2손가락 스크롤 후 3번째 손가락이 닿는 경우, 기존 1·2손가락 회귀), 저장소 직렬화 리터럴 2종 + 전송 실패 합류, ViewModel 위임, GestureConfig 불변식.
+7. **런타임 테스트는 `:app:cleanTestDebugUnitTest :app:testDebugUnitTest`로 강제 재실행**(`UP-TO-DATE` 스킵 방지). 기준선 258 → 회귀 0. `runTest`에서 heartbeat 루프를 살려둔 채 끝내지 말 것(AGENTS.md 섹션 6 함정).
 
-### 서버 범위 밖
-UIPI 차단 감지, 트레이 표시, `server.py`/`single_instance.py`/`logging_setup.py` 변경, 서버 기동 실패 시 안내창.
+## 서버 스펙 (server-dev)
 
----
+1. `input_controller.py`에 **키보드 주입** 추가: `KEYBDINPUT` 구조체(`wVk`, `wScan`, `dwFlags`, `time`, `dwExtraInfo`)를 `_INPUTunion`에 추가(`ctypes.sizeof(INPUT)`이 변하면 안 됨 — 변하면 SendInput이 통째로 실패한다. 테스트로 고정), `INPUT.type = INPUT_KEYBOARD(1)`.
+2. `handle_event`에 `DESKTOP_SWITCH` 분기 추가 → `_desktop_switch(direction) -> bool`.
+3. 키 시퀀스는 **`SendInput` 1회 호출, 6개 INPUT으로 원자적**: `Ctrl down → Win down → Arrow down → Arrow up → Win up → Ctrl up`. (VK_LCONTROL 0xA2, VK_LWIN 0x5B, VK_LEFT 0x25 / VK_RIGHT 0x27.) 화살표 키는 `KEYEVENTF_EXTENDEDKEY(0x1)` 필수, 키 업은 `KEYEVENTF_KEYUP(0x2)`. 반드시 기존 `_send_input(count, inputs, kind)` 창구를 경유(섹션 9 컨벤션: `SendInput` 직접 호출 금지), kind는 `"DESKTOP_SWITCH"`.
+4. **수정 키 고착 방지(핵심 안전장치):** 주입이 부분 성공(`injected != 6`)일 수 있으므로, 실패로 판정되면 **Ctrl·Win 및 화살표의 키 업 3개를 best-effort로 한 번 더 보낸다**(정리용 호출은 kind `"DESKTOP_SWITCH_CLEANUP"` 등 별도 종류로 하되 재귀/무한 재시도 금지, 정리 호출 자체의 예외도 삼켜 원래 실패 처리에 영향 없게). Win 키가 눌린 채 남는 것이 최악의 결과다. 성공 경로에서는 정리 호출을 하지 않는다(호출 횟수 단언).
+5. 드래그와의 상호작용: 서버는 드래그 활성 중 `DESKTOP_SWITCH`를 받아도 **거부하지 않는다**(Android가 3손가락이 닿으면 이미 DRAG_END를 보내므로 정상 흐름에선 안 겹친다). 상태를 건드리지 않는다.
+6. 잘못된 `direction`은 무시(위 와이어 스펙). 예외 전파 금지.
+7. `server.py`는 **수정 금지**(병렬 세션과 충돌 방지). TCP 경로의 `handle_event` 위임이 새 type을 통과시키는지는 `handle_client`를 실제 구동하는 테스트(기존 `test_server_drag.py` 방식)로 검증하고, `patch_send_input()`(tests/send_input_stub.py)를 사용할 것.
+8. 테스트: 정확한 6개 INPUT의 순서·vk·플래그(좌/우), 화살표만 EXTENDEDKEY, `SendInput` 호출 1회, 잘못된 direction 무시(누락/None/숫자/대소문자 다른 값 `"LEFT"` 등 — **`"left"`/`"right"` 소문자 정확 일치만 허용**), 실패 시 카운터 + 정리 호출 3개 키 업, 성공 시 정리 없음, 정리 호출 예외 무시, INPUT 구조체 크기 불변, TCP end-to-end 1건, 드래그 활성 중에도 드래그 상태 불변. 기준선 246 passed, 1 skipped → 회귀 0.
+9. 가능하면 **실제 SendInput 키 주입은 하지 말 것**(실행 중 데스크톱을 실제로 전환하거나 Win 키가 고착될 위험). 실측이 필요하면 `KEYEVENTF_KEYUP` 단독 같은 무해한 호출로 반환값 계약만 확인.
 
-## B. Android — 연결 타임아웃 없음 · 첫 연결 취소 불가 · 영어 원문 오류 메시지
-
-### 확인된 사실 (조사)
-- `TcpClient.connect()`가 `Socket(host, port)`를 쓴다 → **연결 타임아웃이 없다.** 틀린 IP(다른 네트워크/꺼진 PC)를 입력하면 OS 기본 타임아웃(수십 초)까지 "연결 중..."에 갇힌다.
-- `ConnectingPanel`의 "취소" 버튼은 재연결(`Reconnecting`)에만 있다. **첫 연결(`Connecting`)에는 취소가 없어** 그 수십 초 동안 빠져나갈 방법이 없다.
-- 연결 실패 메시지는 예외 `e.message` **원문 그대로** UI에 노출된다(예: `failed to connect to /192.168.0.5 (port 9000) from /:: (port 41822) after 21000ms`). 한국어 사용자에게 무슨 조치를 해야 하는지 전혀 알려주지 않는다.
-
-### 확정 스펙
-1. **연결 타임아웃:** `GestureConfig`에 `CONNECT_TIMEOUT_MS = 5000`(다른 네트워크 상수 옆, 근거 주석). `TcpClient.connect()`는 `Socket()` + `connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)`를 쓴다. `InetSocketAddress`가 unresolved면 `UnknownHostException`. 기존 세션 핸드셰이크 타임아웃(3초)/heartbeat 타임아웃 동작은 그대로.
-2. **첫 연결 취소:** `Connecting` 화면에도 "취소" 버튼. 누르면 진행 중인 접속 시도를 즉시 끊고(블로킹 `connect`는 코루틴 취소로 안 풀리므로 소켓을 닫아 깨운다) **오류 표시 없이 IP 입력 화면(`Disconnected`)으로 복귀**한다. **취소된 시도의 뒤늦은 실패/성공이 상태를 `Error`/`Connected`로 덮어쓰면 안 된다**(기존 `generation`/`reconnectEpoch`/뮤텍스 밖 취소 패턴 — AGENTS.md 섹션 6 "재연결 구현 시 핵심 파일/설계"의 경합 설계를 반드시 읽고 따를 것. 취소는 뮤텍스 **밖**에서 먼저 한다).
-3. **친절한 오류 메시지 (순수 함수):** `Throwable`(또는 실패 종류) → 한국어 메시지 + 조치 힌트를 돌려주는 **순수 함수**(Android 프레임워크 비의존, JUnit 테스트 가능). 최소 매핑:
-   - 연결 거부(ConnectException, `refused`) → 서버 미실행/방화벽(TCP 9000) 확인
-   - 연결 타임아웃(SocketTimeoutException) → IP가 맞는지, PC와 같은 Wi-Fi인지 확인
-   - UnknownHostException → 주소를 찾을 수 없음, IP 확인
-   - 네트워크 없음(NoRouteToHostException, `unreachable`) → Wi-Fi 확인
-   - 핸드셰이크 실패(null 세션) → Phone Pad 서버가 맞는지/버전 확인
-   - 그 외 → `연결 실패: <원문>` 폴백(원문을 완전히 버리지 않는다)
-4. **메시지 계약을 깨지 말 것:** 기존 `ConnectionState.Error("Heartbeat timeout")`, `Error("Connection lost")`, 재연결 트리거 로직은 **문자열에 의존하지 않는다**는 것을 확인하고 그 상태/문자열은 **유지**한다(기존 테스트가 이 문자열을 단언한다). 친절한 문구는 "사용자에게 보이는 표시" 계층에서만 적용한다 — 예: `ConnectionState.Error`에 원인 종류(`kind`)를 **추가**하고 UI가 종류→문구로 변환하거나, 표시용 변환 함수를 UI에서 호출. `Error` 동등성을 쓰는 기존 테스트가 있으면 새 필드의 기본값으로 호환되게 설계하고, 그래도 바뀌는 단언은 의도된 계약 변경 범위만 최소로 수정할 것. heartbeat 유실/재연결 소진 메시지도 사용자 표시 계층에서 한국어로 보여주되 내부 문자열은 그대로.
-5. UI는 오류 원문을 숨기지 말고 **친절한 문구를 주 메시지로, 원문은 작은 보조 텍스트로** 함께 보여주는 정도면 충분(디자인 과설계 금지). 실기기/에뮬레이터 UI 확인은 이 환경에서 불가 — "UI 미확인, 컴파일/단위 테스트만 검증"으로 명시할 것.
-
-### Android 테스트
-- 오류 메시지 매핑 순수 함수: 위 각 종류 + 폴백 + null/빈 메시지
-- 연결 타임아웃 상수와 `TcpClient`의 타임아웃 적용(루프백에서 응답 없는 소켓/닫힌 포트로 실제 검증 가능한 범위에서. 실제 5초를 기다리는 테스트는 만들지 말고 타임아웃 값을 주입/오버라이드해 짧게)
-- 첫 연결 취소: 접속 시도 진행 중 취소 → `Disconnected`, 이후 뒤늦게 실패/성공해도 상태 불변(가짜 `TcpClient`로 접속을 걸어두고 완료 시점을 제어)
-- 기존 테스트 전부 회귀 없음 (기준선: Android 217개). **`runTest` 함정(AGENTS.md 섹션 6 "테스트 함정"): heartbeat/재연결 루프를 살려 둔 채 테스트를 끝내면 무한 루프+OOM** — 새 테스트는 반드시 `disconnect()`/`Error` 종료로 끝낼 것. 테스트 실행은 `:app:cleanTestDebugUnitTest :app:testDebugUnitTest`(clean 필수 — UP-TO-DATE로 스킵됨).
-
-### Android 범위 밖
-IP 입력 형식 검증(기존 trim+blank 체크 유지), 포트 입력 UI, 앱 백그라운드 진입 시 드래그 종료(별개 이슈 — 실기기 검증 필요), 서버 자동 탐색(다른 세션 담당), `TrackpadEvent`/와이어 변경.
-
----
-
-## 공통
-- 에이전트는 **`AGENTS.md`/`CLAUDE.md`를 수정하지 않는다**(리더 담당) — 요약 파일에 무엇을 어떻게 바꿔야 하는지만 적을 것.
-- **커밋하지 않는다.**
-- 참고: `AGENTS.md` 섹션 6(재연결 설계·테스트 함정), 섹션 9(컨벤션), 섹션 10(미결 사항)
+## 산출물
+- 각자 `_workspace/01_android-dev_summary.md` / `_workspace/01_server-dev_summary.md` (변경 파일, 테스트 결과 수치, 미해결 이슈, "리더가 AGENTS.md에 반영할 내용").
+- 커밋하지 말 것.
