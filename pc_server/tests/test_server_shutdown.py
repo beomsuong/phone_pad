@@ -13,6 +13,7 @@ import pytest
 
 import server
 import tray
+from fake_conn import AUTH_LINE
 from send_input_stub import patch_send_input
 from input_controller import INPUT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, InputController
 
@@ -114,13 +115,18 @@ def test_same_port_can_be_bound_again_after_stop():
 
 
 def test_running_server_serves_a_real_client_then_stops():
-    """정지 가능하게 바꾼 뒤에도 기존 핸드셰이크가 그대로 동작하는지."""
+    """정지 가능하게 바꾼 뒤에도 기존 핸드셰이크가 그대로 동작하는지.
+
+    Phase 5 부터 클라이언트가 AUTH 줄을 먼저 보내야 SESSION 이 온다
+    (이 런타임은 인증이 꺼져 있으므로 pin 값은 무관하다).
+    """
     registry = server.SessionRegistry()
     runtime = make_runtime(registry=registry)
     thread = start(runtime)
     try:
         with socket.create_connection((LOCALHOST, runtime.tcp_port), timeout=2.0) as client:
             client.settimeout(2.0)
+            client.sendall(AUTH_LINE)
             line = client.makefile("r", encoding="utf-8").readline()
             event = json.loads(line)
             assert event["type"] == "SESSION"
@@ -247,10 +253,11 @@ class FakeTrayController:
 
     instances = []
 
-    def __init__(self, count_provider, on_quit, port):
+    def __init__(self, count_provider, on_quit, port, pin=None):
         self.count_provider = count_provider
         self.on_quit = on_quit
         self.port = port
+        self.pin = pin  # Phase 5: 인증이 켜져 있으면 트레이가 PIN 을 표시한다
         self.run_calls = 0
         self.stop_calls = 0
         self.on_run_entry = None
@@ -359,6 +366,20 @@ def test_tray_menu_uses_the_configured_tcp_port():
         controller, registry, runtime=runtime, tray_factory=quitting_tray_factory
     )
     assert FakeTrayController.instances[0].port == runtime.requested_tcp_port
+    # 인증이 꺼진 런타임(기본값)이면 트레이에 넘길 PIN 도 없다
+    assert FakeTrayController.instances[0].pin is None
+
+
+def test_tray_receives_the_session_pin_when_authentication_is_on():
+    """사용자가 폰에 입력할 값이라 트레이가 표시해야 한다 (Phase 5)."""
+    registry = server.SessionRegistry()
+    controller = InputController()
+    runtime = make_runtime(controller=controller, registry=registry, expected_pin="483920")
+
+    server.run_with_tray(
+        controller, registry, runtime=runtime, tray_factory=quitting_tray_factory
+    )
+    assert FakeTrayController.instances[0].pin == "483920"
 
 
 # --------------------------------------------------------------------------
@@ -494,6 +515,7 @@ def test_console_mode_serves_and_stops_without_a_tray():
 
     with socket.create_connection((LOCALHOST, runtime.tcp_port), timeout=2.0) as client:
         client.settimeout(2.0)
+        client.sendall(AUTH_LINE)  # 인증 꺼진 서버여도 AUTH 줄은 항상 먼저 보낸다
         event = json.loads(client.makefile("r", encoding="utf-8").readline())
         assert event["type"] == "SESSION"
 
@@ -537,9 +559,14 @@ def test_console_mode_keyboard_interrupt_releases_drag(capsys):
 def test_existing_entry_points_keep_their_signatures():
     import inspect
 
-    assert list(inspect.signature(server.handle_client).parameters) == [
-        "conn", "addr", "controller", "registry",
+    params = inspect.signature(server.handle_client).parameters
+    assert list(params) == [
+        "conn", "addr", "controller", "registry", "expected_pin", "auth_limiter",
     ]
+    # 새 파라미터의 기본값은 "인증 없음" 이어야 한다 - 기존 호출자/테스트가
+    # auth 를 명시적으로 켜지 않는 한 지금까지와 똑같이 동작해야 하기 때문이다.
+    assert params["expected_pin"].default is None
+    assert params["auth_limiter"].default is None
     assert list(inspect.signature(server.handle_udp_packet).parameters) == [
         "data", "controller", "registry",
     ]

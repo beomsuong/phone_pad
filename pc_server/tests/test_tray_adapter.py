@@ -12,6 +12,7 @@ import pytest
 import tray
 from tray import (
     MENU_KEY_ADDRESS,
+    MENU_KEY_PIN,
     MENU_KEY_QUIT,
     MENU_KEY_SEPARATOR,
     MENU_KEY_STATUS,
@@ -79,7 +80,8 @@ class FakeIcon:
 class Harness:
     """TrayController + 그 의존성을 한 번에 들고 있는 테스트 지그."""
 
-    def __init__(self, count=0, ip="192.168.0.42", port=9000, on_quit=None, poll_interval=0.01):
+    def __init__(self, count=0, ip="192.168.0.42", port=9000, on_quit=None,
+                 poll_interval=0.01, pin=None):
         self.count = count
         self.icons = []
         self.quit_calls = 0
@@ -100,6 +102,7 @@ class Harness:
             icon_factory=icon_factory,
             image_factory=lambda state: f"IMG:{state}",
             poll_interval=poll_interval,
+            pin=pin,  # Phase 5: 인증이 켜져 있을 때만 값이 들어온다
         )
 
     @property
@@ -282,6 +285,49 @@ def test_only_quit_entry_is_actionable():
     h.start()
     actionable = [e.key for e in h.controller.menu_entries() if e.action is not None]
     assert actionable == [MENU_KEY_QUIT]
+
+
+# --------------------------------------------------------------------------
+# PIN 표시 (Phase 5)
+# --------------------------------------------------------------------------
+
+def test_no_pin_entry_when_authentication_is_off():
+    """인증이 꺼져 있으면 메뉴 구성이 기존과 완전히 같아야 한다."""
+    h = Harness(pin=None)
+    h.start()
+    assert MENU_KEY_PIN not in [e.key for e in h.controller.menu_entries()]
+
+
+def test_pin_entry_sits_after_the_address_and_is_display_only():
+    h = Harness(pin="483920")
+    h.start()
+    entries = h.controller.menu_entries()
+
+    assert [e.key for e in entries] == [
+        MENU_KEY_STATUS,
+        MENU_KEY_ADDRESS,
+        MENU_KEY_PIN,
+        MENU_KEY_SEPARATOR,
+        MENU_KEY_QUIT,
+    ]
+    assert h.entry(MENU_KEY_PIN).text == "PIN: 483920"
+    assert h.entry(MENU_KEY_PIN).enabled is False
+    assert h.entry(MENU_KEY_PIN).action is None
+
+
+def test_tooltip_shows_the_pin_so_the_user_can_type_it_on_the_phone():
+    h = Harness(count=0, pin="483920")
+    icon = h.start()
+    assert icon.title == "Phone Pad - 대기 중 - PIN: 483920"
+
+
+def test_pin_stays_in_the_tooltip_after_a_connection_arrives():
+    h = Harness(count=0, pin="483920")
+    icon = h.start()
+    h.count = 1
+    assert h.controller.refresh() is True
+    assert icon.title == "Phone Pad - 연결됨 (1대) - PIN: 483920"
+    assert h.entry(MENU_KEY_STATUS).text == icon.title
 
 
 # --------------------------------------------------------------------------

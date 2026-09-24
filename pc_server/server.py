@@ -8,6 +8,7 @@ import uuid
 
 import discovery
 import logging_setup
+import pin_auth
 import single_instance
 import tray
 from input_controller import InputController
@@ -32,6 +33,15 @@ HEARTBEAT_MISS_LIMIT = 3
 HEARTBEAT_ACK_LINE = (
     json.dumps({"type": "HEARTBEAT_ACK"}, separators=(",", ":")) + "\n"
 ).encode("utf-8")
+
+# PIN 인증 (AGENTS.md 섹션 4 / Phase 5, pin_auth.py 참조)
+# 클라이언트는 연결 직후 AUTH 한 줄을 보내야 하고, 서버는 그 줄을 읽는 동안에만
+# 이 타임아웃을 건다 (heartbeat 타임아웃과 별개 - 그건 SESSION 이후 시작된다).
+AUTH_TIMEOUT_S = 3.0
+# 인증 이전 단계에서 받아들이는 첫 줄의 최대 길이. `{"type":"AUTH","pin":"483920"}`
+# 는 30 바이트라 넉넉하다. 인증되지 않은 상대가 개행 없이 무한히 밀어넣어
+# 메모리를 키우는 것을 막는다 (초과 시 조용히 닫는다).
+AUTH_MAX_LINE_CHARS = 4096
 
 
 class SessionRegistry:
@@ -113,9 +123,112 @@ def udp_listener(sock: socket.socket, controller: InputController, registry: Ses
         handle_udp_packet(data, controller, registry)
 
 
+def read_auth_line(conn: socket.socket):
+    """AUTH 한 줄을 읽는다. `(line, leftover)` 또는 읽지 못했으면 `None`.
+
+    SESSION 이전 단계라 heartbeat 감시가 아직 시작되지 않았으므로 이 읽기에만
+    `AUTH_TIMEOUT_S` 를 건다. 타임아웃 / EOF / UTF-8 아님 / 과대 입력은 `None`
+    이고, 호출자가 아무 응답 없이 연결을 닫는다.
+
+    개행 뒤에 이미 도착한 바이트(`leftover`)는 버리지 않고 돌려준다 - 정상
+    클라이언트는 SESSION 을 받기 전에 아무것도 보내지 않지만, 보냈다면 그
+    이벤트가 유실되면 안 된다.
+    """
+    conn.settimeout(AUTH_TIMEOUT_S)
+    buffer = ""
+    while "\n" not in buffer:
+        if len(buffer) > AUTH_MAX_LINE_CHARS:
+            return None
+        try:
+            data = conn.recv(4096)
+        except socket.timeout:
+            return None
+        except OSError:
+            return None
+        if not data:
+            return None  # EOF
+        try:
+            buffer += data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    line, leftover = buffer.split("\n", 1)
+    return line, leftover
+
+
+def authenticate_client(conn: socket.socket, addr, expected_pin: str = None,
+                        auth_limiter=None):
+    """SESSION 발급 전 AUTH 한 단계. `(통과했는지, 남은 버퍼)`.
+
+    `expected_pin is None` 이면 인증이 꺼진 것이고, `pin` 값과 무관하게(빈
+    문자열이어도) 통과시킨다 - 다만 **첫 줄이 AUTH 형식이어야 한다는 것은
+    그대로다** (와이어 형식은 서버 설정에 따라 갈라지지 않는다).
+
+    통과하지 못하면 호출자가 연결을 닫는다. 그때 클라이언트에게 가는 것은
+    - PIN 이 명확히 틀렸을 때만 `AUTH_FAIL` 한 줄,
+    - 그 밖(타임아웃/EOF/형식 오류/잠금)은 아무것도 없다(조용히 닫기).
+
+    `auth_limiter` 가 `None` 이면 브루트포스 집계를 하지 않는다 (인증이 꺼진
+    경우와 `handle_client` 를 직접 호출하는 단위 테스트가 그렇다). `ServerRuntime`
+    은 인증이 켜져 있으면 항상 하나를 넘긴다.
+    """
+    auth_enabled = expected_pin is not None
+    key = pin_auth.source_key(addr)
+
+    if auth_enabled and auth_limiter is not None and auth_limiter.is_locked_out(key):
+        # 잠긴 IP: AUTH 줄의 "내용"은 읽지 않고 즉시 닫는다 - 와이어에서는
+        # "형식 오류로 조용히 닫힘"과 구분되지 않아야 한다(잠금 상태를 알려주지
+        # 않는다). 단, close() 전에 큐에 남은 바이트를 짧게 비워야 한다 - 안
+        # 비우면 커널이 RST 를 보내(수신 큐에 미판독 데이터가 있는 채로 닫힘),
+        # 클라이언트가 clean FIN(EOF, HANDSHAKE_FAILED로 분류됨) 대신
+        # SocketException(UNKNOWN으로 분류됨)을 받아 잠금이 형식 오류와 다르게
+        # 보인다 (protocol-qa F-1 실측). 아주 짧은 타임아웃으로 최선을 다해서만
+        # 비운다 - 여기서 더 기다리는 것은 잠금의 의미(즉시 차단)를 해친다.
+        auth_limiter.note_blocked(key)
+        try:
+            conn.settimeout(0.05)
+            conn.recv(4096)
+        except OSError:
+            pass
+        return False, ""
+
+    result = read_auth_line(conn)
+    if result is None:
+        return False, ""  # 타임아웃 / EOF / 과대 입력 - 조용히
+    line, leftover = result
+
+    pin = pin_auth.parse_auth_message(line)
+    if pin is None:
+        # 깨진 JSON / dict 아님 / type != AUTH / pin 이 문자열 아님 - 조용히
+        return False, ""
+
+    if not auth_enabled:
+        return True, leftover
+
+    if not pin_auth.pins_match(pin, expected_pin):
+        # 로그에 PIN 값(기대값도, 받은 값도) 을 남기지 않는다.
+        print(f"[!] Auth failed for {addr}")
+        if auth_limiter is not None:
+            auth_limiter.record_failure(key)
+        try:
+            conn.sendall(pin_auth.AUTH_FAIL_LINE)
+        except OSError as e:
+            print(f"[!] Failed to send auth failure to {addr}: {e}")
+        return False, ""
+
+    return True, leftover
+
+
 def handle_client(conn: socket.socket, addr, controller: InputController,
-                  registry: SessionRegistry):
+                  registry: SessionRegistry, expected_pin: str = None,
+                  auth_limiter=None):
     print(f"[+] Connected: {addr}")
+    authenticated, buffer = authenticate_client(conn, addr, expected_pin, auth_limiter)
+    if not authenticated:
+        # 세션을 발급하지 않았으므로 회수할 것도, 드래그 안전장치도 필요 없다.
+        conn.close()
+        print(f"[-] Disconnected: {addr}")
+        return
+
     session = registry.issue()
     try:
         conn.sendall((json.dumps({"type": "SESSION", "session": session}) + "\n").encode("utf-8"))
@@ -128,26 +241,12 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
         conn.close()
         return
 
-    buffer = ""
+    # buffer 는 AUTH 줄 뒤에 남아 있던 바이트에서 시작한다 (보통 빈 문자열).
     missed = 0  # 연속 heartbeat 미응답 횟수
     try:
         while True:
-            try:
-                data = conn.recv(4096)
-            except socket.timeout:
-                missed += 1
-                if missed >= HEARTBEAT_MISS_LIMIT:
-                    print(f"[!] Heartbeat timeout: dropping {addr}")
-                    break
-                if missed >= 2:
-                    # 정상 연결에서도 송신 주기와 recv 타임아웃 창이 맞물려 1회 정도는
-                    # 흔히 발생한다(F-1). 노이즈를 줄이기 위해 2회부터만 로그를 남긴다.
-                    print(f"[!] Heartbeat miss {missed}/{HEARTBEAT_MISS_LIMIT} from {addr}")
-                continue
-            if not data:
-                break
-            missed = 0  # 어떤 데이터든 받았으면 살아있는 것으로 본다
-            buffer += data.decode("utf-8")
+            # 완성된 줄을 recv 보다 **먼저** 비운다 - AUTH 줄과 같은 청크에
+            # 이벤트가 붙어 왔다면 다음 recv 를 기다리지 않고 처리해야 한다.
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 line = line.strip()
@@ -174,6 +273,22 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
                     # TCP 세션 전체가 끊기면 안 된다 — UDP 경로(handle_udp_packet)와
                     # 동일하게 이 이벤트만 무시하고 계속 진행한다 (F-4)
                     print(f"[!] handle_event failed for {event!r}: {e}")
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                missed += 1
+                if missed >= HEARTBEAT_MISS_LIMIT:
+                    print(f"[!] Heartbeat timeout: dropping {addr}")
+                    break
+                if missed >= 2:
+                    # 정상 연결에서도 송신 주기와 recv 타임아웃 창이 맞물려 1회 정도는
+                    # 흔히 발생한다(F-1). 노이즈를 줄이기 위해 2회부터만 로그를 남긴다.
+                    print(f"[!] Heartbeat miss {missed}/{HEARTBEAT_MISS_LIMIT} from {addr}")
+                continue
+            if not data:
+                break
+            missed = 0  # 어떤 데이터든 받았으면 살아있는 것으로 본다
+            buffer += data.decode("utf-8")
     except Exception as e:
         print(f"[!] Error from {addr}: {e}")
     finally:
@@ -226,6 +341,8 @@ class ServerRuntime:
         accept_timeout: float = ACCEPT_TIMEOUT_S,
         stop_event: threading.Event = None,
         discovery_port: int = None,
+        expected_pin: str = None,
+        auth_limiter=None,
     ):
         self.controller = controller
         self.registry = registry
@@ -237,6 +354,17 @@ class ServerRuntime:
         # 동안 무관한 테스트가 깨진다. main() 만 이 값을 넘긴다.
         self.requested_discovery_port = discovery_port
         self.discovery = None
+        # PIN 인증도 **기본 비활성**이다 (탐색 포트와 같은 교훈): 기본값을 켜두면
+        # ServerRuntime 을 만드는 기존 테스트가 전부 AUTH 를 보내야 한다.
+        # main() 만 실제 PIN 을 넘긴다.
+        self.expected_pin = expected_pin
+        if auth_limiter is not None:
+            self.auth_limiter = auth_limiter
+        elif expected_pin is not None:
+            # 브루트포스 집계는 연결을 넘어 유지돼야 하므로 런타임이 하나만 들고 있는다.
+            self.auth_limiter = pin_auth.AuthAttemptLimiter()
+        else:
+            self.auth_limiter = None
         self.accept_timeout = accept_timeout
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         # 바인드가 끝나고 accept 루프에 진입했음을 알리는 신호 (테스트/기동 동기화용)
@@ -306,7 +434,14 @@ class ServerRuntime:
                     break
                 threading.Thread(
                     target=handle_client,
-                    args=(conn, addr, self.controller, self.registry),
+                    args=(
+                        conn,
+                        addr,
+                        self.controller,
+                        self.registry,
+                        self.expected_pin,
+                        self.auth_limiter,
+                    ),
                     daemon=True,
                 ).start()
         finally:
@@ -389,6 +524,9 @@ def run_with_tray(controller: InputController, registry: SessionRegistry,
         count_provider=lambda: len(registry.snapshot()),
         on_quit=on_quit,
         port=runtime.requested_tcp_port,
+        # 인증이 꺼져 있으면 None - 트레이 표시는 기존과 완전히 동일해진다.
+        # getattr 로 읽는 이유: 테스트가 ServerRuntime 대역을 넘길 수 있다.
+        pin=getattr(runtime, "expected_pin", None),
     )
 
     def server_main():
@@ -433,7 +571,47 @@ def parse_args(argv=None):
         action="store_true",
         help="disable UDP broadcast server discovery (port %d)" % discovery.DISCOVERY_PORT,
     )
+    parser.add_argument(
+        "--pin",
+        default=None,
+        metavar="CODE",
+        help="use this PIN instead of a randomly generated one",
+    )
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="disable PIN authentication entirely (development/debugging only)",
+    )
     return parser.parse_args(argv)
+
+
+def resolve_expected_pin(args) -> str:
+    """이번 실행에 쓸 PIN. 인증이 꺼져 있으면 `None`.
+
+    `--no-auth` > `--pin` > 무작위 생성 순으로 결정한다. 콘솔 출력은 호출자가
+    한다. **PIN 값이 노출되는 의도된 지점은 이것과 트레이 툴팁/메뉴
+    (`tray_status.py`) 둘뿐이다** — 그 외 어떤 로그에도 PIN 값은 남지 않는다
+    (protocol-qa W-3: "로그에 나가는 유일한 지점"이라는 이전 문구는 트레이를
+    빠뜨려 부정확했다).
+    """
+    if getattr(args, "no_auth", False):
+        return None
+    if getattr(args, "pin", None) is not None:
+        pin = args.pin.strip()
+        # 빈/공백 PIN을 그대로 쓰면 "인증 켜짐 + 기대값 빈 문자열"이 되는데,
+        # 앱은 빈 PIN 전송을 막고 있어 그 서버는 누구도 접속할 수 없고 5회
+        # 시도하면 자기 IP가 잠긴다(protocol-qa F-2 실측 - "아무 pin이나
+        # 통과에 가까워진다"는 예상과 정반대). 애초에 받지 않는다.
+        # strip()은 앱의 TrackpadViewModel.onPinInputChange()가 하는 trim()과
+        # 맞추기 위함이기도 하다 - 안 맞으면 "--pin ' 483920 '"이 영원히
+        # 불일치한다(W-4).
+        if not pin:
+            raise SystemExit(
+                "--pin requires a non-blank value (use --no-auth to disable "
+                "authentication instead)"
+            )
+        return pin
+    return pin_auth.generate_pin()
 
 
 def main(argv=None) -> int:
@@ -454,6 +632,14 @@ def main(argv=None) -> int:
     controller = InputController()
     registry = SessionRegistry()
 
+    # 사용자가 폰에 입력해야 하는 값이라 **이 한 줄만** 의도적으로 PIN 을 노출한다.
+    # 그 밖의 어떤 로그에도 PIN 값을 남기지 않는다 (pin_auth.py 참조).
+    expected_pin = resolve_expected_pin(args)
+    if expected_pin is None:
+        print("[Server] PIN authentication disabled (--no-auth)")
+    else:
+        print(f"[Server] PIN for this session: {expected_pin}")
+
     # 안전장치: 정상 종료 경로를 안 거치고 인터프리터가 끝나도 버튼을 놓는다.
     # `force_release_drag` 가 멱등이라 정상 경로와 중복 호출돼도 문제 없다.
     atexit.register(release_drag, controller, "atexit")
@@ -470,6 +656,7 @@ def main(argv=None) -> int:
         controller,
         registry,
         discovery_port=None if args.no_discovery else discovery.DISCOVERY_PORT,
+        expected_pin=expected_pin,
     )
 
     if use_tray:

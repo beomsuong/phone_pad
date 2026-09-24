@@ -14,6 +14,7 @@ import pytest
 from unittest.mock import patch
 
 import server
+from fake_conn import FakeConn
 from send_input_stub import (
     injected_none,
     injected_partial,
@@ -475,38 +476,9 @@ def test_failed_desktop_switch_during_drag_keeps_drag_active():
 
 
 # --------------------------------------------------------------------------
-# TCP end-to-end (server.py 무변경 - 기존 handle_event 위임 경로를 그대로 탄다)
+# TCP end-to-end (기존 handle_event 위임 경로를 그대로 탄다. AUTH 줄은 공용
+# FakeConn 이 자동으로 먼저 보내고, 서버는 인증 없이(expected_pin=None) 돈다)
 # --------------------------------------------------------------------------
-
-class FakeConn:
-    """socket.socket 대역 (test_server_drag.py 와 동일 패턴)."""
-
-    def __init__(self, chunks=None):
-        self._chunks = list(chunks or [])
-        self.sent = []
-        self.closed = False
-
-    def settimeout(self, value):
-        pass
-
-    def sendall(self, data):
-        self.sent.append(data)
-
-    def recv(self, _size):
-        if self._chunks:
-            chunk = self._chunks.pop(0)
-            if isinstance(chunk, BaseException):
-                raise chunk
-            return chunk
-        return b""
-
-    def close(self):
-        self.closed = True
-
-    def sent_lines(self):
-        joined = b"".join(self.sent).decode("utf-8")
-        return [line for line in joined.split("\n") if line]
-
 
 def run_client(conn, controller=None, registry=None):
     controller = controller or InputController()

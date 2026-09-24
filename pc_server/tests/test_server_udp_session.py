@@ -5,35 +5,8 @@ import time
 from unittest.mock import patch
 
 import server
+from fake_conn import FakeConn
 from input_controller import InputController
-
-
-class FakeConn:
-    """socket.socket 대역: recv 로 돌려줄 바이트열을 미리 넣어둔다."""
-
-    def __init__(self, chunks=None):
-        self._chunks = list(chunks or [])
-        self.sent = []
-        self.closed = False
-        self.timeouts = []
-
-    def settimeout(self, value):
-        self.timeouts.append(value)
-
-    def sendall(self, data):
-        self.sent.append(data)
-
-    def recv(self, _size):
-        if self._chunks:
-            return self._chunks.pop(0)
-        return b""  # 연결 종료
-
-    def close(self):
-        self.closed = True
-
-    def sent_lines(self):
-        joined = b"".join(self.sent).decode("utf-8")
-        return [line for line in joined.split("\n") if line]
 
 
 def make_controller():
@@ -251,10 +224,10 @@ def test_handle_client_registers_session_while_connected():
     seen = {}
 
     class ProbeConn(FakeConn):
-        def recv(self, size):
-            # 연결 유지 중 세션이 활성인지 확인
+        def _recv_event(self, size):
+            # 연결 유지 중(= SESSION 발급 후) 세션이 활성인지 확인
             seen["active"] = registry.snapshot()
-            return super().recv(size)
+            return super()._recv_event(size)
 
     conn = ProbeConn()
     server.handle_client(conn, ("127.0.0.1", 5555), controller, registry)
@@ -281,7 +254,8 @@ def test_handle_client_removes_session_even_on_error():
     controller = make_controller()
 
     class ExplodingConn(FakeConn):
-        def recv(self, _size):
+        def _recv_event(self, _size):
+            # AUTH 는 정상적으로 지나가고, SESSION 이후의 첫 recv 에서 터진다
             raise ConnectionResetError("client vanished")
 
     conn = ExplodingConn()

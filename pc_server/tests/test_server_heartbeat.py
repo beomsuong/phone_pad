@@ -1,50 +1,22 @@
 """TCP heartbeat (HEARTBEAT / HEARTBEAT_ACK) 처리 테스트.
 
-기존 test_server_udp_session.py 의 FakeConn 패턴을 따른다:
-recv() 로 돌려줄 값을 미리 큐에 넣고, socket.timeout 을 넣어 무응답을 시뮬레이션한다.
-실제 소켓/SendInput 호출은 전혀 하지 않는다.
+공용 `fake_conn.FakeConn` 을 쓴다: recv() 로 돌려줄 값을 미리 큐에 넣고,
+socket.timeout 을 넣어 무응답을 시뮬레이션한다. 실제 소켓/SendInput 호출은
+전혀 하지 않는다.
+
+Phase 5(PIN 인증)부터 클라이언트가 AUTH 줄을 먼저 보내야 SESSION 이 오므로
+FakeConn 이 그 줄을 자동으로 흘려준다. `recv_calls` / `timeouts` 는 여전히
+SESSION 이후(=heartbeat 루프)만 센다 - 아래 단정들의 의미가 보존된다.
 """
 import json
 import socket
 from unittest.mock import patch
 
 import server
+from fake_conn import FakeConn
 from input_controller import InputController
 
 ADDR = ("127.0.0.1", 5555)
-
-
-class FakeConn:
-    """socket.socket 대역. chunks 의 각 원소는 bytes 이거나 예외 인스턴스."""
-
-    def __init__(self, chunks=None):
-        self._chunks = list(chunks or [])
-        self.sent = []
-        self.closed = False
-        self.timeouts = []
-        self.recv_calls = 0
-
-    def settimeout(self, value):
-        self.timeouts.append(value)
-
-    def sendall(self, data):
-        self.sent.append(data)
-
-    def recv(self, _size):
-        self.recv_calls += 1
-        if self._chunks:
-            chunk = self._chunks.pop(0)
-            if isinstance(chunk, BaseException):
-                raise chunk
-            return chunk
-        return b""  # 클라이언트가 연결을 닫음
-
-    def close(self):
-        self.closed = True
-
-    def sent_lines(self):
-        joined = b"".join(self.sent).decode("utf-8")
-        return [line for line in joined.split("\n") if line]
 
 
 def timeout():
@@ -75,7 +47,9 @@ def test_handle_client_sets_socket_timeout_after_handshake():
     conn = FakeConn()
     run_client(conn)
     assert conn.timeouts == [server.HEARTBEAT_INTERVAL_S]
-    # 타임아웃은 SESSION 줄을 보낸 뒤에 걸려야 한다 (핸드셰이크는 블로킹)
+    # AUTH 줄을 읽는 동안에는 별개의(더 짧은) 타임아웃이 걸린다
+    assert conn.auth_timeouts == [server.AUTH_TIMEOUT_S]
+    # heartbeat 타임아웃은 SESSION 줄을 보낸 뒤에 걸려야 한다
     assert json.loads(conn.sent_lines()[0])["type"] == "SESSION"
 
 

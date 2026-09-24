@@ -19,6 +19,8 @@ from tray_status import (
     TrayStatus,
     detect_lan_ip,
     format_address_label,
+    format_pin_label,
+    normalize_pin,
     tray_status,
 )
 
@@ -43,6 +45,7 @@ DEFAULT_POLL_INTERVAL_S = 1.0
 # 메뉴 항목 키 (테스트가 문구가 아니라 키로 항목을 찾을 수 있게 한다)
 MENU_KEY_STATUS = "status"
 MENU_KEY_ADDRESS = "address"
+MENU_KEY_PIN = "pin"
 MENU_KEY_SEPARATOR = "separator"
 MENU_KEY_QUIT = "quit"
 
@@ -116,10 +119,13 @@ class TrayController:
         image_factory: Callable[[str], object] = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL_S,
         name: str = "phone_pad",
+        pin: str = None,
     ):
         self._count_provider = count_provider
         self._on_quit = on_quit
         self._port = port
+        # 인증이 꺼져 있으면 None - 툴팁/메뉴가 기존과 완전히 같아진다.
+        self._pin = normalize_pin(pin)
         self._ip_lookup = ip_lookup if ip_lookup is not None else detect_lan_ip
         self._icon_factory = icon_factory if icon_factory is not None else _default_icon_factory
         self._image_factory = image_factory if image_factory is not None else create_icon_image
@@ -149,7 +155,7 @@ class TrayController:
         return self._status
 
     def current_status(self) -> TrayStatus:
-        return tray_status(self._count_provider())
+        return tray_status(self._count_provider(), self._pin)
 
     def status_text(self) -> str:
         status = self._status if self._status is not None else self.current_status()
@@ -175,14 +181,27 @@ class TrayController:
 
     # -- 메뉴 -------------------------------------------------------------
 
+    def pin_label(self) -> str:
+        """PIN 라벨 (표시 전용). 인증이 꺼져 있으면 항목 자체가 없다."""
+        return format_pin_label(self._pin)
+
     def menu_entries(self):
-        """메뉴 구성 (위 -> 아래). pystray 없이도 만들어지고 검사할 수 있다."""
-        return [
+        """메뉴 구성 (위 -> 아래). pystray 없이도 만들어지고 검사할 수 있다.
+
+        PIN 항목은 **인증이 켜져 있을 때만** 들어간다 - 꺼져 있으면 메뉴 구성이
+        기존(상태/주소/구분선/종료)과 완전히 같다.
+        """
+        entries = [
             MenuEntry(MENU_KEY_STATUS, self.status_text(), enabled=False),
             MenuEntry(MENU_KEY_ADDRESS, self.address_label(), enabled=False),
+        ]
+        if self._pin is not None:
+            entries.append(MenuEntry(MENU_KEY_PIN, self.pin_label(), enabled=False))
+        entries.extend([
             MenuEntry(MENU_KEY_SEPARATOR, "", enabled=False),
             MenuEntry(MENU_KEY_QUIT, QUIT_TEXT, enabled=True, action=self.quit),
-        ]
+        ])
+        return entries
 
     @staticmethod
     def _wrap_action(action):

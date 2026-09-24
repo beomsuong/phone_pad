@@ -4,7 +4,8 @@
 멈춘다. handle_client 의 finally 는 정상 종료(EOF) / heartbeat 타임아웃 / 예외
 전부를 지나므로, 그 경로마다 LEFTUP 이 실제로 나가는지 FakeConn 으로 구동해 확인한다.
 
-test_server_heartbeat.py 의 FakeConn 패턴을 그대로 쓴다 — 실제 소켓/SendInput 호출 없음.
+공용 `fake_conn.FakeConn` 을 쓴다 — 실제 소켓/SendInput 호출 없음. AUTH 줄은
+FakeConn 이 자동으로 먼저 흘려주고, `recv_calls` 는 SESSION 이후만 센다.
 """
 import ctypes
 import json
@@ -12,6 +13,7 @@ import socket
 from unittest.mock import patch
 
 import server
+from fake_conn import FakeConn
 from send_input_stub import patch_send_input
 from input_controller import (
     INPUT,
@@ -24,39 +26,6 @@ ADDR = ("127.0.0.1", 5555)
 
 DRAG_START_LINE = b'{"type":"DRAG_START"}\n'
 DRAG_END_LINE = b'{"type":"DRAG_END"}\n'
-
-
-class FakeConn:
-    """socket.socket 대역. chunks 의 각 원소는 bytes 이거나 예외 인스턴스."""
-
-    def __init__(self, chunks=None):
-        self._chunks = list(chunks or [])
-        self.sent = []
-        self.closed = False
-        self.timeouts = []
-        self.recv_calls = 0
-
-    def settimeout(self, value):
-        self.timeouts.append(value)
-
-    def sendall(self, data):
-        self.sent.append(data)
-
-    def recv(self, _size):
-        self.recv_calls += 1
-        if self._chunks:
-            chunk = self._chunks.pop(0)
-            if isinstance(chunk, BaseException):
-                raise chunk
-            return chunk
-        return b""  # 클라이언트가 연결을 닫음
-
-    def close(self):
-        self.closed = True
-
-    def sent_lines(self):
-        joined = b"".join(self.sent).decode("utf-8")
-        return [line for line in joined.split("\n") if line]
 
 
 def timeout():

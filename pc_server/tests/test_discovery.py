@@ -13,6 +13,7 @@ import pytest
 
 import discovery
 import server
+from fake_conn import AUTH_LINE
 from input_controller import InputController
 
 LOCALHOST = "127.0.0.1"
@@ -436,6 +437,9 @@ def test_server_keeps_serving_when_discovery_cannot_bind(capsys):
         assert runtime.discovery is not None and not runtime.discovery.running
         with socket.create_connection((LOCALHOST, runtime.tcp_port), timeout=2.0) as client:
             client.settimeout(2.0)
+            # Phase 5: 클라이언트가 AUTH 줄을 먼저 보내야 SESSION 이 온다
+            # (이 런타임은 인증이 꺼져 있으므로 pin 값은 무관하다)
+            client.sendall(AUTH_LINE)
             event = json.loads(client.makefile("r", encoding="utf-8").readline())
             assert event["type"] == "SESSION"
     finally:

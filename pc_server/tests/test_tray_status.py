@@ -7,13 +7,16 @@ import pytest
 
 from tray_status import (
     ADDRESS_UNKNOWN,
+    PIN_DISABLED,
     ROUTE_PROBE_ADDRESS,
     STATE_CONNECTED,
     STATE_IDLE,
     TOOLTIP_IDLE,
     detect_lan_ip,
     format_address_label,
+    format_pin_label,
     is_usable_lan_ip,
+    normalize_pin,
     tray_status,
 )
 
@@ -175,3 +178,51 @@ def test_address_label_never_advertises_loopback():
 
 def test_address_label_uses_given_port():
     assert format_address_label("10.1.2.3", 9100).endswith(":9100")
+
+
+# --------------------------------------------------------------------------
+# PIN 표시 (Phase 5) - 인증이 켜져 있을 때만 붙는다
+# --------------------------------------------------------------------------
+
+def test_tooltip_is_unchanged_when_authentication_is_off():
+    assert tray_status(0).tooltip == "Phone Pad - 대기 중"
+    assert tray_status(0, None).tooltip == "Phone Pad - 대기 중"
+    assert tray_status(2, None).tooltip == "Phone Pad - 연결됨 (2대)"
+
+
+def test_idle_tooltip_appends_the_pin():
+    assert tray_status(0, "483920").tooltip == "Phone Pad - 대기 중 - PIN: 483920"
+
+
+def test_connected_tooltip_appends_the_pin():
+    assert tray_status(2, "483920").tooltip == "Phone Pad - 연결됨 (2대) - PIN: 483920"
+
+
+def test_pin_does_not_change_the_icon_state():
+    assert tray_status(0, "483920").state == STATE_IDLE
+    assert tray_status(1, "483920").state == STATE_CONNECTED
+
+
+def test_pin_is_part_of_the_status_value_for_change_detection():
+    assert tray_status(1, "483920") == tray_status(1, "483920")
+    assert tray_status(1, "483920") != tray_status(1, "112233")
+    assert tray_status(1, "483920") != tray_status(1)
+
+
+@pytest.mark.parametrize("bogus", ["", "   ", None, 483920, object(), ["4"]])
+def test_bogus_pins_are_shown_as_no_pin_at_all(bogus):
+    """트레이 표시 계산이 서버를 죽이는 일은 없어야 한다 (연결 수와 같은 규칙)."""
+    assert normalize_pin(bogus) is None
+    assert tray_status(0, bogus).tooltip == TOOLTIP_IDLE
+
+
+def test_normalize_pin_trims_surrounding_whitespace():
+    assert normalize_pin("  483920 ") == "483920"
+
+
+def test_pin_menu_label():
+    assert format_pin_label("483920") == "PIN: 483920"
+
+
+def test_pin_menu_label_when_authentication_is_off():
+    assert format_pin_label(None) == f"PIN: {PIN_DISABLED}"
