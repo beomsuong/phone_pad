@@ -10,7 +10,7 @@ import pytest
 
 import gui
 import gui_state
-from fake_tk import FakeTk
+from fake_tk import FakeStyle, FakeTk, FakeTtk
 
 
 class FakeServer:
@@ -53,8 +53,9 @@ class FakeServer:
 
 
 class Harness:
-    def __init__(self, tray_usable=True, ip="192.168.0.42", port=9000, count=0):
-        self.tk = FakeTk()
+    def __init__(self, tray_usable=True, ip="192.168.0.42", port=9000, count=0,
+                 ttk_module=None):
+        self.tk = FakeTk(ttk_module=ttk_module)
         self.server = FakeServer()
         self.tray_usable = tray_usable
         self.count = count
@@ -95,6 +96,13 @@ class Harness:
 
     def button(self, key):
         return self.controller._buttons[key]
+
+    @property
+    def style(self):
+        return self.tk.ttk.style
+
+    def dot_color(self):
+        return self.controller._dot_label.kwargs.get("foreground")
 
     def close_window(self):
         """X 버튼."""
@@ -173,6 +181,123 @@ def test_two_buttons_exist_with_the_expected_wiring():
     assert h.button("exit").kwargs["text"] == gui_state.EXIT_TEXT
     assert h.button("toggle").kwargs["command"] == h.controller.on_toggle
     assert h.button("exit").kwargs["command"] == h.controller.exit_clicked
+
+
+# --------------------------------------------------------------------------
+# 2b. 겉모습 (동작이 아니라 '어떻게 보이는가'. 여기서 깨지면 창이 레트로로 돌아간다)
+# --------------------------------------------------------------------------
+
+def test_every_widget_is_themed_and_the_native_theme_is_applied():
+    """클래식 `tk.Label/Button`(회색 베벨)으로 되돌아가면 여기서 잡힌다."""
+    h = Harness().build()
+    widgets = h.tk.ttk.widgets
+    assert widgets, "the window must be built out of ttk widgets"
+    assert all(w.themed for w in widgets)
+    assert h.style.theme_use() == gui.PREFERRED_THEME
+
+
+def test_theme_falls_back_silently_when_vista_is_missing():
+    """다른 플랫폼/구버전 Tcl 에는 vista 가 없다 - 창은 그래도 떠야 한다."""
+    ttk_module = FakeTtk(style_factory=lambda master: FakeStyle(
+        master, themes=("clam", "default")))
+    h = Harness(ttk_module=ttk_module).build()
+    assert h.style.theme_uses == [], "an absent theme must not be requested"
+    assert h.root.state == "normal"
+
+
+def test_build_survives_a_style_setup_failure(capsys):
+    """스타일은 보기 좋으라고 있는 것이다 - 실패해도 서버를 못 켜게 하면 안 된다."""
+    class ExplodingTtk(FakeTtk):
+        def Style(self, master=None):
+            raise RuntimeError("no style engine")
+
+    h = Harness(ttk_module=ExplodingTtk()).build()
+    assert h.label("status") == gui_state.STATUS_STOPPED
+    assert h.button("toggle").kwargs["style"] == gui.STYLE_BUTTON
+    assert capsys.readouterr().out.isascii()
+
+
+def test_the_start_button_gets_an_emphasis_style():
+    """이 환경의 Tk 8.6.15 에는 Accent 가 없어 직접 만든 스타일로 내려간다."""
+    h = Harness().build()
+    assert h.button("toggle").kwargs["style"] == gui.STYLE_PRIMARY_BUTTON
+    assert gui.STYLE_PRIMARY_BUTTON in h.style.configured
+    assert "style" not in h.button("exit").kwargs, "the exit button stays secondary"
+
+
+def test_a_builtin_accent_style_is_preferred_when_tcl_provides_one():
+    ttk_module = FakeTtk(style_factory=lambda master: FakeStyle(
+        master, builtin={gui.STYLE_ACCENT_BUTTON: {"background": "#0067c0"}}))
+    h = Harness(ttk_module=ttk_module).build()
+    assert h.button("toggle").kwargs["style"] == gui.STYLE_ACCENT_BUTTON
+
+
+def test_pin_is_large_only_while_there_is_a_real_pin():
+    h = Harness().build()
+    assert h.controller._pin_label.kwargs["style"] == gui.STYLE_PIN_MUTED
+
+    h.controller.start_server()
+    assert h.label("pin") == "PIN: 483921"
+    assert h.controller._pin_label.kwargs["style"] == gui.STYLE_PIN
+
+    h.controller.stop_server()
+    assert h.controller._pin_label.kwargs["style"] == gui.STYLE_PIN_MUTED
+
+
+def test_status_dot_and_window_icon_follow_the_tray_color_rule():
+    """회색 = 대기, 초록 = 연결됨 (트레이 아이콘과 같은 의미)."""
+    h = Harness().build()
+    h.controller.start_server()
+    assert h.dot_color() == gui.COLOR_IDLE
+    assert h.root.icon_photos[-1][1] is h.controller._icons[gui.COLOR_IDLE]
+
+    h.count = 1
+    h.controller.refresh()
+    assert h.label("status") == "Phone Pad - 연결됨 (1대)"
+    assert h.dot_color() == gui.COLOR_CONNECTED
+    assert h.root.icon_photos[-1][1] is h.controller._icons[gui.COLOR_CONNECTED]
+
+    h.count = 0
+    h.controller.refresh()
+    assert h.dot_color() == gui.COLOR_IDLE
+
+
+def test_an_unchanged_status_does_not_repaint_the_dot():
+    """Windows 에서 아이콘을 매초 갈아 끼우면 깜빡인다 (트레이와 같은 규칙)."""
+    h = Harness().build()
+    before = len(h.root.icon_photos)
+    for _ in range(5):
+        h.controller.refresh()
+    assert len(h.root.icon_photos) == before
+    assert h.controller._dot_label.configure_calls == [{"foreground": gui.COLOR_IDLE}]
+
+
+def test_the_window_icon_is_drawn_without_pillow():
+    """Pillow 는 선택 의존성이다 - 창 아이콘은 표준 `PhotoImage` 로만 그린다."""
+    h = Harness().build()
+    assert len(h.tk.images) == 2
+    for image in h.tk.images:
+        assert (image.width, image.height) == (gui.ICON_SIZE_PX, gui.ICON_SIZE_PX)
+        assert image.puts, "the dot must actually be painted"
+
+
+def test_minimum_width_keeps_the_window_from_jumping():
+    h = Harness().build()
+    assert h.root.minsize_calls == [(gui.MIN_WIDTH_PX, 0)]
+
+
+def test_status_color_only_turns_green_for_the_connected_line():
+    assert gui.status_color(gui_state.STATUS_STOPPED) == gui.COLOR_IDLE
+    assert gui.status_color("Phone Pad - 대기 중") == gui.COLOR_IDLE
+    assert gui.status_color("Phone Pad - 연결됨 (3대)") == gui.COLOR_CONNECTED
+    assert gui.status_color(None) == gui.COLOR_IDLE
+
+
+def test_pin_style_picks_the_big_font_only_for_digits():
+    assert gui.pin_style("PIN: 483920") == gui.STYLE_PIN
+    assert gui.pin_style(gui_state.PIN_STOPPED) == gui.STYLE_PIN_MUTED
+    assert gui.pin_style("PIN: (사용 안 함)") == gui.STYLE_PIN_MUTED
+    assert gui.pin_style(None) == gui.STYLE_PIN_MUTED
 
 
 # --------------------------------------------------------------------------
@@ -520,6 +645,13 @@ def _real_harness(real_tk):
     return h
 
 
+def _rgb(value):
+    """`PhotoImage.get()` 는 Tk/Python 버전에 따라 튜플 또는 '46 160 67' 문자열."""
+    if isinstance(value, str):
+        value = tuple(int(part) for part in value.split())
+    return tuple(value)[:3]
+
+
 def test_real_tk_builds_the_window_and_wires_the_buttons(real_tk):
     h = _real_harness(real_tk)
     h.controller.build()
@@ -530,6 +662,60 @@ def test_real_tk_builds_the_window_and_wires_the_buttons(real_tk):
         assert h.controller.label("toggle") == "정지"
         h.controller._buttons["toggle"].invoke()
         assert h.server.stops == 1
+    finally:
+        h.controller.destroy()
+
+
+def test_real_tk_actually_applies_the_custom_styles(real_tk):
+    """가짜 Style 은 옵션 이름이 틀려도 받아 준다 - 실제 Tk 로 한 번 확인한다.
+
+    `_setup_style()` 은 실패를 조용히 삼키므로(창이 안 뜨면 안 되니까) 여기서
+    확인하지 않으면 오타 하나로 '레트로' 로 돌아가도 모른다.
+    """
+    h = _real_harness(real_tk)
+    h.controller.build()
+    try:
+        style = h.controller._style
+        assert style is not None
+        assert gui.FONT_MONO in str(style.lookup(gui.STYLE_PIN, "font"))
+        assert style.lookup(gui.STYLE_STATUS, "foreground") == gui.COLOR_TEXT
+        assert style.lookup(gui.STYLE_CARD, "background") == gui.COLOR_SURFACE
+        # 강조 버튼은 실제로 존재하는 스타일 이름이어야 한다.
+        assert style.configure(h.controller._primary_style)
+        # 실제 위젯도 그 스타일을 달고 있어야 한다.
+        assert h.controller._pin_label.cget("style") == gui.STYLE_PIN_MUTED
+        assert h.controller._buttons["toggle"].cget("style") == h.controller._primary_style
+    finally:
+        h.controller.destroy()
+
+
+def test_real_tk_paints_the_status_dot_and_window_icon(real_tk):
+    h = _real_harness(real_tk)
+    h.controller.build()
+    try:
+        # 이 Tcl/Tk 버전은 `cget("foreground")`가 평범한 str이 아니라 색 전용
+        # 래퍼 객체를 돌려준다(repr은 같은 값을 보여주지만 `==`이 str과 바로
+        # 성립하지 않는다) - str()로 감싸서 비교한다.
+        assert str(h.controller._dot_label.cget("foreground")) == gui.COLOR_IDLE
+        assert set(h.controller._icons) == {gui.COLOR_IDLE, gui.COLOR_CONNECTED}
+        image = h.controller._icons[gui.COLOR_CONNECTED]
+        assert (image.width(), image.height()) == (gui.ICON_SIZE_PX, gui.ICON_SIZE_PX)
+        # 가운데는 칠해져 있고 모서리는 투명해야 '원' 이다.
+        middle = gui.ICON_SIZE_PX // 2
+        assert _rgb(image.get(middle, middle)) == (46, 160, 67)
+        assert image.transparency_get(0, 0) is True
+        # `image`는 `PhotoImage`(Tcl 인터프리터에 매인 객체)를 가리키는 이 함수
+        # 지역 변수다. 지우지 않으면 함수가 끝날 때(= finally의 destroy() 이후)
+        # 참조 카운트가 0이 되어 `__del__`이 이미 파괴된 인터프리터를 호출해
+        # "main thread is not in main loop"를 던진다(pytest가 실패로 잡는다).
+        # destroy()는 `self._icons`를 root.destroy() 전에 비워 정상적으로 정리하므로,
+        # 여기서 이 지역 참조만 먼저 없애면 destroy() 시점에 참조가 그것 하나만 남는다.
+        del image
+
+        h.controller.start_server()
+        h.count = 2
+        h.controller.refresh()
+        assert str(h.controller._dot_label.cget("foreground")) == gui.COLOR_CONNECTED
     finally:
         h.controller.destroy()
 
