@@ -81,7 +81,7 @@ class Harness:
     """TrayController + 그 의존성을 한 번에 들고 있는 테스트 지그."""
 
     def __init__(self, count=0, ip="192.168.0.42", port=9000, on_quit=None,
-                 poll_interval=0.01, pin=None):
+                 poll_interval=0.01, pin=None, on_show=None):
         self.count = count
         self.icons = []
         self.quit_calls = 0
@@ -103,6 +103,8 @@ class Harness:
             image_factory=lambda state: f"IMG:{state}",
             poll_interval=poll_interval,
             pin=pin,  # Phase 5: 인증이 켜져 있을 때만 값이 들어온다
+            # 창 모드에서만 주어진다 - 있으면 메뉴에 '창 열기' 가 생긴다
+            on_show=on_show,
         )
 
     @property
@@ -520,3 +522,106 @@ def test_unavailable_reason_is_empty_when_available():
         assert tray.unavailable_reason() == ""
     else:
         assert tray.unavailable_reason() != ""
+
+
+# --------------------------------------------------------------------------
+# 창 모드 확장: '창 열기' 항목 + 값이 변하는 PIN
+# (창이 없는 모드에서는 둘 다 기존과 완전히 같아야 한다 - 위쪽 테스트들이 그것을
+#  고정하고 있다)
+# --------------------------------------------------------------------------
+
+def test_show_window_entry_is_absent_without_a_callback():
+    """트레이만 도는 모드에는 열 창이 없다 - 메뉴 구성이 기존 그대로여야 한다."""
+    h = Harness()
+    assert tray.MENU_KEY_SHOW not in [e.key for e in h.controller.menu_entries()]
+
+
+def test_show_window_entry_appears_in_window_mode():
+    shows = []
+    h = Harness(pin="483920", on_show=lambda: shows.append(1))
+    keys = [e.key for e in h.controller.menu_entries()]
+    assert keys == [
+        MENU_KEY_STATUS,
+        MENU_KEY_ADDRESS,
+        MENU_KEY_PIN,
+        MENU_KEY_SEPARATOR,
+        tray.MENU_KEY_SHOW,
+        MENU_KEY_QUIT,
+    ]
+    entry = h.entry(tray.MENU_KEY_SHOW)
+    assert entry.text == "창 열기"
+    assert entry.enabled is True
+    entry.action()
+    assert shows == [1]
+
+
+def test_show_window_entry_is_the_default_menu_item():
+    """트레이 아이콘을 (더블)클릭하면 창이 열려야 한다 - 종료가 기본이면 큰일난다."""
+    h = Harness(on_show=lambda: None)
+    defaults = [e.key for e in h.controller.menu_entries() if e.default]
+    assert defaults == [tray.MENU_KEY_SHOW]
+
+
+def test_quit_is_never_the_default_item():
+    for harness in (Harness(), Harness(on_show=lambda: None)):
+        assert harness.entry(MENU_KEY_QUIT).default is False
+
+
+def test_show_window_handler_failure_does_not_break_the_tray(capsys):
+    def boom():
+        raise RuntimeError("gui queue is gone")
+
+    h = Harness(on_show=boom)
+    h.controller.show_window()  # 예외가 새면 pystray 스레드가 죽는다
+    out = capsys.readouterr().out
+    assert "[!] Tray show-window handler failed" in out
+    assert out.isascii()
+
+
+def test_show_window_without_a_callback_is_a_noop():
+    Harness().controller.show_window()
+
+
+def test_callable_pin_is_read_again_on_every_refresh():
+    """창 모드에서는 '시작'마다 PIN 이 바뀐다 - 툴팁/메뉴가 따라가야 한다."""
+    pins = {"value": "111111"}
+    h = Harness(pin=lambda: pins["value"])
+    icon = h.start()
+    assert icon.title.endswith("PIN: 111111")
+    assert h.entry(MENU_KEY_PIN).text == "PIN: 111111"
+
+    pins["value"] = "222222"
+    assert h.controller.refresh() is True
+    assert icon.title.endswith("PIN: 222222")
+    assert h.entry(MENU_KEY_PIN).text == "PIN: 222222"
+
+
+def test_callable_pin_keeps_the_menu_row_while_the_server_is_stopped():
+    """정지 중에는 PIN 이 없다. 항목은 남되 '사용 안 함' 으로 보인다.
+
+    (pystray 는 메뉴가 만들어진 뒤 항목을 추가하지 못하므로, 창 모드에서는
+    항목 자체를 항상 둔다.)
+    """
+    pins = {"value": None}
+    h = Harness(pin=lambda: pins["value"])
+    assert MENU_KEY_PIN in [e.key for e in h.controller.menu_entries()]
+    assert h.entry(MENU_KEY_PIN).text == "PIN: (사용 안 함)"
+    pins["value"] = "483920"
+    assert h.entry(MENU_KEY_PIN).text == "PIN: 483920"
+
+
+def test_a_failing_pin_provider_does_not_break_the_tray():
+    def boom():
+        raise RuntimeError("supervisor is gone")
+
+    h = Harness(pin=boom)
+    icon = h.start()
+    assert icon.title == "Phone Pad - 대기 중"
+    assert h.entry(MENU_KEY_PIN).text == "PIN: (사용 안 함)"
+
+
+def test_fixed_pin_behaviour_is_unchanged():
+    """기존 호출 방식(문자열/None)은 한 글자도 달라지지 않아야 한다."""
+    assert Harness(pin="483920").entry(MENU_KEY_PIN).text == "PIN: 483920"
+    assert MENU_KEY_PIN not in [e.key for e in Harness(pin=None).controller.menu_entries()]
+    assert MENU_KEY_PIN not in [e.key for e in Harness(pin="   ").controller.menu_entries()]

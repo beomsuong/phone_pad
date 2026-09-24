@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from tray_status import (
     QUIT_TEXT,
+    SHOW_WINDOW_TEXT,
     STATE_CONNECTED,
     TrayStatus,
     detect_lan_ip,
@@ -47,6 +48,7 @@ MENU_KEY_STATUS = "status"
 MENU_KEY_ADDRESS = "address"
 MENU_KEY_PIN = "pin"
 MENU_KEY_SEPARATOR = "separator"
+MENU_KEY_SHOW = "show"
 MENU_KEY_QUIT = "quit"
 
 
@@ -74,6 +76,9 @@ class MenuEntry:
     text: str
     enabled: bool = True
     action: Optional[Callable[[], None]] = field(default=None)
+    # 트레이 아이콘을 (더블)클릭했을 때 실행되는 기본 항목인지. pystray 는 메뉴
+    # 전체에서 하나만 허용한다.
+    default: bool = False
 
     @property
     def is_separator(self) -> bool:
@@ -104,9 +109,14 @@ def _default_icon_factory(name, image, title, menu):
 class TrayController:
     """트레이 아이콘의 수명 주기와 갱신을 담당한다.
 
-    스레드 모델: `run()` 은 메인 스레드에서 블로킹한다 (pystray 는 Windows 에서
-    메시지 루프를 소유해야 한다). 연결 수 폴링은 별도 데몬 스레드가 돈다.
-    `stop()` 은 아무 스레드에서나 호출해도 안전하다.
+    스레드 모델: `run()` 은 호출한 스레드에서 블로킹한다 (pystray 가 그 스레드에
+    메시지 루프를 만든다). 트레이만 도는 모드에서는 메인 스레드지만, 창 모드
+    (`server.run_with_gui`)에서는 tkinter 가 메인 스레드를 가져가므로
+    **백그라운드 스레드**에서 돈다 - Windows(`_win32`) 백엔드는 자기가 만든 창의
+    스레드에서 `GetMessage` 를 돌리므로 메인 스레드일 필요가 없다(macOS Cocoa
+    백엔드는 그렇지 않지만 이 프로젝트는 Windows 전용이다).
+    연결 수 폴링은 별도 데몬 스레드가 돈다. `stop()` 은 아무 스레드에서나
+    호출해도 안전하다.
     """
 
     def __init__(
@@ -119,13 +129,29 @@ class TrayController:
         image_factory: Callable[[str], object] = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL_S,
         name: str = "phone_pad",
-        pin: str = None,
+        pin=None,
+        on_show: Callable[[], None] = None,
     ):
         self._count_provider = count_provider
         self._on_quit = on_quit
+        # 창 모드에서만 주어진다 - 있으면 메뉴에 '창 열기' 항목이 생긴다.
+        # **다른 스레드에서 호출된다**(트레이는 백그라운드 스레드에서 돈다)는 것을
+        # 전제로, 호출자는 스레드 세이프한 콜백을 넘겨야 한다
+        # (`gui.GuiController.request_show` 가 그렇다).
+        self._on_show = on_show
         self._port = port
-        # 인증이 꺼져 있으면 None - 툴팁/메뉴가 기존과 완전히 같아진다.
-        self._pin = normalize_pin(pin)
+        # PIN 은 고정 문자열(기존 동작) 또는 **호출 가능 객체**(창 모드: '시작'을
+        # 다시 누를 때마다 PIN 이 바뀌므로 매번 다시 읽어야 한다)일 수 있다.
+        # 인증이 꺼져 있으면(고정 None) 툴팁/메뉴가 기존과 완전히 같아진다.
+        if callable(pin):
+            self._pin_provider = pin
+            # 항목의 존재 여부는 메뉴 생성 시점에 고정된다(pystray 는 나중에
+            # 항목을 추가하지 못한다). 매번 값을 읽는 쪽이므로 항상 둔다.
+            self._auth_enabled = True
+        else:
+            fixed = normalize_pin(pin)
+            self._pin_provider = lambda: fixed
+            self._auth_enabled = fixed is not None
         self._ip_lookup = ip_lookup if ip_lookup is not None else detect_lan_ip
         self._icon_factory = icon_factory if icon_factory is not None else _default_icon_factory
         self._image_factory = image_factory if image_factory is not None else create_icon_image
@@ -154,8 +180,15 @@ class TrayController:
     def status(self) -> Optional[TrayStatus]:
         return self._status
 
+    def _pin(self):
+        """현재 표시할 PIN. 창 모드에서는 '시작'마다 값이 바뀐다."""
+        try:
+            return normalize_pin(self._pin_provider())
+        except Exception:
+            return None
+
     def current_status(self) -> TrayStatus:
-        return tray_status(self._count_provider(), self._pin)
+        return tray_status(self._count_provider(), self._pin())
 
     def status_text(self) -> str:
         status = self._status if self._status is not None else self.current_status()
@@ -183,24 +216,46 @@ class TrayController:
 
     def pin_label(self) -> str:
         """PIN 라벨 (표시 전용). 인증이 꺼져 있으면 항목 자체가 없다."""
-        return format_pin_label(self._pin)
+        return format_pin_label(self._pin())
+
+    def _pin_menu_text(self, item=None) -> str:
+        """pystray 의 callable text 훅 (상태 라벨과 같은 이유 - 값이 변한다)."""
+        return self.pin_label()
+
+    def show_window(self) -> None:
+        """메뉴의 '창 열기'. 콜백이 없으면 항목 자체가 없어 도달하지 않는다.
+
+        **트레이 스레드에서 실행된다** - 콜백은 tkinter 위젯을 직접 건드리지 않고
+        메인 스레드로 넘겨야 한다 (`gui.GuiController.request_show`).
+        """
+        if self._on_show is None:
+            return
+        try:
+            self._on_show()
+        except Exception as e:
+            print(f"[!] Tray show-window handler failed: {e}")
 
     def menu_entries(self):
         """메뉴 구성 (위 -> 아래). pystray 없이도 만들어지고 검사할 수 있다.
 
         PIN 항목은 **인증이 켜져 있을 때만** 들어간다 - 꺼져 있으면 메뉴 구성이
-        기존(상태/주소/구분선/종료)과 완전히 같다.
+        기존(상태/주소/구분선/종료)과 완전히 같다. '창 열기' 도 같은 원칙으로
+        `on_show` 를 받았을 때(= 창 모드)만 들어간다.
         """
         entries = [
             MenuEntry(MENU_KEY_STATUS, self.status_text(), enabled=False),
             MenuEntry(MENU_KEY_ADDRESS, self.address_label(), enabled=False),
         ]
-        if self._pin is not None:
+        if self._auth_enabled:
             entries.append(MenuEntry(MENU_KEY_PIN, self.pin_label(), enabled=False))
-        entries.extend([
-            MenuEntry(MENU_KEY_SEPARATOR, "", enabled=False),
-            MenuEntry(MENU_KEY_QUIT, QUIT_TEXT, enabled=True, action=self.quit),
-        ])
+        entries.append(MenuEntry(MENU_KEY_SEPARATOR, "", enabled=False))
+        if self._on_show is not None:
+            # default=True: 트레이 아이콘을 (더블)클릭하면 창이 열린다.
+            entries.append(
+                MenuEntry(MENU_KEY_SHOW, SHOW_WINDOW_TEXT, enabled=True,
+                          action=self.show_window, default=True)
+            )
+        entries.append(MenuEntry(MENU_KEY_QUIT, QUIT_TEXT, enabled=True, action=self.quit))
         return entries
 
     @staticmethod
@@ -231,16 +286,24 @@ class TrayController:
             if entry.is_separator:
                 items.append(pystray.Menu.SEPARATOR)
             elif entry.action is None:
-                # 상태/주소 라벨은 비활성. 상태 라벨만 매번 다시 계산한다
-                # (pystray 는 callable text 를 `text(item)` 으로 호출한다).
+                # 상태/주소 라벨은 비활성. 값이 변하는 라벨(상태, 창 모드의 PIN)만
+                # 매번 다시 계산한다 (pystray 는 callable text 를 `text(item)` 으로
+                # 호출한다).
                 if entry.key == MENU_KEY_STATUS:
                     text = self._status_menu_text
+                elif entry.key == MENU_KEY_PIN:
+                    text = self._pin_menu_text
                 else:
                     text = entry.text
                 items.append(pystray.MenuItem(text, None, enabled=False))
             else:
                 items.append(
-                    pystray.MenuItem(entry.text, self._wrap_action(entry.action), enabled=True)
+                    pystray.MenuItem(
+                        entry.text,
+                        self._wrap_action(entry.action),
+                        enabled=True,
+                        default=entry.default,
+                    )
                 )
         return pystray.Menu(*items)
 

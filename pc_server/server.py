@@ -7,6 +7,7 @@ import threading
 import uuid
 
 import discovery
+import gui
 import logging_setup
 import pin_auth
 import single_client
@@ -579,6 +580,223 @@ def run_with_tray(controller: InputController, registry: SessionRegistry,
     return 1 if failures else 0
 
 
+def disconnect_active_client(runtime) -> bool:
+    """정지하는 런타임에 붙어 있던 클라이언트를 끊는다. 끊었으면 True.
+
+    **'정지' 버튼에 의미를 주기 위해 필요하다.** `ServerRuntime.stop()` 은 리슨
+    소켓과 UDP 소켓만 닫는다 - 이미 맺어진 TCP 연결의 처리 스레드는 그대로 살아
+    있고, 폰이 5초마다 보내는 heartbeat 가 미응답 카운터를 계속 리셋하므로
+    **영원히 끊기지 않는다**. 그 상태에서 CLICK/SCROLL/DRAG 는 계속 실행된다
+    (MOVE 만 UDP 소켓이 닫혀 멈춘다). 프로세스가 곧 끝나던 기존 모드에서는 드러날
+    수 없었던 구멍이다.
+
+    끊는 방식은 clean EOF 다 - `SESSION_REPLACED` 를 보내지 않으므로 앱은 평소의
+    연결 유실로 보고 자동 재연결을 시도한다('시작'을 다시 누르면 붙는다).
+
+    가드가 없는 런타임(기본값, 단위 테스트)에서는 아무것도 하지 않는다.
+    """
+    guard = getattr(runtime, "single_client_guard", None)
+    if guard is None:
+        return False
+    try:
+        current = guard.current()
+    except Exception as e:  # noqa: BLE001 - 정리 경로가 예외로 멈추면 안 된다
+        print(f"[!] Failed to read the active client: {e}")
+        return False
+    if not current:
+        return False
+    conn, addr = current[0], current[1]
+    print(f"[=] Server stopping - closing client {addr}")
+    try:
+        single_client.disconnect(conn, addr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] Failed to close the active client: {e}")
+        return False
+    return True
+
+
+class ServerSupervisor:
+    """`ServerRuntime` 을 만들고 스레드에서 돌리고 멈춘다 (시작/정지 토글용).
+
+    `ServerRuntime` 은 **재사용할 수 없다** - `close()` 한 소켓은 다시 열 수 없다.
+    그래서 인스턴스가 아니라 `runtime_factory`(인자 없이 부르면 새 인스턴스)를
+    받아, '시작'을 누를 때마다 새로 만든다. PIN 이 '시작' 단위로 새로 생기는 것도
+    같은 이유다(팩토리가 매번 `resolve_expected_pin()` 을 다시 부른다).
+
+    `start()` 는 **호출한 스레드에서 `bind()` 까지 끝낸다** - 포트 점유 같은
+    실패를 바로 그 자리에서 `OSError` 로 돌려줘야 GUI 가 창에 표시할 수 있기
+    때문이다. accept 루프(`serve()`)만 백그라운드 스레드로 내려간다.
+    """
+
+    def __init__(self, runtime_factory, join_timeout: float = SHUTDOWN_JOIN_TIMEOUT_S):
+        self._runtime_factory = runtime_factory
+        self._join_timeout = join_timeout
+        self._lock = threading.Lock()
+        self._runtime = None
+        self._thread = None
+        # 서버 스레드가 예외로 죽은 이력 (창이 '예기치 않게 멈췄습니다' 를 띄운다)
+        self.failures = []
+
+    @property
+    def running(self) -> bool:
+        return self._runtime is not None
+
+    @property
+    def runtime(self):
+        return self._runtime
+
+    def current_pin(self):
+        """지금 돌고 있는 서버의 PIN. 멈춰 있으면 None."""
+        return getattr(self._runtime, "expected_pin", None)
+
+    def start(self) -> bool:
+        """새 런타임을 만들어 바인드하고 accept 루프를 띄운다.
+
+        이미 돌고 있으면 False. 바인드 실패는 `OSError` 로 그대로 올라간다.
+        """
+        with self._lock:
+            if self._runtime is not None:
+                return False
+            runtime = self._runtime_factory()
+            runtime.bind()  # 실패(포트 점유 등)는 호출자에게 즉시 보인다
+            thread = threading.Thread(
+                target=self._serve, args=(runtime,), name="phone-pad-server", daemon=True
+            )
+            self._runtime = runtime
+            self._thread = thread
+        thread.start()
+        return True
+
+    def _serve(self, runtime):
+        try:
+            runtime.serve()
+        except BaseException as e:  # noqa: BLE001 - 어떤 실패든 창이 알아야 한다
+            self.failures.append(e)
+            print(f"[!] Server stopped unexpectedly: {e!r}")
+        finally:
+            runtime.stop()
+            # `stop()` 이 이미 다른 런타임으로 교체했을 수 있다 - identity 비교로
+            # 뒤늦은 정리가 새 런타임을 지우지 않게 한다.
+            with self._lock:
+                if self._runtime is runtime:
+                    self._runtime = None
+                    self._thread = None
+
+    def stop(self) -> bool:
+        """돌고 있으면 멈추고 스레드를 회수한다. 멈춰 있었으면 False.
+
+        **join 은 락 밖에서 한다** - 서버 스레드의 정리 코드가 같은 락을 잡으므로
+        락을 쥔 채 기다리면 교착한다.
+        """
+        with self._lock:
+            runtime, thread = self._runtime, self._thread
+            self._runtime = None
+            self._thread = None
+        if runtime is None:
+            return False
+        runtime.stop()
+        disconnect_active_client(runtime)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self._join_timeout)
+            if thread.is_alive():
+                print("[!] Server thread did not stop in time - continuing shutdown")
+        runtime.close()
+        return True
+
+
+def run_with_gui(controller: InputController, registry: SessionRegistry,
+                 runtime_factory, tray_factory=None, gui_factory=None,
+                 join_timeout: float = SHUTDOWN_JOIN_TIMEOUT_S,
+                 port: int = TCP_PORT, autostart: bool = True) -> int:
+    """창(tkinter)을 메인 스레드에, 트레이(pystray)와 서버를 백그라운드에 둔다.
+
+    `run_with_tray` 와 스레드 모델이 또 한 번 뒤집힌다: tkinter 의 `mainloop()` 는
+    반드시 메인 스레드에서 돌아야 하고, Windows 의 pystray 는 (macOS 와 달리)
+    아무 스레드에서나 메시지 루프를 돌릴 수 있기 때문이다.
+
+    종료 절차는 `run_with_tray.on_quit` 과 같다(정지 -> join -> drag 해제 ->
+    아이콘 제거). 창의 '종료' 버튼과 트레이의 '종료' 메뉴가 **같은 `shutdown()`**
+    을 부르고, 한 번만 실행된다.
+
+    반환값: 창을 정상적으로 닫았으면 0. `run_with_tray` 와 달리 서버 기동 실패가
+    프로세스를 끝내지 않는다 - 창에 오류를 띄우고 사용자가 '시작'을 다시 누를 수
+    있는 것이 창 모드의 계약이다.
+    """
+    supervisor = ServerSupervisor(runtime_factory, join_timeout=join_timeout)
+    make_gui = gui_factory if gui_factory is not None else gui.GuiController
+    make_tray = tray_factory
+    if make_tray is None and tray.tray_available():
+        make_tray = tray.TrayController
+
+    shutdown_done = threading.Event()
+    # 트레이 스레드가 실제로 돌고 있는지. X 버튼이 '숨기기'여도 되는지의 판단
+    # 근거다 - 트레이가 뜨지 못했는데 창을 숨기면 사용자는 앱을 잃어버린다.
+    tray_live = threading.Event()
+    tray_controller = None
+
+    def shutdown(reason: str):
+        if shutdown_done.is_set():
+            return
+        shutdown_done.set()
+        supervisor.stop()
+        release_drag(controller, reason)
+        if tray_controller is not None:
+            tray_controller.stop()
+
+    gui_controller = make_gui(
+        on_start=supervisor.start,
+        on_stop=supervisor.stop,
+        on_exit=lambda: shutdown("gui quit"),
+        is_running=lambda: supervisor.running,
+        count_provider=lambda: len(registry.snapshot()),
+        pin_provider=supervisor.current_pin,
+        port=port,
+        tray_visible=tray_live.is_set,
+    )
+
+    tray_thread = None
+    if make_tray is not None:
+        def tray_quit():
+            shutdown("tray quit")
+            # 창도 함께 닫아야 mainloop 가 끝나고 프로세스가 종료된다.
+            gui_controller.request_destroy()
+
+        tray_controller = make_tray(
+            count_provider=lambda: len(registry.snapshot()),
+            on_quit=tray_quit,
+            port=port,
+            # 창 모드에서는 '시작'마다 PIN 이 바뀌므로 값이 아니라 조회 함수를 준다.
+            pin=supervisor.current_pin,
+            # 트레이 스레드에서 호출된다 - 큐를 거쳐 메인 스레드로 넘어간다.
+            on_show=gui_controller.request_show,
+        )
+
+        def tray_main():
+            tray_live.set()
+            try:
+                tray_controller.run()
+            except BaseException as e:  # noqa: BLE001 - 트레이가 죽어도 창은 살아야 한다
+                print(f"[!] Tray icon stopped unexpectedly: {e!r}")
+            finally:
+                tray_live.clear()
+
+        tray_thread = threading.Thread(target=tray_main, name="phone-pad-tray", daemon=True)
+        tray_thread.start()
+
+    if autostart:
+        # 위젯이 생긴 뒤에 시작해야 실패 메시지를 창에 띄울 수 있다. 큐에 넣어
+        # 두면 mainloop 진입 직후 첫 tick 에서 메인 스레드가 실행한다.
+        gui_controller.request(gui_controller.start_server)
+
+    try:
+        gui_controller.run()
+    finally:
+        shutdown("gui shutdown")
+        if tray_thread is not None:
+            tray_thread.join(timeout=join_timeout)
+    return 0
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Phone Pad PC server")
     parser.add_argument(
@@ -657,39 +875,66 @@ def main(argv=None) -> int:
     controller = InputController()
     registry = SessionRegistry()
 
-    # 사용자가 폰에 입력해야 하는 값이라 **이 한 줄만** 의도적으로 PIN 을 노출한다.
-    # 그 밖의 어떤 로그에도 PIN 값을 남기지 않는다 (pin_auth.py 참조).
-    expected_pin = resolve_expected_pin(args)
-    if expected_pin is None:
-        print("[Server] PIN authentication disabled (--no-auth)")
-    else:
-        print(f"[Server] PIN for this session: {expected_pin}")
+    # `--pin ""` 같은 잘못된 인자는 창을 띄우기 전에 즉시 거절한다(SystemExit).
+    # 이 값은 첫 런타임이 그대로 쓴다 - 여기서 만들어 두고 버리면 콘솔에 찍힌
+    # PIN 과 실제 서버의 PIN 이 달라진다.
+    first_pin = [resolve_expected_pin(args)]
+
+    def make_runtime() -> ServerRuntime:
+        """런타임 하나를 만든다. 창 모드에서는 '시작'을 누를 때마다 다시 불린다.
+
+        PIN 은 **런타임 단위**로 새로 생긴다 - 창에서 정지/시작을 하면 새 PIN 이
+        나오고, 콘솔/트레이 모드에서는 이 함수가 딱 한 번 불리므로 기존과 똑같이
+        프로세스마다 하나다.
+        """
+        expected_pin = first_pin.pop() if first_pin else resolve_expected_pin(args)
+        # 사용자가 폰에 입력해야 하는 값이라 **이 한 줄만** 의도적으로 PIN 을
+        # 노출한다. 그 밖의 어떤 로그에도 PIN 값을 남기지 않는다 (pin_auth.py).
+        if expected_pin is None:
+            print("[Server] PIN authentication disabled (--no-auth)")
+        else:
+            print(f"[Server] PIN for this session: {expected_pin}")
+        return ServerRuntime(
+            controller,
+            registry,
+            discovery_port=None if args.no_discovery else discovery.DISCOVERY_PORT,
+            expected_pin=expected_pin,
+            # 단일 클라이언트 정책은 제품 정책이라 끄는 옵션이 없다 - 실제 서버는
+            # 항상 가드를 쓴다 (single_client.py 참조).
+            single_client_guard=single_client.SingleClientGuard(),
+        )
 
     # 안전장치: 정상 종료 경로를 안 거치고 인터프리터가 끝나도 버튼을 놓는다.
     # `force_release_drag` 가 멱등이라 정상 경로와 중복 호출돼도 문제 없다.
     atexit.register(release_drag, controller, "atexit")
 
-    use_tray = not args.no_tray
-    if use_tray and not tray.tray_available():
+    # 그래픽 UI 폴백 사슬: 창(+트레이) -> 트레이만 -> 콘솔.
+    # `--no-tray` 는 "그래픽 UI 전부 끄고 콘솔" 로 뜻이 넓어졌다 (새 플래그 없음).
+    use_graphics = not args.no_tray
+    if use_graphics and gui.gui_available():
+        if not tray.tray_available():
+            print(
+                "[!] pystray/Pillow not available - no tray icon; closing the window "
+                f"will quit the server ({tray.unavailable_reason()}). "
+                "Install with: pip install -r requirements.txt"
+            )
+        return run_with_gui(controller, registry, make_runtime, port=TCP_PORT)
+
+    if use_graphics:
+        print(
+            "[!] tkinter not available - running without the server window "
+            f"({gui.unavailable_reason()})"
+        )
+    if use_graphics and not tray.tray_available():
         print(
             "[!] pystray/Pillow not available - running in console mode "
             f"({tray.unavailable_reason()}). Install with: pip install -r requirements.txt"
         )
-        use_tray = False
+        use_graphics = False
 
-    runtime = ServerRuntime(
-        controller,
-        registry,
-        discovery_port=None if args.no_discovery else discovery.DISCOVERY_PORT,
-        expected_pin=expected_pin,
-        # 단일 클라이언트 정책은 제품 정책이라 끄는 옵션이 없다 - 실제 서버는
-        # 항상 가드를 쓴다 (single_client.py 참조).
-        single_client_guard=single_client.SingleClientGuard(),
-    )
-
-    if use_tray:
-        return run_with_tray(controller, registry, runtime)
-    return run_console(controller, registry, runtime)
+    if use_graphics:
+        return run_with_tray(controller, registry, make_runtime())
+    return run_console(controller, registry, make_runtime())
 
 
 if __name__ == "__main__":

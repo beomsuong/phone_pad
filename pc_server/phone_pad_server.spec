@@ -37,9 +37,11 @@ a = Analysis(  # noqa: F821
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Pillow drags tkinter in through PIL.ImageTk / _tkinter_finder; the server
-        # never shows a GUI of its own, and tkinter is worth ~5MB in the exe.
-        "tkinter",
+        # NOTE: tkinter used to be excluded here ("the server never shows a GUI of
+        # its own", worth ~5MB). It is REQUIRED now - the server window (gui.py) is
+        # the default mode, and without tkinter the exe silently falls back to the
+        # tray-only mode. Keep the Pillow/Tk bridge out, though: tray.py builds its
+        # icon with PIL.Image/ImageDraw and never needs ImageTk.
         "PIL.ImageTk",
         "PIL.ImageQt",
         "PIL.ImageShow",

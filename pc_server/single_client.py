@@ -106,6 +106,27 @@ def _drain(conn) -> int:
     return total
 
 
+def disconnect(conn, addr):
+    """활성 연결을 clean EOF 로 끊는다 (알림 줄 없음). **락 밖에서** 호출.
+
+    `evict()` 와 다른 점은 `SESSION_REPLACED` 를 보내지 않는다는 것뿐이다. 창
+    모드의 '정지' 버튼처럼 **서버가 멈추는** 경우에 쓴다 - 끊긴 이유가 '다른
+    기기에 밀렸다' 가 아니므로, 앱은 평소의 연결 유실 처리(자동 재연결 시도)를
+    해야 한다. `SESSION_REPLACED` 를 보내면 앱이 재연결을 포기한다.
+
+    드레인 -> shutdown -> close 순서와 그 이유는 `evict()` 주석 참조.
+    """
+    _drain(conn)
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except Exception:  # noqa: BLE001 - 이미 끊긴 소켓이면 정상적으로 실패한다
+        pass
+    try:
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[!] Failed to close client {addr}: {e}")
+
+
 def evict(conn, addr):
     """밀려난 연결에 `SESSION_REPLACED` 를 보내고 강제로 닫는다. **락 밖에서** 호출.
 
@@ -131,12 +152,4 @@ def evict(conn, addr):
         conn.sendall(SESSION_REPLACED_LINE)
     except Exception as e:  # noqa: BLE001 - best-effort 알림
         print(f"[!] Failed to notify evicted client {addr}: {e}")
-    _drain(conn)
-    try:
-        conn.shutdown(socket.SHUT_RDWR)
-    except Exception:  # noqa: BLE001 - 이미 끊긴 소켓이면 정상적으로 실패한다
-        pass
-    try:
-        conn.close()
-    except Exception as e:  # noqa: BLE001
-        print(f"[!] Failed to close evicted client {addr}: {e}")
+    disconnect(conn, addr)

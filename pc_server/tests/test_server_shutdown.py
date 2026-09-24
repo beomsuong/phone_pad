@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+import gui
 import server
 import tray
 from fake_conn import AUTH_LINE
@@ -474,8 +475,15 @@ def test_no_tray_flag_runs_console_mode():
 
 
 def test_tray_mode_is_used_when_dependencies_are_available():
+    """pystray 가 있으면 트레이 모드.
+
+    창(tkinter)이 기본 모드가 된 뒤로는 **창을 쓸 수 없을 때**의 폴백이다 -
+    그래서 tkinter 를 못 쓰는 상황을 함께 흉내 낸다. 창 모드 자체의 검증은
+    `test_server_gui.py` 에 있다.
+    """
     with patch("server.run_console") as console, \
             patch("server.run_with_tray", return_value=0) as with_tray, \
+            patch.object(gui, "GUI_IMPORT_ERROR", ImportError("no tkinter")), \
             patch.object(tray, "TRAY_IMPORT_ERROR", None), \
             patch("server.atexit.register"):
         assert server.main([]) == 0
@@ -487,6 +495,7 @@ def test_missing_pystray_falls_back_to_console_with_one_warning(capsys):
     fake_error = ImportError("No module named 'pystray'")
     with patch("server.run_console", return_value=0) as console, \
             patch("server.run_with_tray") as with_tray, \
+            patch.object(gui, "GUI_IMPORT_ERROR", ImportError("no tkinter")), \
             patch.object(tray, "TRAY_IMPORT_ERROR", fake_error), \
             patch("server.atexit.register"):
         assert server.main([]) == 0
