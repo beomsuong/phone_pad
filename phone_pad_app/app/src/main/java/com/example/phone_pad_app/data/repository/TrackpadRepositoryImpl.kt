@@ -123,20 +123,32 @@ class TrackpadRepositoryImpl @Inject constructor(
     private var lastConnectedPort: Int = GestureConfig.DEFAULT_PORT
 
     /**
+     * 마지막으로 연결에 성공한 PIN. 자동 재연결은 이 값으로 AUTH를 다시 보낸다.
+     *
+     * 재연결도 처음부터 `connect()`를 다시 타므로(세션을 물려받는 구조가 아니다) PIN이 다시
+     * 필요하다. 사용자에게 다시 묻지 않는 이유는 성공했던 값이기 때문이고, 서버가 재시작되며
+     * PIN이 바뀐 경우에는 이 값이 거부되어 재시도가 소진된 뒤 `Error`로 간다(확정 스펙).
+     *
+     * 메모리에만 두고 절대 영속화하지 않는다 — PIN은 서버 실행마다 새로 생성된다.
+     */
+    @Volatile
+    private var lastConnectedPin: String = ""
+
+    /**
      * 사용자가 직접 요청한 연결. **항상 진행 중인 자동 재연결을 이긴다.**
      *
      * 재연결 취소를 뮤텍스 **밖에서** 먼저 하는 것이 중요하다 — 재연결 루프가 접속 시도 중
      * 뮤텍스를 쥐고 있을 수 있어서, 락을 잡은 뒤에 취소하려 하면 그 시도가 끝날 때까지
      * 기다리게 되고(= 이중 접속) 취소 의미도 사라진다.
      */
-    override suspend fun connect(host: String, port: Int) {
+    override suspend fun connect(host: String, port: Int, pin: String) {
         cancelReconnect()
         val epoch = connectEpoch.incrementAndGet()
         connectionMutex.withLock {
             // 락을 기다리는 동안 사용자가 취소했거나 다른 연결이 끼어들었을 수 있다.
             if (connectEpoch.get() != epoch) return
             _connectionState.value = ConnectionState.Connecting
-            when (val outcome = openConnection(host, port) { connectEpoch.get() == epoch }) {
+            when (val outcome = openConnection(host, port, pin) { connectEpoch.get() == epoch }) {
                 // 취소된 시도의 뒤늦은 결과는 아무 상태도 쓰지 않는다 —
                 // cancelConnect()가 이미 Disconnected로 돌려놨다.
                 ConnectOutcome.Cancelled, ConnectOutcome.Success -> Unit
@@ -186,6 +198,7 @@ class TrackpadRepositoryImpl @Inject constructor(
     private suspend fun openConnection(
         host: String,
         port: Int,
+        pin: String,
         isStillWanted: () -> Boolean,
     ): ConnectOutcome {
         // 이전 세션/UDP 타깃/heartbeat 루프가 새 핸드셰이크 완료 전까지 남아있지 않도록 즉시 무효화한다.
@@ -193,7 +206,7 @@ class TrackpadRepositoryImpl @Inject constructor(
         sessionToken = null
         runCatching { udpClient.close() }
         return try {
-            val session = tcpClient.connect(host, port)
+            val session = tcpClient.connect(host, port, pin)
             if (!isStillWanted()) {
                 // 취소와 성공이 겹친 경우. 붙어버린 소켓을 반드시 닫는다 —
                 // 안 닫으면 서버에 유령 세션이 남고 앱은 그 사실을 영영 모른다.
@@ -207,6 +220,7 @@ class TrackpadRepositoryImpl @Inject constructor(
                 udpClient.connect(host, GestureConfig.UDP_PORT)
                 lastConnectedHost = host
                 lastConnectedPort = port
+                lastConnectedPin = pin
                 _connectionState.value = ConnectionState.Connected(host)
                 startKeepAlive(currentGeneration)
                 ConnectOutcome.Success
@@ -352,8 +366,12 @@ class TrackpadRepositoryImpl @Inject constructor(
      * 첫 [ConnectionState.Reconnecting]은 **이 함수 안에서 동기적으로** 쓴다 —
      * 코루틴이 스케줄될 때까지 기다리면 그 사이 UI가 이전 상태(Connected)를 붙들고 있거나
      * 다른 경로가 `Error`를 밀어넣을 여지가 생긴다.
+     *
+     * **[ConnectionErrorKind.AUTH_FAILED]는 예외적으로 즉시 중단한다** — 나머지 실패
+     * (heartbeat 타임아웃·연결 유실·거부 등)는 기다리면 복구될 수 있지만 PIN 불일치는
+     * 그렇지 않고, 계속 두드리면 서버의 브루트포스 잠금까지 유발한다(아래 분기의 주석 참조).
      */
-    private fun startReconnect(host: String, port: Int, initialMessage: String) {
+    private fun startReconnect(host: String, port: Int, pin: String, initialMessage: String) {
         val policy = reconnectPolicy
         val epoch = reconnectEpoch.incrementAndGet()
         runCatching { reconnectJob?.cancel() }
@@ -374,7 +392,7 @@ class TrackpadRepositoryImpl @Inject constructor(
                 val outcome = connectionMutex.withLock {
                     // 락을 기다리는 동안 수동 연결이 끼어들었을 수 있다.
                     if (reconnectEpoch.get() != epoch) return@launch
-                    openConnection(host, port) { reconnectEpoch.get() == epoch }
+                    openConnection(host, port, pin) { reconnectEpoch.get() == epoch }
                 }
                 when (outcome) {
                     // 성공: openConnection이 이미 Connected로 바꾸고 keep-alive를 켰다.
@@ -384,6 +402,24 @@ class TrackpadRepositoryImpl @Inject constructor(
                     ConnectOutcome.Cancelled -> return@launch
                     is ConnectOutcome.Failure -> {
                         lastMessage = outcome.message
+                        // PIN 불일치는 **기다려서 해결되는 실패가 아니다.** 남은 백오프를
+                        // 쓰는 것이 무의미할 뿐 아니라 해롭다: 서버는 발신 IP별 AUTH 실패를
+                        // 세어 60초 안에 5회면 그 IP를 잠그는데, 우리 재시도 묶음은 55초에
+                        // 8회를 두드리므로 스스로 잠금을 유발한다. 그러면 사용자가 곧바로
+                        // **올바른** PIN으로 수동 연결해도 서버가 조용히 닫아버려(잠금을
+                        // 알리지 않는 것이 스펙) 앱은 그것을 "서버가 아닌가?"로 오보고한다.
+                        // 그래서 "첫 연결 실패는 재시도하지 않는다"와 같은 범주로 다룬다 —
+                        // 즉시 중단하고 사용자에게 PIN을 다시 물어본다.
+                        if (outcome.kind == ConnectionErrorKind.AUTH_FAILED) {
+                            if (reconnectEpoch.get() != epoch) return@launch
+                            // 종류를 AUTH_FAILED로 그대로 남긴다(RECONNECT_FAILED로 덮지 않는다)
+                            // — 사용자가 취할 조치가 "PIN 다시 입력"으로 특정되기 때문이다.
+                            _connectionState.value = ConnectionState.Error(
+                                outcome.message,
+                                ConnectionErrorKind.AUTH_FAILED,
+                            )
+                            return@launch
+                        }
                         attempt += 1
                     }
                 }
@@ -504,7 +540,7 @@ class TrackpadRepositoryImpl @Inject constructor(
 
         val host = lastConnectedHost
         if (reconnectPolicy.isActive && host != null) {
-            startReconnect(host, lastConnectedPort, message)
+            startReconnect(host, lastConnectedPort, lastConnectedPin, message)
         } else {
             _connectionState.value = ConnectionState.Error(message, kind)
         }

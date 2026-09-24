@@ -29,6 +29,16 @@ class TrackpadViewModel @Inject constructor(
     private val _hostInput = MutableStateFlow("")
 
     /**
+     * 사용자가 입력한 PIN. [_hostInput]과 **완전히 대칭**으로 다룬다 — 메모리에만 두고
+     * DataStore에 저장하지 않는다.
+     *
+     * 영속화하지 않는 이유가 감도 설정과 다르다: 서버는 실행마다 새 PIN을 생성하므로 저장된
+     * 값은 다음 실행에서 거의 항상 틀린 값이 되고, 그러면 "앱이 기억한 PIN으로 자동 실패"하는
+     * 더 나쁜 경험이 된다(게다가 저장할 이유가 없는 비밀을 디스크에 남긴다).
+     */
+    private val _pinInput = MutableStateFlow("")
+
+    /**
      * 연결에 쓸 TCP 포트. 탐색으로 서버를 고르면 그 서버의 포트로 바뀌고,
      * 사용자가 호스트를 직접 고치면 기본값으로 돌아간다([onHostInputChange]).
      */
@@ -46,12 +56,14 @@ class TrackpadViewModel @Inject constructor(
     val uiState = combine(
         repository.connectionState,
         _hostInput,
+        _pinInput,
         _port,
         _discovery,
-    ) { connectionState, host, port, discovery ->
+    ) { connectionState, host, pin, port, discovery ->
         TrackpadUiState(
             connectionState = connectionState,
             hostInput = host,
+            pinInput = pin,
             port = port,
             discovery = discovery,
         )
@@ -71,6 +83,18 @@ class TrackpadViewModel @Inject constructor(
     fun onHostInputChange(value: String) {
         _hostInput.value = value
         _port.value = GestureConfig.DEFAULT_PORT
+    }
+
+    /**
+     * PIN 입력란 반영. [onHostInputChange]와 달리 포트 등 다른 상태를 건드리지 않는다 —
+     * PIN은 "선택한 그 서버"에 딸린 값이 아니라 사용자가 PC 화면을 보고 매번 입력하는 값이다.
+     *
+     * 값 검증은 하지 않는다(길이·숫자 여부 모두). 최종 판정자는 서버이고, 앱이 앞질러 막으면
+     * 서버가 PIN 형식을 바꿀 때 앱이 먼저 고장 난다. 와이어 크기 방어만 전송 직전에 한다
+     * ([GestureConfig.AUTH_PIN_MAX_LENGTH]).
+     */
+    fun onPinInputChange(value: String) {
+        _pinInput.value = value
     }
 
     /**
@@ -107,6 +131,9 @@ class TrackpadViewModel @Inject constructor(
      *
      * 탐색 응답은 같은 LAN의 누구나 위조할 수 있으므로, 고른 결과로 곧바로 접속해 버리면
      * 사용자가 "어디에 붙는지" 확인할 기회가 사라진다. 연결은 늘 사용자가 버튼으로 시작한다.
+     *
+     * **PIN은 채우지 않는다** — 탐색은 인증 이전의 공개 채널이라 응답에 PIN이 없다(있어서도
+     * 안 된다). 사용자가 PC 화면을 보고 직접 입력해야 한다.
      */
     fun selectServer(server: DiscoveredServer) {
         _hostInput.value = server.host
@@ -122,15 +149,26 @@ class TrackpadViewModel @Inject constructor(
         }
     }
 
+    /**
+     * 연결 시작. **host와 PIN 둘 다 있어야** 진행한다.
+     *
+     * PIN 빈 값을 막는 것은 형식 검증이 아니라 "빈 PIN으로 서버에 문을 두드리지 않기" 위한
+     * 것이다 — 인증이 켜진 서버는 이를 실패 1회로 세고(브루트포스 카운터), 5회면 그 IP를
+     * 잠근다. 입력을 깜빡한 사용자가 연결 버튼을 몇 번 누른 것만으로 잠기면 안 된다.
+     */
     fun connect() {
         val host = _hostInput.value.trim()
         if (host.isBlank()) return
+        // 공백 제거는 host와 같은 규약이다(숫자 키패드에서도 붙여넣기로 공백이 섞일 수 있다).
+        // 그 외의 값 검증은 하지 않는다 — 판정은 서버가 한다.
+        val pin = _pinInput.value.trim()
+        if (pin.isBlank()) return
         // 연결 화면을 떠나는 순간 탐색 결과는 쓸모가 없다 — 소켓과 1.5초 창을 여기서 끊는다.
         stopDiscovery()
         // uiState가 아니라 _port를 직접 읽는다 — uiState는 WhileSubscribed(5초) 공유 플로우라
         // 구독자가 없는 순간에는 초기값을 들고 있어, 방금 고른 서버의 포트를 놓칠 수 있다.
         viewModelScope.launch {
-            repository.connect(host, _port.value)
+            repository.connect(host, _port.value, pin)
         }
     }
 

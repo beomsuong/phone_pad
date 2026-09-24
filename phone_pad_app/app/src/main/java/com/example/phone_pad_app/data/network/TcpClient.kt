@@ -1,5 +1,6 @@
 package com.example.phone_pad_app.data.network
 
+import com.example.phone_pad_app.domain.model.AuthFailedException
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -13,7 +14,9 @@ import javax.inject.Singleton
 
 /**
  * TCP 채널 (기본 9000).
- * - 연결 직후 서버가 보내는 세션 핸드셰이크 한 줄을 읽어 세션 토큰을 확보한다.
+ * - 연결 직후 **먼저 AUTH 한 줄을 보내고**([AuthHandshake]), 서버가 그 응답으로 주는 세션
+ *   핸드셰이크 한 줄을 읽어 세션 토큰을 확보한다. PIN이 틀리면 서버는 `AUTH_FAIL` 한 줄을
+ *   보내고 연결을 닫는다.
  * - MOVE 이외의 이벤트(CLICK/SCROLL/DRAG/HEARTBEAT)를 newline-delimited JSON으로 전송한다.
  */
 @Singleton
@@ -50,7 +53,11 @@ class TcpClient @Inject constructor() {
     internal var socketFactory: () -> Socket = { Socket() }
 
     /**
-     * 서버에 연결하고 세션 핸드셰이크 한 줄을 읽는다.
+     * 서버에 연결하고, **AUTH 한 줄을 먼저 보낸 뒤** 세션 핸드셰이크 한 줄을 읽는다.
+     *
+     * 순서가 계약이다 (확정 스펙): 서버는 클라이언트의 AUTH 줄을 받기 전에는 아무것도 보내지
+     * 않으므로, AUTH를 보내기 전에 읽으려 하면 반드시 핸드셰이크 타임아웃으로 실패한다.
+     * 그래서 소켓이 붙은 직후 다른 어떤 읽기/쓰기보다 먼저 AUTH를 내보낸다.
      *
      * 연결은 [connectTimeoutMs] 안에 끝나야 한다 — 넘으면 [java.net.SocketTimeoutException].
      * 주소를 해석할 수 없으면 [java.net.UnknownHostException].
@@ -60,20 +67,33 @@ class TcpClient @Inject constructor() {
      * 진행 중인 시도를 깨울 수 있게 한다(첫 연결 "취소" 버튼이 이 경로를 쓴다).
      * 그때 이 함수는 `SocketException`으로 빠져나온다.
      *
+     * @param pin 사용자가 입력한 PIN. 서버 인증이 꺼져 있어도 **항상** 보낸다(와이어 형식이
+     *   서버 설정에 따라 갈라지지 않게 하기 위해 — [AuthHandshake] 참조).
      * @return 서버가 발급한 세션 토큰. 핸드셰이크가 오지 않거나 형식이 어긋나면 null.
+     * @throws AuthFailedException 서버가 PIN 불일치로 `AUTH_FAIL`을 보낸 경우. null 반환
+     *   (= 일반 핸드셰이크 실패)과 구분해야 사용자에게 "PIN을 확인하세요"라고 말할 수 있다.
      */
-    suspend fun connect(host: String, port: Int): String? = withContext(Dispatchers.IO) {
+    suspend fun connect(host: String, port: Int, pin: String): String? = withContext(Dispatchers.IO) {
         disconnect()
         val s = socketFactory()
         socket = s
         try {
             s.connect(InetSocketAddress(host, port), connectTimeoutMs)
-            writer = PrintWriter(s.getOutputStream(), true)
+            val w = PrintWriter(s.getOutputStream(), true)
+            writer = w
             val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
             reader = r
 
+            // 서버가 응답을 시작하는 트리거. 반드시 첫 읽기보다 먼저 나가야 한다.
+            w.println(AuthHandshake.buildAuthLine(pin))
+
             s.soTimeout = GestureConfig.SESSION_HANDSHAKE_TIMEOUT_MS
-            val session = SessionHandshake.parseSession(r.readLine())
+            val line = r.readLine()
+            if (AuthHandshake.isAuthFail(line)) {
+                // 형식이 맞는 거부 응답이다 — "서버가 아예 응답하지 않음"과 섞지 않는다.
+                throw AuthFailedException(AuthHandshake.parseFailReason(line))
+            }
+            val session = SessionHandshake.parseSession(line)
             if (session != null) {
                 // 핸드셰이크 성공 후에는 heartbeat 주기를 읽기 타임아웃으로 사용한다.
                 // 읽기 한 번이 이 시간 안에 아무것도 받지 못하면 미응답 1회로 집계된다.

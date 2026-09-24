@@ -9,6 +9,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -56,7 +58,7 @@ class TcpClientConnectTimeoutTest {
     }
 
     private fun connect(host: String = "127.0.0.1", port: Int = GestureConfig.DEFAULT_PORT) =
-        runCatching { runBlocking { client.connect(host, port) } }
+        runCatching { runBlocking { client.connect(host, port, PIN) } }
 
     @Test
     fun `연결은 GestureConfig의 CONNECT_TIMEOUT_MS로 제한된다`() {
@@ -137,6 +139,8 @@ class TcpClientConnectTimeoutTest {
         Thread {
             runCatching {
                 val s = server.accept()
+                // PIN 인증 이후: 서버는 클라이언트의 AUTH 줄을 먼저 읽은 뒤 SESSION을 보낸다.
+                BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8)).readLine()
                 PrintWriter(s.getOutputStream(), true).println(SESSION_LINE)
                 accepted.put(s)
             }
@@ -144,7 +148,7 @@ class TcpClientConnectTimeoutTest {
 
         try {
             client.socketFactory = { Socket() }
-            val session = runBlocking { client.connect("127.0.0.1", server.localPort) }
+            val session = runBlocking { client.connect("127.0.0.1", server.localPort, PIN) }
 
             assertEquals(SESSION_TOKEN, session)
             assertTrue(client.isConnected)
@@ -158,5 +162,8 @@ class TcpClientConnectTimeoutTest {
     private companion object {
         const val SESSION_TOKEN = "0123456789abcdef0123456789abcdef"
         const val SESSION_LINE = """{"type": "SESSION", "session": "$SESSION_TOKEN"}"""
+
+        /** 인증이 꺼진 서버를 모사하는 테스트들이라 값은 무관하다. */
+        const val PIN = "483920"
     }
 }

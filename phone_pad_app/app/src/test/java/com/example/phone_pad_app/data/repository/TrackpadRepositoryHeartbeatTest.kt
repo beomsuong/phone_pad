@@ -29,6 +29,13 @@ import org.junit.Test
 import java.net.SocketTimeoutException
 
 private const val HOST = "192.168.0.10"
+
+/**
+ * connect()에 넘기는 PIN. 이 테스트들은 **인증이 꺼진 서버**를 모사하므로 값 자체는 무관하고,
+ * 고정하는 것은 "PIN이 TcpClient까지 그대로 전달된다"는 계약뿐이다
+ * (와이어 형식은 TcpClientAuthTest가 고정한다).
+ */
+private const val PIN = "483920"
 private const val SESSION_A = "0123456789abcdef0123456789abcdef"
 private const val SESSION_B = "ffffffffffffffffffffffffffffffff"
 private const val HEARTBEAT_JSON = """{"type":"HEARTBEAT"}"""
@@ -58,12 +65,12 @@ class TrackpadRepositoryHeartbeatTest {
         // Reconnecting으로 바꾸므로, 정책을 꺼서 재연결 도입 이전의 의미를 그대로 보존한다
         // (재연결 동작은 TrackpadRepositoryReconnectTest가 별도로 검증).
         repository = TrackpadRepositoryImpl(tcpClient, udpClient, dispatcher, ReconnectPolicy.Disabled)
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns SESSION_A
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns SESSION_A
         // 기본 스텁: 서버가 아무것도 보내지 않는 상태로 계속 매달려 있는 읽기
         coEvery { tcpClient.readLine() } coAnswers { awaitCancellation() }
     }
 
-    private suspend fun connect() = repository.connect(HOST, GestureConfig.DEFAULT_PORT)
+    private suspend fun connect() = repository.connect(HOST, GestureConfig.DEFAULT_PORT, PIN)
 
     /** 읽기 타임아웃을 모사: 한 주기 동안 매달렸다가 SocketTimeoutException */
     private fun stubReadTimeouts() {
@@ -208,7 +215,7 @@ class TrackpadRepositoryHeartbeatTest {
         runCurrent()
         coVerify(exactly = 1) { tcpClient.send(HEARTBEAT_JSON) }
 
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns SESSION_B
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns SESSION_B
         connect()
         clearMocks(tcpClient, answers = false, recordedCalls = true)
 
@@ -258,7 +265,7 @@ class TrackpadRepositoryHeartbeatTest {
         assertEquals(0, readerCancellations)
 
         // 재연결: 옛 루프가 먼저 취소되어야 한다
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns SESSION_B
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns SESSION_B
         connect()
         runCurrent()
         assertEquals(1, readerCancellations)
@@ -271,7 +278,7 @@ class TrackpadRepositoryHeartbeatTest {
 
     @Test
     fun `핸드셰이크가 실패하면 heartbeat 루프를 시작하지 않는다`() = runTest(dispatcher) {
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns null
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns null
 
         connect()
         advanceTimeBy(INTERVAL * 5)
@@ -288,7 +295,7 @@ class TrackpadRepositoryHeartbeatTest {
         // 나중에 완료되면서 살아있는 새 연결의 소켓을 닫거나(Connected인데 heartbeat가
         // 없는 상태) 상태를 잘못 덮어쓸 수 있었다(F-3). connectionMutex로 완전히
         // 직렬화되면 두 번째 호출이 첫 번째가 끝날 때까지 기다리므로 이런 교차가 없다.
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } coAnswers {
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } coAnswers {
             delay(100)
             SESSION_A
         }
@@ -297,7 +304,7 @@ class TrackpadRepositoryHeartbeatTest {
         runCurrent() // 첫 connect()가 핸드셰이크(딜레이) 중에 진입해 Mutex를 잡은 상태로 만든다
 
         // 첫 호출이 아직 안 끝났을 때 두 번째 connect() 요청이 들어온다
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } coAnswers {
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } coAnswers {
             delay(100)
             SESSION_B
         }
@@ -312,7 +319,7 @@ class TrackpadRepositoryHeartbeatTest {
         second.join()
 
         // 직렬화됐다면 두 호출 다 성공하고, 최종 상태는 나중에 실행된 두 번째 세션을 반영한다
-        coVerify(exactly = 2) { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) }
+        coVerify(exactly = 2) { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) }
         assertEquals(ConnectionState.Connected(HOST), state())
 
         // heartbeat 루프가 정확히 한 쌍만 살아있어야 한다 (옛 루프가 겹쳐 돌면 안 됨)

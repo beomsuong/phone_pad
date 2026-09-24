@@ -24,6 +24,13 @@ import org.junit.Before
 import org.junit.Test
 
 private const val HOST = "192.168.0.10"
+
+/**
+ * connect()에 넘기는 PIN. 이 테스트들은 **인증이 꺼진 서버**를 모사하므로 값 자체는 무관하고,
+ * 고정하는 것은 "PIN이 TcpClient까지 그대로 전달된다"는 계약뿐이다
+ * (와이어 형식은 TcpClientAuthTest가 고정한다).
+ */
+private const val PIN = "483920"
 private const val PORT = GestureConfig.DEFAULT_PORT
 private const val SESSION = "0123456789abcdef0123456789abcdef"
 
@@ -68,7 +75,7 @@ class TrackpadRepositoryCancelConnectTest {
 
     /** 접속이 [CONNECT_DURATION_MS] 동안 매달렸다가 [result]를 돌려주도록 만든다. */
     private fun stubSlowConnect(result: String?) {
-        coEvery { tcpClient.connect(HOST, PORT) } coAnswers {
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } coAnswers {
             delay(CONNECT_DURATION_MS)
             result
         }
@@ -76,7 +83,7 @@ class TrackpadRepositoryCancelConnectTest {
 
     /** 접속이 [CONNECT_DURATION_MS] 동안 매달렸다가 실패하도록 만든다. */
     private fun stubSlowConnectFailure(error: Throwable) {
-        coEvery { tcpClient.connect(HOST, PORT) } coAnswers {
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } coAnswers {
             delay(CONNECT_DURATION_MS)
             throw error
         }
@@ -87,7 +94,7 @@ class TrackpadRepositoryCancelConnectTest {
     @Test
     fun `취소하면 오류 없이 Disconnected로 돌아간다`() = runTest(dispatcher) {
         stubSlowConnect(SESSION)
-        val attempt = launch { repository.connect(HOST, PORT) }
+        val attempt = launch { repository.connect(HOST, PORT, PIN) }
         runCurrent()
         assertEquals(ConnectionState.Connecting, state())
 
@@ -101,7 +108,7 @@ class TrackpadRepositoryCancelConnectTest {
     @Test
     fun `취소는 소켓을 닫아 블로킹 접속을 깨운다`() = runTest(dispatcher) {
         stubSlowConnect(SESSION)
-        val attempt = launch { repository.connect(HOST, PORT) }
+        val attempt = launch { repository.connect(HOST, PORT, PIN) }
         runCurrent()
 
         repository.cancelConnect()
@@ -114,7 +121,7 @@ class TrackpadRepositoryCancelConnectTest {
     @Test
     fun `취소된 시도가 뒤늦게 성공해도 Connected로 덮어쓰지 않는다`() = runTest(dispatcher) {
         stubSlowConnect(SESSION)
-        launch { repository.connect(HOST, PORT) }
+        launch { repository.connect(HOST, PORT, PIN) }
         runCurrent()
         repository.cancelConnect()
 
@@ -132,7 +139,7 @@ class TrackpadRepositoryCancelConnectTest {
     @Test
     fun `취소된 시도가 뒤늦게 실패해도 Error로 덮어쓰지 않는다`() = runTest(dispatcher) {
         stubSlowConnectFailure(java.net.ConnectException("refused"))
-        launch { repository.connect(HOST, PORT) }
+        launch { repository.connect(HOST, PORT, PIN) }
         runCurrent()
         repository.cancelConnect()
 
@@ -146,15 +153,15 @@ class TrackpadRepositoryCancelConnectTest {
     @Test
     fun `취소한 뒤 다시 연결하면 정상적으로 붙는다`() = runTest(dispatcher) {
         stubSlowConnect(SESSION)
-        launch { repository.connect(HOST, PORT) }
+        launch { repository.connect(HOST, PORT, PIN) }
         runCurrent()
         repository.cancelConnect()
         advanceTimeBy(CONNECT_DURATION_MS + 1)
         runCurrent()
 
         // 취소가 어떤 플래그를 영구히 망가뜨리지 않았는지 — 이번에는 즉시 성공하게 둔다.
-        coEvery { tcpClient.connect(HOST, PORT) } returns SESSION
-        repository.connect(HOST, PORT)
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } returns SESSION
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
 
         assertEquals(ConnectionState.Connected(HOST), state())
@@ -163,8 +170,8 @@ class TrackpadRepositoryCancelConnectTest {
 
     @Test
     fun `이미 연결된 상태에서의 취소는 연결을 끊지 않는다`() = runTest(dispatcher) {
-        coEvery { tcpClient.connect(HOST, PORT) } returns SESSION
-        repository.connect(HOST, PORT)
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } returns SESSION
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         assertEquals(ConnectionState.Connected(HOST), state())
 
@@ -179,12 +186,12 @@ class TrackpadRepositoryCancelConnectTest {
     @Test
     fun `재연결 중의 취소는 재연결을 건드리지 않는다`() = runTest(dispatcher) {
         // 재연결 취소는 disconnect()가 담당한다 — cancelConnect()는 첫 연결 전용이다.
-        coEvery { tcpClient.connect(HOST, PORT) } returns SESSION
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } returns SESSION
         coEvery { tcpClient.readLine() } coAnswers {
             delay(1_000L)
             null // EOF = 연결 유실
         }
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         advanceTimeBy(1_000L)
         runCurrent()

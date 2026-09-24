@@ -30,6 +30,16 @@ enum class ConnectionErrorKind {
     /** TCP는 붙었지만 세션 핸드셰이크 한 줄이 오지 않음 — Phone Pad 서버가 아니거나 버전 불일치. */
     HANDSHAKE_FAILED,
 
+    /**
+     * 서버가 PIN 인증을 거부함 (`AUTH_FAIL`) — 입력한 PIN이 PC 화면의 값과 다르다.
+     *
+     * [HANDSHAKE_FAILED]와 분리하는 이유는 조치가 정반대라서다. 핸드셰이크 실패는 "저쪽이
+     * Phone Pad 서버가 맞는가"를 의심해야 하지만, 이쪽은 서버가 분명히 맞고(형식이 맞는 거부
+     * 응답을 보냈으므로) 사용자가 PIN만 다시 입력하면 된다. 분류는 [AuthFailedException]
+     * 타입으로 이루어진다.
+     */
+    AUTH_FAILED,
+
     /** 연결 유지 중 heartbeat 미응답이 한계치에 도달 (`"Heartbeat timeout"`). */
     HEARTBEAT_TIMEOUT,
 

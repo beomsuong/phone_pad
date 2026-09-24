@@ -52,6 +52,9 @@ object ConnectionErrorClassifier {
     private fun classifyOne(throwable: Throwable): ConnectionErrorKind {
         // 타입이 확실한 것부터. SocketTimeoutException은 ConnectException의 형제이므로 순서 무관.
         val byType = when (throwable) {
+            // 가장 먼저 본다: 서버가 명시적으로 거부한 경우이므로 다른 어떤 단서보다 확실하다.
+            // (IOException 계열이라 메시지 추측 경로로 흘러가면 엉뚱하게 분류될 수 있다.)
+            is AuthFailedException -> ConnectionErrorKind.AUTH_FAILED
             is SocketTimeoutException -> ConnectionErrorKind.TIMEOUT
             is UnknownHostException -> ConnectionErrorKind.UNKNOWN_HOST
             is NoRouteToHostException -> ConnectionErrorKind.NETWORK_UNREACHABLE

@@ -48,6 +48,12 @@ class TrackpadViewModelDiscoveryTest {
 
     private lateinit var viewModel: TrackpadViewModel
 
+    /**
+     * 연결을 진행시키려면 PIN이 비어 있지 않아야 한다(확정 스펙). 이 파일의 관심사는 탐색이므로
+     * 값 자체는 무관하며, PIN 정책 자체는 [TrackpadViewModelPinTest]가 고정한다.
+     */
+    private val PIN = "483920"
+
     private val found = DiscoveredServer(name = "MY-PC", host = "192.168.0.11", port = 9000)
     private val oddPortServer = DiscoveredServer(name = "ODD", host = "192.168.0.12", port = 9100)
 
@@ -152,16 +158,18 @@ class TrackpadViewModelDiscoveryTest {
         viewModel.selectServer(found)
         advanceUntilIdle()
 
-        coVerify(exactly = 0) { repository.connect(any(), any()) }
+        coVerify(exactly = 0) { repository.connect(any(), any(), any()) }
     }
 
     @Test
     fun `고른 서버의 포트로 연결한다`() = runTest(dispatcher) {
         viewModel.selectServer(oddPortServer)
+        // 서버를 골라도 PIN은 채워지지 않으므로(탐색 응답에 PIN이 없다) 직접 입력해야 한다.
+        viewModel.onPinInputChange(PIN)
         viewModel.connect()
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { repository.connect("192.168.0.12", 9100) }
+        coVerify(exactly = 1) { repository.connect("192.168.0.12", 9100, PIN) }
     }
 
     @Test
@@ -169,21 +177,23 @@ class TrackpadViewModelDiscoveryTest {
         // 고른 서버의 비표준 포트가 무관한 IP로 새면 엉뚱한 곳에 붙으러 간다.
         viewModel.selectServer(oddPortServer)
         viewModel.onHostInputChange("10.0.0.5")
+        viewModel.onPinInputChange(PIN)
         viewModel.connect()
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { repository.connect("10.0.0.5", GestureConfig.DEFAULT_PORT) }
-        coVerify(exactly = 0) { repository.connect(any(), 9100) }
+        coVerify(exactly = 1) { repository.connect("10.0.0.5", GestureConfig.DEFAULT_PORT, PIN) }
+        coVerify(exactly = 0) { repository.connect(any(), 9100, any()) }
     }
 
     @Test
     fun `수동 입력만으로도 기본 포트로 연결된다`() = runTest(dispatcher) {
         // 자동 탐색이 추가돼도 수동 IP 입력 경로는 그대로 fallback으로 살아 있어야 한다.
         viewModel.onHostInputChange(" 192.168.0.50 ")
+        viewModel.onPinInputChange(PIN)
         viewModel.connect()
         advanceUntilIdle()
 
-        coVerify(exactly = 1) { repository.connect("192.168.0.50", GestureConfig.DEFAULT_PORT) }
+        coVerify(exactly = 1) { repository.connect("192.168.0.50", GestureConfig.DEFAULT_PORT, PIN) }
     }
 
     // --- 탐색 취소 ---------------------------------------------------------------------
@@ -200,6 +210,7 @@ class TrackpadViewModelDiscoveryTest {
 
         viewModel.startDiscovery()
         viewModel.onHostInputChange("192.168.0.99")
+        viewModel.onPinInputChange(PIN)
         viewModel.connect()
         advanceUntilIdle()
 
@@ -232,10 +243,13 @@ class TrackpadViewModelDiscoveryTest {
         viewModel.startDiscovery()
         advanceUntilIdle()
 
+        // PIN은 채워 둔다 — 여기서 고정하는 것은 "host가 비면 연결하지 않는다"이므로
+        // 다른 이유로 막히면 테스트가 의미를 잃는다.
+        viewModel.onPinInputChange(PIN)
         viewModel.connect()
         advanceUntilIdle()
 
-        coVerify(exactly = 0) { repository.connect(any(), any()) }
+        coVerify(exactly = 0) { repository.connect(any(), any(), any()) }
         assertEquals(DiscoveryState.Found(listOf(found)), viewModel.uiState.value.discovery)
         job.cancel()
     }

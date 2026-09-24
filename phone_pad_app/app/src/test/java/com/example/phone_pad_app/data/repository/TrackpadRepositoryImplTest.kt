@@ -25,6 +25,13 @@ import org.junit.Before
 import org.junit.Test
 
 private const val HOST = "192.168.0.10"
+
+/**
+ * connect()에 넘기는 PIN. 이 테스트들은 **인증이 꺼진 서버**를 모사하므로 값 자체는 무관하고,
+ * 고정하는 것은 "PIN이 TcpClient까지 그대로 전달된다"는 계약뿐이다
+ * (와이어 형식은 TcpClientAuthTest가 고정한다).
+ */
+private const val PIN = "483920"
 private const val SESSION = "0123456789abcdef0123456789abcdef"
 
 class TrackpadRepositoryImplTest {
@@ -56,15 +63,15 @@ class TrackpadRepositoryImplTest {
     }
 
     private suspend fun connectSuccessfully() {
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns SESSION
-        repository.connect(HOST, GestureConfig.DEFAULT_PORT)
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns SESSION
+        repository.connect(HOST, GestureConfig.DEFAULT_PORT, PIN)
     }
 
     @Test
     fun `connect는 TCP 핸드셰이크 후 UDP 채널을 9001로 준비하고 Connected로 전환한다`() = runTest {
         connectSuccessfully()
 
-        coVerify(exactly = 1) { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) }
+        coVerify(exactly = 1) { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) }
         coVerify(exactly = 1) { udpClient.connect(HOST, 9001) }
         assertEquals(9001, GestureConfig.UDP_PORT)
         assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
@@ -307,9 +314,9 @@ class TrackpadRepositoryImplTest {
 
     @Test
     fun `핸드셰이크가 오지 않으면 Error로 전환하고 UDP를 준비하지 않는다`() = runTest {
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns null
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns null
 
-        repository.connect(HOST, GestureConfig.DEFAULT_PORT)
+        repository.connect(HOST, GestureConfig.DEFAULT_PORT, PIN)
 
         coVerify(exactly = 0) { udpClient.connect(any(), any()) }
         verify { tcpClient.disconnect() }
@@ -318,10 +325,10 @@ class TrackpadRepositoryImplTest {
 
     @Test
     fun `TCP 연결이 실패하면 Error로 전환하고 소켓을 정리한다`() = runTest {
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } throws
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } throws
             java.net.ConnectException("refused")
 
-        repository.connect(HOST, GestureConfig.DEFAULT_PORT)
+        repository.connect(HOST, GestureConfig.DEFAULT_PORT, PIN)
 
         verify { udpClient.close() }
         verify { tcpClient.disconnect() }
@@ -360,8 +367,8 @@ class TrackpadRepositoryImplTest {
         repository.disconnect()
 
         val newSession = "ffffffffffffffffffffffffffffffff"
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns newSession
-        repository.connect(HOST, GestureConfig.DEFAULT_PORT)
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns newSession
+        repository.connect(HOST, GestureConfig.DEFAULT_PORT, PIN)
         repository.sendEvent(TrackpadEvent.Move(0.5f, 0.5f))
 
         val json = slot<String>()
@@ -376,9 +383,9 @@ class TrackpadRepositoryImplTest {
         connectSuccessfully()
         clearMocks(udpClient, answers = false, recordedCalls = true)
 
-        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT) } returns
+        coEvery { tcpClient.connect(HOST, GestureConfig.DEFAULT_PORT, PIN) } returns
             "1111111111111111111111111111aaaa"
-        repository.connect(HOST, GestureConfig.DEFAULT_PORT)
+        repository.connect(HOST, GestureConfig.DEFAULT_PORT, PIN)
 
         coVerifyOrder {
             udpClient.close()

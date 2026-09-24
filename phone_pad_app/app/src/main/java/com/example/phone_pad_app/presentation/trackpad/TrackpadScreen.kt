@@ -79,8 +79,10 @@ fun TrackpadScreen(
     when (state) {
         is ConnectionState.Disconnected -> ConnectPanel(
             hostInput = uiState.hostInput,
+            pinInput = uiState.pinInput,
             discovery = uiState.discovery,
             onHostChange = viewModel::onHostInputChange,
+            onPinChange = viewModel::onPinInputChange,
             onConnect = viewModel::connect,
             onSearchServers = viewModel::startDiscovery,
             onSelectServer = viewModel::selectServer,
@@ -89,8 +91,10 @@ fun TrackpadScreen(
         )
         is ConnectionState.Error -> ConnectPanel(
             hostInput = uiState.hostInput,
+            pinInput = uiState.pinInput,
             discovery = uiState.discovery,
             onHostChange = viewModel::onHostInputChange,
+            onPinChange = viewModel::onPinInputChange,
             onConnect = viewModel::connect,
             onSearchServers = viewModel::startDiscovery,
             onSelectServer = viewModel::selectServer,
@@ -135,8 +139,10 @@ fun TrackpadScreen(
 @Composable
 private fun ConnectPanel(
     hostInput: String,
+    pinInput: String,
     discovery: DiscoveryState,
     onHostChange: (String) -> Unit,
+    onPinChange: (String) -> Unit,
     onConnect: () -> Unit,
     onSearchServers: () -> Unit,
     onSelectServer: (DiscoveredServer) -> Unit,
@@ -158,7 +164,7 @@ private fun ConnectPanel(
             Text(text = "Phone Pad", style = MaterialTheme.typography.headlineMedium)
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "PC 서버의 IP 주소를 입력하세요",
+                text = "PC 서버의 IP 주소와 PC 화면에 표시된 PIN을 입력하세요",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -170,6 +176,22 @@ private fun ConnectPanel(
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Uri,
+                    // IP 다음에는 PIN을 채워야 하므로 여기서 연결이 시작되면 안 된다.
+                    imeAction = ImeAction.Next,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            // PIN은 서버가 실행마다 새로 만들어 콘솔/트레이에 띄운다. 자동 탐색으로 서버를
+            // 골라도 채워지지 않으므로(탐색 응답에 PIN이 없다) 사용자가 직접 입력한다.
+            OutlinedTextField(
+                value = pinInput,
+                onValueChange = onPinChange,
+                label = { Text("PIN 번호 (PC 화면의 6자리)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    // 힌트일 뿐이다 — 값 검증은 서버가 한다(형식이 바뀌어도 앱이 막지 않는다).
+                    keyboardType = KeyboardType.Number,
                     imeAction = ImeAction.Go,
                 ),
                 keyboardActions = KeyboardActions(onGo = { onConnect() }),
@@ -180,7 +202,8 @@ private fun ConnectPanel(
             Spacer(modifier = Modifier.height(16.dp))
             Button(
                 onClick = onConnect,
-                enabled = hostInput.isNotBlank(),
+                // 빈 PIN으로 문을 두드리면 서버의 브루트포스 카운터만 올라간다(5회면 잠김).
+                enabled = hostInput.isNotBlank() && pinInput.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("연결")

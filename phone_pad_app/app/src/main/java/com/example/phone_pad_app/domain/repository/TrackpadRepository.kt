@@ -6,7 +6,13 @@ import kotlinx.coroutines.flow.Flow
 
 interface TrackpadRepository {
     val connectionState: Flow<ConnectionState>
-    suspend fun connect(host: String, port: Int)
+
+    /**
+     * @param pin 사용자가 입력한 PIN. TCP 연결 직후 AUTH 한 줄로 **항상** 전송된다
+     *   (서버 인증이 꺼져 있어도 형식은 같다 — AGENTS.md 섹션 4). 자동 재연결도 같은 값을
+     *   다시 쓴다.
+     */
+    suspend fun connect(host: String, port: Int, pin: String)
 
     /**
      * 진행 중인 **첫 연결 시도**를 사용자가 취소한다.

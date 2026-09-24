@@ -47,6 +47,9 @@ object ConnectionErrorMessages {
         ConnectionErrorKind.HANDSHAKE_FAILED ->
             "응답한 서버가 Phone Pad 서버가 아니거나 버전이 다릅니다. PC에서 Phone Pad 서버를 실행했는지 확인하세요."
 
+        ConnectionErrorKind.AUTH_FAILED ->
+            "PIN이 올바르지 않습니다. PC 화면에 표시된 PIN 6자리를 다시 확인해 입력하세요."
+
         ConnectionErrorKind.HEARTBEAT_TIMEOUT ->
             "PC 서버가 응답하지 않아 연결이 끊어졌습니다. PC가 절전 상태는 아닌지, Wi-Fi가 유지되는지 확인하세요."
 

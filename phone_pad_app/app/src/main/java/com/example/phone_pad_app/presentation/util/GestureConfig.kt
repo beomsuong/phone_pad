@@ -242,6 +242,17 @@ object GestureConfig {
     const val SESSION_HANDSHAKE_TIMEOUT_MS = 3000
 
     /**
+     * AUTH 줄에 실어 보낼 PIN 문자열의 최대 길이 (자).
+     *
+     * 서버가 생성하는 PIN은 6자리 숫자이므로 실사용에는 전혀 걸리지 않는다. 이 상한의 목적은
+     * **와이어 크기 방어**다 — 입력란에 붙여넣기 등으로 아주 긴 문자열이 들어와도 그대로
+     * 첫 줄에 실려 나가지 않도록 클라이언트가 전송 전에 자른다
+     * ([AuthHandshake][com.example.phone_pad_app.data.network.AuthHandshake.buildAuthLine]).
+     * 서버는 어차피 불일치로 거부하므로 자르는 것이 값을 바꿔 보내는 것보다 나쁘지 않다.
+     */
+    const val AUTH_PIN_MAX_LENGTH = 32
+
+    /**
      * TCP heartbeat 전송 주기 (ms).
      * 연결 유지 중 이 간격으로 `{"type":"HEARTBEAT"}`를 보내고,
      * 동일한 값을 소켓 `soTimeout`으로 사용해 수신 루프의 1회 대기 시간으로 삼는다.

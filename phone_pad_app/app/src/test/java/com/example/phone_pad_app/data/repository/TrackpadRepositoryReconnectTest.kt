@@ -28,6 +28,13 @@ import org.junit.Before
 import org.junit.Test
 
 private const val HOST = "192.168.0.10"
+
+/**
+ * connect()에 넘기는 PIN. 이 테스트들은 **인증이 꺼진 서버**를 모사하므로 값 자체는 무관하고,
+ * 고정하는 것은 "PIN이 TcpClient까지 그대로 전달된다"는 계약뿐이다
+ * (와이어 형식은 TcpClientAuthTest가 고정한다).
+ */
+private const val PIN = "483920"
 private const val OTHER_HOST = "192.168.0.99"
 private const val PORT = GestureConfig.DEFAULT_PORT
 private const val SESSION_A = "0123456789abcdef0123456789abcdef"
@@ -58,8 +65,8 @@ class TrackpadRepositoryReconnectTest {
     fun setUp() {
         tcpClient = mockk(relaxed = true)
         udpClient = mockk(relaxed = true)
-        coEvery { tcpClient.connect(HOST, PORT) } returns SESSION_A
-        coEvery { tcpClient.connect(OTHER_HOST, PORT) } returns SESSION_B
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } returns SESSION_A
+        coEvery { tcpClient.connect(OTHER_HOST, PORT, PIN) } returns SESSION_B
         // 기본: 서버가 아무것도 보내지 않는 상태로 계속 매달려 있는 읽기(= 연결 유지)
         coEvery { tcpClient.readLine() } coAnswers { awaitCancellation() }
     }
@@ -87,7 +94,7 @@ class TrackpadRepositoryReconnectTest {
         losses: Int = 1,
     ) {
         stubConnectionLoss(losses)
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         advanceTimeBy(LOSS_AT_MS)
         runCurrent()
@@ -121,11 +128,11 @@ class TrackpadRepositoryReconnectTest {
 
         advanceTimeBy(GestureConfig.RECONNECT_BASE_DELAY_MS - 1)
         runCurrent()
-        coVerify(exactly = 0) { tcpClient.connect(any(), any()) }
+        coVerify(exactly = 0) { tcpClient.connect(any(), any(), any()) }
 
         advanceTimeBy(1)
         runCurrent()
-        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT) }
+        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT, PIN) }
         assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
 
         repository.disconnect()
@@ -137,7 +144,7 @@ class TrackpadRepositoryReconnectTest {
         connectThenLose(repository)
 
         // 서버가 재기동되어 새 토큰을 발급한 상황
-        coEvery { tcpClient.connect(HOST, PORT) } returns SESSION_B
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } returns SESSION_B
         advanceTimeBy(GestureConfig.RECONNECT_BASE_DELAY_MS)
         runCurrent()
         assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
@@ -186,7 +193,7 @@ class TrackpadRepositoryReconnectTest {
             val policy = ReconnectPolicy(maxAttempts = 3)
             val repository = repositoryWith(policy)
             var connectCalls = 0
-            coEvery { tcpClient.connect(HOST, PORT) } coAnswers {
+            coEvery { tcpClient.connect(HOST, PORT, PIN) } coAnswers {
                 connectCalls += 1
                 if (connectCalls == 1) SESSION_A else throw java.net.ConnectException("refused")
             }
@@ -238,29 +245,29 @@ class TrackpadRepositoryReconnectTest {
     @Test
     fun `첫 연결 실패는 재시도하지 않고 Error로 남는다`() = runTest(dispatcher) {
         val repository = repositoryWith()
-        coEvery { tcpClient.connect(HOST, PORT) } throws java.net.ConnectException("refused")
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } throws java.net.ConnectException("refused")
 
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         assertEquals(ConnectionState.Error("refused", ConnectionErrorKind.CONNECTION_REFUSED), repository.connectionState.first())
 
         // 틀린 IP에 55초씩 매달리면 안 된다 — 가상 시간을 한참 진행해도 추가 시도가 없다
         advanceTimeBy(600_000)
         runCurrent()
-        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT) }
+        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT, PIN) }
         assertEquals(ConnectionState.Error("refused", ConnectionErrorKind.CONNECTION_REFUSED), repository.connectionState.first())
     }
 
     @Test
     fun `핸드셰이크 실패도 재시도하지 않는다`() = runTest(dispatcher) {
         val repository = repositoryWith()
-        coEvery { tcpClient.connect(HOST, PORT) } returns null
+        coEvery { tcpClient.connect(HOST, PORT, PIN) } returns null
 
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         advanceTimeBy(600_000)
         runCurrent()
 
-        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT) }
+        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT, PIN) }
         assertEquals(
             ConnectionState.Error("Session handshake failed", ConnectionErrorKind.HANDSHAKE_FAILED),
             repository.connectionState.first(),
@@ -282,7 +289,7 @@ class TrackpadRepositoryReconnectTest {
 
             advanceTimeBy(600_000)
             runCurrent()
-            coVerify(exactly = 0) { tcpClient.connect(any(), any()) }
+            coVerify(exactly = 0) { tcpClient.connect(any(), any(), any()) }
             // 취소된 재연결 루프가 뒤늦게 Reconnecting/Error를 밀어넣지 않는다
             assertEquals(ConnectionState.Disconnected, repository.connectionState.first())
         }
@@ -294,15 +301,15 @@ class TrackpadRepositoryReconnectTest {
         clearMocks(tcpClient, answers = false, recordedCalls = true)
 
         // 사용자가 기다리지 않고 다른 IP를 직접 입력했다
-        repository.connect(OTHER_HOST, PORT)
+        repository.connect(OTHER_HOST, PORT, PIN)
         runCurrent()
         assertEquals(ConnectionState.Connected(OTHER_HOST), repository.connectionState.first())
 
         advanceTimeBy(600_000)
         runCurrent()
         // 이중 접속 금지: 옛 대상으로의 재연결은 한 번도 일어나지 않는다
-        coVerify(exactly = 0) { tcpClient.connect(HOST, PORT) }
-        coVerify(exactly = 1) { tcpClient.connect(OTHER_HOST, PORT) }
+        coVerify(exactly = 0) { tcpClient.connect(HOST, PORT, PIN) }
+        coVerify(exactly = 1) { tcpClient.connect(OTHER_HOST, PORT, PIN) }
         assertEquals(ConnectionState.Connected(OTHER_HOST), repository.connectionState.first())
 
         repository.disconnect()
@@ -311,7 +318,7 @@ class TrackpadRepositoryReconnectTest {
     @Test
     fun `수동 disconnect 뒤의 전송 실패는 연결을 되살리지 않는다`() = runTest(dispatcher) {
         val repository = repositoryWith()
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         repository.disconnect()
         runCurrent()
@@ -323,7 +330,7 @@ class TrackpadRepositoryReconnectTest {
         advanceTimeBy(600_000)
         runCurrent()
 
-        coVerify(exactly = 0) { tcpClient.connect(any(), any()) }
+        coVerify(exactly = 0) { tcpClient.connect(any(), any(), any()) }
         assertEquals(ConnectionState.Disconnected, repository.connectionState.first())
     }
 
@@ -335,7 +342,7 @@ class TrackpadRepositoryReconnectTest {
         val repository = repositoryWith(
             ReconnectPolicy(maxAttempts = 1, baseDelayMs = 100_000, maxDelayMs = 100_000)
         )
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         clearMocks(tcpClient, udpClient, answers = false, recordedCalls = true)
         coEvery { tcpClient.send(any()) } throws java.io.IOException("broken pipe")
@@ -371,7 +378,7 @@ class TrackpadRepositoryReconnectTest {
         val repository = repositoryWith(
             ReconnectPolicy(maxAttempts = 1, baseDelayMs = 100_000, maxDelayMs = 100_000)
         )
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         coEvery { tcpClient.send(any()) } throws java.io.IOException("broken pipe")
 
@@ -390,7 +397,7 @@ class TrackpadRepositoryReconnectTest {
     fun `MOVE 전송 실패는 재연결을 트리거하지 않는다`() = runTest(dispatcher) {
         // F-2 유지: 고빈도 이벤트의 조용한 실패는 그대로 둔다.
         val repository = repositoryWith()
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         clearMocks(tcpClient, answers = false, recordedCalls = true)
         coEvery { udpClient.send(any()) } throws java.io.IOException("udp down")
@@ -400,7 +407,7 @@ class TrackpadRepositoryReconnectTest {
         runCurrent()
 
         assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
-        coVerify(exactly = 0) { tcpClient.connect(any(), any()) }
+        coVerify(exactly = 0) { tcpClient.connect(any(), any(), any()) }
 
         repository.disconnect()
     }
@@ -409,7 +416,7 @@ class TrackpadRepositoryReconnectTest {
     fun `SCROLL 전송 실패는 재연결을 트리거하지 않는다`() = runTest(dispatcher) {
         // F-1 유지: 스크롤도 고빈도라 실패를 조용히 버린다.
         val repository = repositoryWith()
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         clearMocks(tcpClient, answers = false, recordedCalls = true)
         coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
@@ -418,7 +425,7 @@ class TrackpadRepositoryReconnectTest {
         runCurrent()
 
         assertEquals(ConnectionState.Connected(HOST), repository.connectionState.first())
-        coVerify(exactly = 0) { tcpClient.connect(any(), any()) }
+        coVerify(exactly = 0) { tcpClient.connect(any(), any(), any()) }
 
         repository.disconnect()
     }
@@ -437,13 +444,13 @@ class TrackpadRepositoryReconnectTest {
 
         advanceTimeBy(600_000)
         runCurrent()
-        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT) }
+        coVerify(exactly = 1) { tcpClient.connect(HOST, PORT, PIN) }
     }
 
     @Test
     fun `재연결 비활성 정책이면 Click 전송 실패도 기존처럼 Error로 간다`() = runTest(dispatcher) {
         val repository = repositoryWith(ReconnectPolicy.Disabled)
-        repository.connect(HOST, PORT)
+        repository.connect(HOST, PORT, PIN)
         runCurrent()
         coEvery { tcpClient.send(any()) } throws java.io.IOException("tcp down")
 

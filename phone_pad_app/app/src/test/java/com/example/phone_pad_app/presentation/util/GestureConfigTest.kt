@@ -266,6 +266,14 @@ class GestureConfigTest {
     }
 
     @Test
+    fun `PIN 길이 상한은 서버가 생성하는 6자리를 넉넉히 담는다`() {
+        // 상한의 목적은 와이어 크기 방어이지 형식 검증이 아니다. 6자리보다 작아지면 정상 PIN이
+        // 잘려 나가 "맞는 PIN인데 항상 실패"하는 버그가 된다 (AuthHandshake가 전송 전에 자른다).
+        assertTrue(GestureConfig.AUTH_PIN_MAX_LENGTH >= 6)
+        assertEquals(32, GestureConfig.AUTH_PIN_MAX_LENGTH)
+    }
+
+    @Test
     fun `멀티터치 해제 유예는 탭 최대 지속 시간의 절반보다 짧다`() {
         // 이 여유가 없으면 "손가락 하나를 떼고 남은 손가락으로 탭"하는 동작까지
         // 2손가락 탭으로 삼켜버린다 (MultiTouchGestureTracker의 꼬리 보정 전제 조건)
