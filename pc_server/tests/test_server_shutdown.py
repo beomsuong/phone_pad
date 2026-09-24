@@ -562,11 +562,14 @@ def test_existing_entry_points_keep_their_signatures():
     params = inspect.signature(server.handle_client).parameters
     assert list(params) == [
         "conn", "addr", "controller", "registry", "expected_pin", "auth_limiter",
+        "guard",
     ]
     # 새 파라미터의 기본값은 "인증 없음" 이어야 한다 - 기존 호출자/테스트가
     # auth 를 명시적으로 켜지 않는 한 지금까지와 똑같이 동작해야 하기 때문이다.
     assert params["expected_pin"].default is None
     assert params["auth_limiter"].default is None
+    # 단일 클라이언트 가드도 같은 이유로 기본 비활성 (single_client.py 참조).
+    assert params["guard"].default is None
     assert list(inspect.signature(server.handle_udp_packet).parameters) == [
         "data", "controller", "registry",
     ]

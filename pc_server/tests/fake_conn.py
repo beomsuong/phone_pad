@@ -44,6 +44,8 @@ class FakeConn:
             self._chunks.insert(0, auth_line)
         self.sent = []
         self.closed = False
+        self.shutdowns = []      # shutdown(how) 호출 인자 기록
+        self.call_order = []     # "shutdown"/"close" 호출 순서 (RST 방지 검증용)
         self.timeouts = []       # SESSION 이후(heartbeat) 타임아웃만
         self.auth_timeouts = []  # AUTH 단계 타임아웃
         self.recv_calls = 0      # SESSION 이후 recv 만
@@ -68,8 +70,13 @@ class FakeConn:
         self.recv_calls += 1
         return self._recv_event(size)
 
+    def shutdown(self, how):
+        self.shutdowns.append(how)
+        self.call_order.append("shutdown")
+
     def close(self):
         self.closed = True
+        self.call_order.append("close")
 
     # -- 하위 클래스 훅 ----------------------------------------------------
 

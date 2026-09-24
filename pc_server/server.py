@@ -9,6 +9,7 @@ import uuid
 import discovery
 import logging_setup
 import pin_auth
+import single_client
 import single_instance
 import tray
 from input_controller import InputController
@@ -220,16 +221,25 @@ def authenticate_client(conn: socket.socket, addr, expected_pin: str = None,
 
 def handle_client(conn: socket.socket, addr, controller: InputController,
                   registry: SessionRegistry, expected_pin: str = None,
-                  auth_limiter=None):
+                  auth_limiter=None, guard=None):
     print(f"[+] Connected: {addr}")
     authenticated, buffer = authenticate_client(conn, addr, expected_pin, auth_limiter)
     if not authenticated:
         # 세션을 발급하지 않았으므로 회수할 것도, 드래그 안전장치도 필요 없다.
+        # 활성 슬롯도 건드리지 않는다 - AUTH 를 통과하지 못한 시도는 기존
+        # 연결에 어떤 영향도 주지 않는다 (single_client.py 참조).
         conn.close()
         print(f"[-] Disconnected: {addr}")
         return
 
     session = registry.issue()
+    if guard is not None:
+        # 단일 클라이언트 정책: 밀어내기를 **SESSION 발급보다 먼저** 끝낸다.
+        evicted = guard.take_over(conn, addr, session)
+        if evicted is not None:
+            evicted_conn, evicted_addr = evicted
+            print(f"[!] Evicted previous client: {evicted_addr} (replaced by {addr})")
+            single_client.evict(evicted_conn, evicted_addr)
     try:
         conn.sendall((json.dumps({"type": "SESSION", "session": session}) + "\n").encode("utf-8"))
         print(f"[=] Session issued to {addr}: {session}")
@@ -238,6 +248,11 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
     except OSError as e:
         print(f"[!] Failed to send session to {addr}: {e}")
         registry.remove(session)
+        # 이 경로도 "연결이 스스로 끝나는" 경우다 - 죽은 소켓이 활성 슬롯을
+        # 차지한 채 남지 않게 여기서도 놓는다 (identity 비교라 이미 다른 연결에
+        # 밀려난 뒤라면 아무 일도 일어나지 않는다).
+        if guard is not None:
+            guard.release(conn)
         conn.close()
         return
 
@@ -293,6 +308,10 @@ def handle_client(conn: socket.socket, addr, controller: InputController,
         print(f"[!] Error from {addr}: {e}")
     finally:
         registry.remove(session)
+        if guard is not None:
+            # `_current` 가 여전히 이 conn 일 때만 지워진다 - 이미 밀려난 뒤의
+            # 뒤늦은 정리가 새 활성 클라이언트의 슬롯을 지우면 안 된다.
+            guard.release(conn)
         print(f"[=] Session revoked: {session}")
         # 드래그 안전장치: DRAG_END 가 유실된 채 연결이 끊기면(정상 종료 / heartbeat
         # 타임아웃 / 예외 전부 이 블록을 지난다) PC 마우스 왼쪽 버튼이 영원히 눌린 채
@@ -343,6 +362,7 @@ class ServerRuntime:
         discovery_port: int = None,
         expected_pin: str = None,
         auth_limiter=None,
+        single_client_guard=None,
     ):
         self.controller = controller
         self.registry = registry
@@ -365,6 +385,10 @@ class ServerRuntime:
             self.auth_limiter = pin_auth.AuthAttemptLimiter()
         else:
             self.auth_limiter = None
+        # 단일 클라이언트 정책도 **기본 비활성**이다 (탐색 포트 / PIN 과 같은
+        # 이유: 기본값을 켜두면 두 연결을 동시에 다루는 기존 테스트가 깨진다).
+        # 실제 서버에서는 main() 이 항상 하나를 넘긴다 - 끄는 CLI 옵션은 없다.
+        self.single_client_guard = single_client_guard
         self.accept_timeout = accept_timeout
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         # 바인드가 끝나고 accept 루프에 진입했음을 알리는 신호 (테스트/기동 동기화용)
@@ -441,6 +465,7 @@ class ServerRuntime:
                         self.registry,
                         self.expected_pin,
                         self.auth_limiter,
+                        self.single_client_guard,
                     ),
                     daemon=True,
                 ).start()
@@ -657,6 +682,9 @@ def main(argv=None) -> int:
         registry,
         discovery_port=None if args.no_discovery else discovery.DISCOVERY_PORT,
         expected_pin=expected_pin,
+        # 단일 클라이언트 정책은 제품 정책이라 끄는 옵션이 없다 - 실제 서버는
+        # 항상 가드를 쓴다 (single_client.py 참조).
+        single_client_guard=single_client.SingleClientGuard(),
     )
 
     if use_tray:
