@@ -95,12 +95,27 @@ phone_pad/
 
 **TCP 9000** — newline-delimited JSON (한 줄 = 한 이벤트, `\n` 종료)
 
-세션 핸드셰이크: 클라이언트가 TCP 연결하면 서버가 다른 어떤 이벤트보다도 먼저 세션 토큰 한 줄을 보낸다.
+**세션 핸드셰이크 (✅ PIN 인증 완료, Phase 5 — 순서가 뒤집혔다).** 예전에는 서버가 연결 직후 가장 먼저 말했지만, 이제는 **클라이언트가 먼저 AUTH를 보내야** 서버가 응답한다.
 ```jsonc
-// 서버 → 클라이언트, 연결 직후 1회, 반드시 첫 줄
+// 클라이언트 → 서버: TCP 연결 직후, 다른 어떤 것보다도 먼저 보내는 한 줄
+{"type":"AUTH","pin":"483920"}
+
+// 성공: 서버 → 클라이언트 — 형식은 예전과 완전히 동일
 {"type":"SESSION","session":"0123456789abcdef0123456789abcdef"}  // uuid4().hex, 32자리 hex
+
+// 실패(PIN 불일치): 서버 → 클라이언트, 보낸 뒤 즉시 연결을 닫는다
+{"type":"AUTH_FAIL","reason":"invalid_pin"}
 ```
-클라이언트는 이 줄을 받아야 `ConnectionState.Connected`로 전환한다 (`SESSION_HANDSHAKE_TIMEOUT_MS` 내 미수신 시 `Error`). 핸드셰이크 직후부터 서버는 해당 소켓에 `HEARTBEAT_INTERVAL_S` 초 `recv` 타임아웃을 걸고, **연속 `HEARTBEAT_MISS_LIMIT`(3)회 동안 상향 데이터가 전혀 없으면(≈15초) 세션을 회수하고 연결을 끊는다.** 여기서 "데이터"는 HEARTBEAT뿐 아니라 CLICK 등 어떤 상향 이벤트든 해당되며, 매번 카운터가 0으로 리셋된다.
+- **AUTH는 인증이 꺼져 있어도(`--no-auth`) 항상 보낸다** — 서버 설정에 따라 와이어 형식이 갈라지면 클라이언트가 미리 알 방법이 없다. 인증이 꺼져 있으면 서버는 `pin` 값과 무관하게(빈 문자열이어도) 통과시키고 SESSION을 보낸다.
+- 서버는 첫 줄을 읽을 때 **`AUTH_TIMEOUT_S`(3.0초)** 타임아웃을 건다. 다음은 **아무 응답 없이 조용히 닫는다**(응답할 정보가 없거나 알려주는 것 자체가 무의미): 타임아웃, EOF, 깨진 JSON, dict 아님, `type != "AUTH"`, `pin`이 문자열 아님, **브루트포스 잠금 중인 IP**(아래). `AUTH_FAIL`은 **형식은 맞았는데 PIN 값만 틀렸을 때만** 보낸다 — "조용히 닫기"와 확실히 구분해야 공격자에게 잠금 여부가 새지 않는다. PIN 비교는 `hmac.compare_digest`.
+- **브루트포스 방어:** 발신 IP별로 AUTH 실패 횟수를 추적(`pin_auth.AuthAttemptLimiter`, 시간 주입 가능한 순수 클래스, discovery의 `ResponseRateLimiter`와 같은 패턴)해, **60초 안에 5회 실패**하면 그 IP는 남은 시간 동안 새 연결에서 AUTH 줄을 읽지도 않고 즉시 닫는다. **close 전에 큐에 남은 바이트를 짧은 타임아웃(0.05초)으로 최선을 다해 비운다** — 안 비우면 커널이 RST를 보내 클라이언트가 clean EOF(`HANDSHAKE_FAILED`) 대신 `SocketException`(`UNKNOWN`)을 보게 되어 잠금이 형식 오류와 다르게 관측된다(협의 QA F-1로 발견·수정). 인증이 꺼져 있으면 이 추적 자체를 하지 않는다.
+- **PIN은 `--pin <code>`(고정, 앞뒤 공백은 서버가 제거)로 지정하거나, 지정하지 않으면 서버가 세션마다 6자리 숫자를 무작위 생성**해 콘솔에 `[Server] PIN for this session: 483920` 한 줄로, 그리고 **트레이 툴팁/메뉴에도** 표시한다(의도된 노출 지점은 이 둘뿐 — 그 외 어떤 로그에도 PIN 값은 남지 않는다). `--pin ""`처럼 빈/공백 PIN은 시작 시 거부한다(그렇지 않으면 "인증 켜짐 + 기대값 빈 문자열"이 되어 정상 PIN을 보내는 앱조차 접속할 수 없고 5회 만에 자기 IP가 잠긴다). `--no-auth`로 인증을 완전히 끌 수 있다(개발용, `--no-tray`/`--no-discovery`/`--allow-multiple`과 같은 선상).
+- **PIN은 탐색(UDP 9002 `SERVER` 메시지)에 절대 넣지 않는다** — 탐색은 인증이 없는 채널이라 PIN을 실어 보내면 인증 자체가 무의미해진다.
+- Android는 **PIN을 저장하지 않는다**(`hostInput`과 대칭 — `pinInput`은 ViewModel 메모리에만 있다가 화면을 벗어나면 사라진다). 서버가 재시작할 때마다 PIN이 새로 생성되므로, 저장해 봤자 대부분 다음 연결 시점엔 틀린 값이라 영속화가 오히려 해롭다.
+- **재연결 루프는 `AUTH_FAILED`를 만나면 백오프를 소진하지 않고 즉시 `Error(kind=AUTH_FAILED)`로 전환한다** — 다른 실패 종류(HEARTBEAT_TIMEOUT/CONNECTION_LOST 등)는 기존처럼 계속 재시도한다. PIN 불일치는 시간이 지난다고 저절로 맞아지는 일시 장애가 아니고, 계속 두드리면 서버의 브루트포스 잠금(60초/5회)을 스스로 유발해 사용자가 올바른 PIN으로 수동 재연결해도 막히기 때문이다.
+- SESSION 발급(`SessionRegistry`), heartbeat, 그 이후의 모든 이벤트 처리는 **완전히 무변경**이다 — 바뀐 것은 SESSION을 보내기 **전에** AUTH를 한 단계 거친다는 것뿐이다.
+
+클라이언트는 SESSION 줄을 받아야 `ConnectionState.Connected`로 전환한다 (`SESSION_HANDSHAKE_TIMEOUT_MS` 내 미수신 시 `Error`). 핸드셰이크 직후부터 서버는 해당 소켓에 `HEARTBEAT_INTERVAL_S` 초 `recv` 타임아웃을 걸고, **연속 `HEARTBEAT_MISS_LIMIT`(3)회 동안 상향 데이터가 전혀 없으면(≈15초) 세션을 회수하고 연결을 끊는다.** 여기서 "데이터"는 HEARTBEAT뿐 아니라 CLICK 등 어떤 상향 이벤트든 해당되며, 매번 카운터가 0으로 리셋된다.
 
 ```jsonc
 // 좌클릭
@@ -349,8 +364,21 @@ RECONNECT_MAX_DELAY_MS = 10_000L // 백오프 상한
 - 함정: ① `runCatching`이 suspend 호출의 `CancellationException`을 삼켜 **연결 시작으로 취소한 탐색이 "서버를 찾지 못했습니다"로 표시**됐다(신규 ViewModel 테스트가 잡음) → `try/catch(CancellationException){throw}` ② **KDoc·주석에 유니코드 escape 리터럴을 쓰면 kapt Java 스텁 주석으로 복사되어 `illegal unicode escape`로 `:app:kaptDebugKotlin`이 깨진다**(실측 — 코드/문자열 리터럴은 무해) ③ `runTest {}` 안에서 새 `StandardTestDispatcher`를 만들면 `Detected use of different schedulers`로 무더기 실패 → 디스패처를 필드로 두고 `runTest(dispatcher)` ④ 루프백 실소켓 테스트에서 닫힌 포트로 보내면 Windows ICMP unreachable이 다음 `recv`를 깨워 "창이 끝날 때까지 기다림"을 측정할 수 없다(받기만 하고 답하지 않는 소켓으로 재현)
 - **QA 발견(리더가 수정):** F-1 — 서버가 이름을 문자 수 64자로 자르지만 `ensure_ascii` escape로 바이트가 커져 비BMP 이름은 예전 상한 512에서 수신 버퍼가 잘려 서버가 목록에서 사라질 수 있었다(Windows 컴퓨터 이름은 15자·제한 문자라 실기기 도달 불가지만 계약이 안 닫혀 있었음) → `MAX_RESPONSE_BYTES = 1024` + 최악값(비BMP 64자, 807B) 회귀 테스트. W-1 — `toIntOrNull(16)`이 부호를 허용해 위조 escape가 엉뚱한 문자가 됐다 → hex 자릿수 검사 + 테스트
 
+**PIN 인증 구현 시 핵심 파일/설계:**
+- **파괴적 변경 경고가 실제로 옳았다** — TCP 핸드셰이크 첫 줄이 바뀌므로 기존에 handshake를 흉내 내던 테스트 전부가 깨졌다. 서버는 `test_server_drag.py`/`test_server_shutdown.py`/`test_desktop_switch.py`뿐 아니라 **요청 목록에 없던 `test_discovery.py`의 실소켓 핸드셰이크**까지 grep으로 찾아 고쳤다(목록만 믿었으면 놓쳤을 1건) — **와이어 순서가 바뀌는 변경은 항상 grep으로 전수 재확인할 것**, 새 테스트 추가만으로는 부족하다.
+- `pc_server/pin_auth.py` — `generate_pin()`(secrets, 6자리 0-패딩), `parse_auth_message()`(bytes/str/dict 전부 받고 무예외), `pins_match()`(`hmac.compare_digest`), `AuthAttemptLimiter`(시간 주입, 60초/5회, discovery의 `ResponseRateLimiter`와 같은 패턴)
+- `pc_server/tests/fake_conn.py` — 파괴적 변경을 한 파일에서 흡수하는 **공용 `FakeConn`**(AUTH 줄을 자동 선발송, `recv_calls`/`timeouts`는 SESSION 이후만 셈). 여러 테스트 파일에 흩어진 가짜 소켓 헬퍼가 있다면 **이런 공용화가 파괴적 변경 대응 비용을 크게 줄인다**
+- `pc_server/server.py` — `authenticate_client()`가 `read_auth_line()`(AUTH_TIMEOUT_S 3.0초) → `pin_auth`로 검증 → `(통과 여부, leftover)` 반환. `handle_client(..., expected_pin=None, auth_limiter=None)` **기본값은 인증 없음**(discovery_port 때와 같은 교훈 — 세 번째로 겪음). `main()`만 `resolve_expected_pin()`으로 실제 값을 결정해 넘긴다. 잠금 close는 **`recv()` 1회(0.05초 타임아웃)로 큐를 비운 뒤** 닫는다(QA F-1 — 안 비우면 RST가 나가 잠금이 형식 오류와 다르게 관측된다). `--pin`은 `strip()` 후 빈 문자열이면 `SystemExit`(QA F-2 — 안 그러면 "인증 켜짐 + 기대값 빈 문자열"이 되어 아무도 접속 못 하고 자기 IP가 잠긴다). Android의 `trim()`과 맞추기 위한 `strip()`이기도 하다.
+- `pc_server/tray_status.py`/`tray.py` — 툴팁 끝에 `" - PIN: {pin}"`(인증 켜져 있을 때만), 메뉴에 표시 전용 PIN 항목 추가.
+- `data/network/AuthHandshake.kt` — AUTH 줄 생성(`"`/`\`/제어문자 이스케이프, 32자 절단)과 `AUTH_FAIL` 판별 순수 object. `TcpClient.connect(host, port, pin)`이 소켓 성공 직후 **다른 무엇보다 먼저** 이 줄을 전송, 응답이 `AUTH_FAIL`이면 `AuthFailedException`을 던져 일반 handshake 실패와 구분한다.
+- `domain/model/ConnectionErrorKind.AUTH_FAILED` — `ConnectionErrorClassifier`가 `AuthFailedException`을 최우선으로 매핑, `ConnectionErrorMessages`에 한국어 문구. `TrackpadRepositoryImpl`의 재연결 루프(`startReconnect()`)는 `outcome.kind == AUTH_FAILED`일 때만 `attempt += 1`을 건너뛰고 즉시 `Error`로 전환(다른 실패 종류는 기존 백오프 그대로) — 변이 검사로 이 분기가 정확히 1개 테스트로만 고정됨을 확인.
+- `TrackpadViewModel`/`TrackpadUiState`/`TrackpadScreen` — `hostInput`과 대칭인 `pinInput`(영속화 없음), 연결 버튼은 둘 다 비어 있지 않아야 활성화. 서버 탐색으로 서버를 선택해도 PIN은 채워지지 않는다(탐색 응답에 없으므로).
+- **QA 발견(리더가 수정) — F-1:** 잠금 close가 미판독 바이트를 남겨 RST가 나가던 것을 위 `recv()` 드레인으로 수정 + 실소켓 회귀 테스트(`test_real_socket_lockout_closes_cleanly_not_with_a_reset`, JVM 클라이언트로 `SocketException` 대신 clean EOF임을 실측). **F-2:** `--pin ""`을 그대로 기대값으로 쓰던 것을 시작 시 거부로 수정 + `strip()` 추가, 회귀 테스트 2건. **W-3(문서 정정):** PIN 노출 지점은 콘솔 한 줄뿐이 아니라 **트레이도 포함해 둘**이라고 바로잡음(서버 코드 주석도 함께 수정).
+- 확인된 강점: 인증 OFF/ON 양쪽에서 기존 이벤트(CLICK/SCROLL/DRAG/DESKTOP_SWITCH/UDP MOVE/DISCOVER) 전부 회귀 없음(protocol-qa 실측). PIN에 `"`나 개행이 섞인 입력도 이스케이프되어 한 줄 유효 JSON이 되므로 이벤트 주입/줄 분할 불가.
+- 미해결(섹션 10 참조): 실기기 미검증, 잠금 카운트는 프로세스 메모리 전용(재시작 시 리셋), NAT 공유 IP는 같이 잠기고 IP를 바꾸는 공격자는 우회 가능(100만 조합 + 3초 타임아웃이 실질 방어선), UDP 세션 토큰 평문 스푸핑은 이번 PIN 인증으로 해결되지 않음(별도 이슈), `--allow-multiple`로 서버를 두 개 띄우면 PIN도 두 개.
+
 ### ⬜ Phase 5 — 선택 확장
-- [ ] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가)
+- [x] PIN 코드 인증 (TCP 핸드셰이크 단계에 추가) — **교차 경계면**(파괴적 변경: 핸드셰이크 순서 역전), android-dev/server-dev 병렬 + protocol-qa 검증. 기본 켜짐(사용자 결정) — 서버가 세션마다 랜덤 6자리 PIN 생성, 앱 연결 화면에 PIN 입력란 필수. 자세한 설계는 아래 "PIN 인증 구현 시 핵심 파일/설계"
 - [x] 3손가락 스와이프 → 가상 데스크톱 전환 — **교차 경계면**(새 이벤트 `DESKTOP_SWITCH`), android-dev/server-dev 병렬 + protocol-qa 검증. 좌/우만(수직 스와이프·4손가락은 범위 밖). 자세한 설계는 아래 "3손가락 스와이프 구현 시 핵심 파일/설계"
 - [ ] 다중 클라이언트 지원 정책 결정
 
@@ -365,7 +393,8 @@ Android                                          PC Server
    |<-- UDP 9002 unicast {type:SERVER,name,port} -   |   ✅ 구현됨 (서버 주소 = 응답 발신 주소)
    |                                                 |
    |-- TCP connect ------------------------------>   |
-   |<-- {"type":"SESSION","session":"<32hex>"} ---   |   ✅ 구현됨 (연결 직후 첫 줄)
+   |-- TCP: {"type":"AUTH","pin":"483920"} ------->   |   ✅ 구현됨 (다른 무엇보다 먼저, 인증 꺼도 보냄)
+   |<-- {"type":"SESSION","session":"<32hex>"} ---   |   ✅ 구현됨 (PIN 일치 시) — 불일치 시 AUTH_FAIL 후 종료
    |                                                 |
    |-- TCP: CLICK (탭 종료 후 300ms 지연) --------->  |   ✅ 구현됨
    |-- TCP: DOUBLE_CLICK --------------------------->  |   ✅ 구현됨 (CLICK 2개 대신 1개, 커서 이동 없음)
@@ -392,13 +421,16 @@ pip install -r requirements.txt   # 트레이 아이콘용 (선택 — 없으면
 python server.py                  # 시스템 트레이 아이콘과 함께 실행
 python server.py --no-tray        # 트레이 없이 콘솔 모드 (Ctrl+C로 종료)
 python server.py --no-discovery   # UDP 9002 자동 탐색 응답 끄기 (수동 IP 입력만)
-# → TCP 9000(이벤트+세션 핸드셰이크) / UDP 9001(MOVE 전용) / UDP 9002(서버 탐색) 포트에서 대기
+python server.py --pin 123456     # 무작위 생성 대신 고정 PIN 사용
+python server.py --no-auth        # PIN 인증 완전히 끄기 (개발/디버깅용)
+# → TCP 9000(이벤트+세션 핸드셰이크+PIN 인증) / UDP 9001(MOVE 전용) / UDP 9002(서버 탐색) 포트에서 대기
 
 # 단일 exe 빌드 — 임시 venv를 저장소 밖에 만든다(전역 Python은 건드리지 않음)
 ./build_exe.ps1                   # → dist/PhonePadServer.exe (약 15.6MB, 빌드 약 40초)
 ```
 **exe 실행:** 더블클릭하면 windowed(`--noconsole`)라 콘솔 창 없이 트레이 아이콘만 뜬다. 그래서 `print()` 로그는 **`%LOCALAPPDATA%\PhonePad\server.log`** 로 간다(줄 단위 flush, 1MB를 넘으면 시작 시 `server.log.1`로 1회 회전). 빌드 산출물(`build/`, `dist/`)은 커밋하지 않는다.
-**트레이 모드:** 아이콘 색이 상태를 보여준다(회색 = 대기 중, 초록 = 연결됨). 툴팁은 `Phone Pad - 연결됨 (N대)`, 메뉴에는 앱에 입력할 **접속 주소(`PC의 LAN IP:9000`)** 가 표시되며 **"종료"** 로 끈다. `pystray`/`Pillow`가 설치돼 있지 않으면 경고 한 줄을 출력하고 자동으로 콘솔 모드로 동작한다(서버 기능은 트레이 의존성에 막히지 않는다). 서버가 예외로 죽으면(포트 바인드 실패 등) 트레이도 함께 내려가 프로세스가 종료 코드 1로 끝난다 — 아이콘만 남는 좀비는 생기지 않는다.
+**PIN 인증(기본 켜짐):** 서버를 실행하면 콘솔에 `[Server] PIN for this session: 483920`이 한 번 출력되고 트레이 툴팁/메뉴에도 같은 값이 보인다. 앱 연결 화면의 PIN 입력란에 이 값을 그대로 입력해야 한다(수동 확인 — 탐색으로 서버를 찾아도 PIN은 자동으로 채워지지 않는다). 서버가 재시작되면 PIN도 새로 바뀐다.
+**트레이 모드:** 아이콘 색이 상태를 보여준다(회색 = 대기 중, 초록 = 연결됨). 툴팁은 `Phone Pad - 연결됨 (N대) - PIN: 483920`, 메뉴에는 앱에 입력할 **접속 주소(`PC의 LAN IP:9000`)** 와 **PIN**이 표시되며 **"종료"** 로 끈다. `pystray`/`Pillow`가 설치돼 있지 않으면 경고 한 줄을 출력하고 자동으로 콘솔 모드로 동작한다(서버 기능은 트레이 의존성에 막히지 않는다). 서버가 예외로 죽으면(포트 바인드 실패 등) 트레이도 함께 내려가 프로세스가 종료 코드 1로 끝난다 — 아이콘만 남는 좀비는 생기지 않는다.
 **서버를 두 번 실행하면 자동으로 차단된다:** Windows에서는 `SO_REUSEADDR` 때문에 이미 점유된 포트에도 bind가 성공해 예전에는 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받았다. 이제 두 번째 프로세스가 named mutex(`Local\PhonePadServer`)로 이를 감지해 "이미 실행 중입니다" 안내창(windowed) 또는 stderr 한 줄(콘솔)을 띄우고 **종료 코드 2**로 끝난다 — 첫 인스턴스는 영향받지 않는다. 개발 중 일부러 두 개를 띄우려면 `--allow-multiple`. 단 다른 로그인 세션에서 띄운 서버는 감지하지 못한다(아래 섹션 10 참조).
 **Windows 방화벽(exe):** `python.exe`로 허용해 둔 기존 규칙은 `PhonePadServer.exe`에 적용되지 않으므로 exe로 처음 실행하면 새 방화벽 프롬프트가 뜰 수 있다(미검증 — 이 환경에서 확인 불가). 허용 대상은 아래와 같다.
 
@@ -411,7 +443,7 @@ PC 마우스 왼쪽 버튼이 눌린 채로 멈춰 있다면(뭘 클릭해도 �
 ### Android 앱
 1. Android Studio에서 `phone_pad_app/` 열기
 2. 빌드 후 기기에 설치
-3. 앱 실행 → PC IP 입력 → 연결 (TCP 핸드셰이크로 세션 토큰을 받아야 Connected로 전환됨)
+3. 앱 실행 → PC IP와 **PC 화면(콘솔/트레이)에 표시된 PIN** 입력 → 연결 (AUTH 통과 후 세션 토큰을 받아야 Connected로 전환됨. PIN이 틀리면 재시도 없이 바로 오류)
 
 ### 테스트 실행
 ```bash
@@ -442,6 +474,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - **사용자에게 보이는 오류 문구와 내부 상태 문자열을 섞지 않는다.** `ConnectionState.Error.message`는 진단용 계약이고, 한국어 문구는 `ConnectionErrorKind` → `ConnectionErrorMessages` 경로로 표시 계층에서만 만든다. 문구 전문을 테스트로 고정하지 말고(다듬을 수 있어야 한다) "원문이 주 메시지를 점령하지 않는다", "모든 kind가 문구를 갖는다" 같은 **계약**을 고정한다
 - **`ctypes.sizeof(INPUT)`은 `SendInput`의 cbSize 인자이므로 절대 변해서는 안 된다.** `_INPUTunion`에 새 구조체를 추가할 때는 그 구조체가 `MOUSEINPUT`보다 작은지 확인하고 크기를 고정하는 테스트를 함께 둔다. 이 값이 틀리면 키보드뿐 아니라 마우스 주입까지 전부 실패하며(실측: 틀린 cbSize → `injected 0 of 1`) 예외가 나지 않아 조용히 죽는다
 - **키보드 수정 키(Ctrl/Win 등)를 누르는 주입은 반드시 `try/finally`로 키 업 정리를 보장한다** — 반환값 분기만으로는 예외 경로에서 키가 눌린 채 남는다
+- **와이어 순서(누가 먼저 말하는지)를 바꾸는 변경은 파괴적 변경으로 취급한다** — 새 테스트 추가만으로는 부족하고, grep으로 기존 handshake 시뮬레이션 테스트를 전수 조사해 갱신해야 한다(놓친 파일이 실제로 있었다 — `test_discovery.py`). 가짜 소켓 헬퍼가 여러 파일에 흩어져 있었다면 이 기회에 공용 모듈로 합친다(`tests/fake_conn.py`)
+- **소켓을 닫기 전에 미판독 바이트가 남아 있으면 커널이 RST를 보낸다** — clean EOF(정상 종료로 관측됨)와 RST(예외로 관측됨)는 클라이언트 쪽에서 다른 종류로 보인다. "형식 오류"와 "의도적 거부"를 와이어 상 구분되지 않게 하려면, close 전에 짧은 타임아웃으로 큐를 비울 것
 - **`ServerRuntime`의 새 선택 인자는 기본값을 "비활성"으로 둔다** — 기본값이 실제 포트를 잡으면 서버가 떠 있는 동안 무관한 테스트가 깨진다(트레이/단일 인스턴스/탐색에서 세 번 겪은 교훈). 켜는 것은 `main()`의 몫
 - **Windows UDP 수신 루프에서 `except OSError: break`를 쓰지 않는다** — 정상 동작 중에도 `WSAEMSGSIZE`/`WSAECONNRESET`이 `recvfrom`에서 `OSError`로 올라와 리스너가 조용히 죽는다. 정지 신호/소켓 닫힘과 구분해서 계속 돌 것
 - **KDoc·주석에 유니코드 escape 리터럴을 적지 않는다** — kapt 스텁 주석으로 복사되어 `illegal unicode escape`로 빌드가 깨진다. 말로 풀어 쓸 것
@@ -468,7 +502,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | Android DI | Hilt 2.48 사용 중 (확정) |
 | 바이너리 프로토콜 전환 | Phase 2 성능 테스트 후 결정 |
 | PC 서버 배포 | PyInstaller onefile + windowed 완료(`build_exe.ps1`). 코드 서명·설치 관리자·부팅 시 자동 시작 등록은 범위 밖 |
-| PIN 인증 | Phase 5 선택 사항 — UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않아 동일 WiFi 내 스푸핑이 가능함. PIN 인증 설계 시 함께 재검토 |
+| PIN 인증 실기기/기타 미검증 | 실기기 왕복(숫자 키패드·소형 화면 잘림·포커스 이동·오류 후 재입력), exe 재빌드 후 PIN 콘솔 출력, 실 pystray PIN 메뉴 렌더는 사람이 확인 필요(서버 테스트는 임시 venv 재실행으로 pystray 메뉴 구성까지는 확인함) |
+| PIN 인증의 남은 한계 | 잠금 카운트는 프로세스 메모리 전용이라 서버 재시작 시 리셋됨. NAT 뒤에서 같은 공인 IP를 쓰는 여러 기기는 한 기기의 실패로 함께 잠김. 공격자가 IP를 바꾸며 시도하면 이 잠금을 우회할 수 있어 실질 방어선은 "6자리 100만 조합 + 3초 AUTH 타임아웃"이다. **UDP 세션 토큰이 평문이고 발신 IP도 검증하지 않는 스푸핑 문제는 PIN 인증으로 해결되지 않는다**(TCP 핸드셰이크만 보호됨 — UDP MOVE 자체를 인증하려면 별도 설계 필요). `--allow-multiple`로 서버를 두 개 띄우면 PIN도 두 개(트레이/콘솔 각자 자기 PIN만 표시) |
 | 다중 기기 연결 | 정책 미정 — 서버는 현재 활성 세션 전부를 동시에 처리 가능한 구조(집합 기반)라, 여러 기기가 동시에 연결하면 전부 커서를 움직일 수 있음. 드래그 상태(`_drag_active`)도 프로세스 전역이라, 기기 A가 드래그 중일 때 기기 B의 연결이 끊기면 B의 안전장치가 A의 드래그를 놓아버림(실측 확인) — 버튼이 눌린 채 멈추는 것보다 안전한 실패 방향이라 1:1 전제하에 그대로 둠, 다중 기기 지원 시 세션별 상태 분리 필요 |
 | sub-pixel 이동 정밀도 | `InputController._move`에 한정된 이슈 — 정수 반올림만 하고 잔차를 누적하지 않아, 아주 느린 드래그의 미세 델타가 소실될 수 있음. SCROLL은 Android가 잔차를 완전히 처리해 보내므로 해당 없음 — 별도 이슈로 개선 검토 |
 | heartbeat 리셋 비대칭 | 서버는 CLICK 등 어떤 상향 데이터로도 미응답 카운터가 리셋되지만, 서버→클라이언트 하향 트래픽은 ACK뿐이라 Android 쪽은 사실상 ACK만이 유일한 리셋 수단. 한쪽 방향만 끊기는 비대칭 시나리오가 가능함 — 자동 재연결은 앱이 유실을 감지한 뒤에만 시작되므로, 서버만 끊었고 앱은 아직 모르는 구간(최대 15초)은 그대로 남는다 |
