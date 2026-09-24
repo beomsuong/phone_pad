@@ -1,5 +1,6 @@
 package com.example.phone_pad_app.data.repository
 
+import com.example.phone_pad_app.data.network.SessionReplacedNotice
 import com.example.phone_pad_app.data.network.TcpClient
 import com.example.phone_pad_app.data.network.UdpClient
 import com.example.phone_pad_app.di.IoDispatcher
@@ -481,6 +482,14 @@ class TrackpadRepositoryImpl @Inject constructor(
      * - 읽기 타임아웃 → 미응답 +1, [GestureConfig.HEARTBEAT_MISS_LIMIT] 도달 시 "Heartbeat timeout"
      * - 아무 줄이나 성공 수신(HEARTBEAT_ACK 여부 무관) → 카운터 0으로 리셋
      * - EOF(null) 또는 기타 예외 → 카운터를 기다리지 않고 즉시 "Connection lost"
+     *
+     * **딱 하나의 예외**: `{"type":"SESSION_REPLACED"}`(단일 클라이언트 정책, AGENTS.md 섹션 4)만은
+     * 내용을 본다. 이 줄이 오면 서버가 곧 소켓을 닫으므로 어차피 다음 읽기에서 EOF가 나지만,
+     * 그렇게 두면 "그냥 끊긴 것"으로 관측되어 자동 재연결이 시작되고 우리를 밀어낸 기기를
+     * 다시 밀어내는 핑퐁이 된다. 그래서 EOF를 기다리지 않고 여기서 종류를 확정한다.
+     *
+     * 이 한 줄 말고는 **아무것도 파싱하지 않는다** — 하향 트래픽 해석을 늘리면 "아무 줄이나
+     * 수신 = 살아 있음"이라는 단순한 계약이 무너진다.
      */
     private suspend fun heartbeatWatchdogLoop(forGeneration: Int) {
         var missedBeats = 0
@@ -489,6 +498,15 @@ class TrackpadRepositoryImpl @Inject constructor(
                 val line = tcpClient.readLine()
                 if (line == null) {
                     reportConnectionLost(forGeneration, MESSAGE_CONNECTION_LOST)
+                    return
+                }
+                if (SessionReplacedNotice.isSessionReplaced(line)) {
+                    // 살아 있다는 증거이긴 하지만 카운터를 리셋하지 않는다 — 이 연결은 끝났다.
+                    reportConnectionLost(
+                        forGeneration,
+                        MESSAGE_SESSION_REPLACED,
+                        ConnectionErrorKind.SESSION_REPLACED,
+                    )
                     return
                 }
                 missedBeats = 0
@@ -521,6 +539,9 @@ class TrackpadRepositoryImpl @Inject constructor(
      *
      * 재연결 조건을 만족하면 `Error`를 **한 프레임도 거치지 않고** 곧바로
      * [ConnectionState.Reconnecting]으로 간다.
+     *
+     * [ConnectionErrorKind.SESSION_REPLACED]만은 재연결 조건 자체를 보지 않고 곧바로 `Error`다
+     * (아래 분기 주석 참조).
      */
     private fun reportConnectionLost(
         forGeneration: Int,
@@ -537,6 +558,16 @@ class TrackpadRepositoryImpl @Inject constructor(
         cleanUp()
         // 형제 루프도 함께 정리한다 (자기 자신이 속한 스코프일 수 있으므로 호출 직후 return 한다).
         stopKeepAlive()
+
+        // 단일 클라이언트 정책으로 밀려난 경우는 **"Connected였던 세션의 유실은 항상 재연결한다"는
+        // 기존 규칙의 의도된 예외**다(AGENTS.md 섹션 6). 재연결은 곧 "방금 나를 밀어낸 기기를
+        // 내가 다시 밀어내기"이고, 상대도 같은 앱이라 똑같이 밀려난 뒤 다시 돌아온다 —
+        // 두 기기가 서로를 무한히 쫓아내며 어느 쪽도 쓸 수 없게 된다. 정책을 확인할 필요조차
+        // 없으므로(정책이 켜져 있어도 재연결하지 않는다) 분기보다 먼저 빠져나간다.
+        if (kind == ConnectionErrorKind.SESSION_REPLACED) {
+            _connectionState.value = ConnectionState.Error(message, kind)
+            return
+        }
 
         val host = lastConnectedHost
         if (reconnectPolicy.isActive && host != null) {
@@ -564,6 +595,13 @@ class TrackpadRepositoryImpl @Inject constructor(
         const val MESSAGE_HANDSHAKE_FAILED = "Session handshake failed"
         const val MESSAGE_CONNECTION_FAILED = "Connection failed"
         const val MESSAGE_SEND_FAILED = "Send failed"
+
+        /**
+         * 서버의 단일 클라이언트 정책으로 밀려났을 때의 내부 진단 문자열.
+         * 사용자에게 보이는 문구가 아니다 — 표시는
+         * [com.example.phone_pad_app.presentation.util.ConnectionErrorMessages]가 담당한다.
+         */
+        const val MESSAGE_SESSION_REPLACED = "Session replaced by another device"
 
         /** 재시도 횟수를 모두 소진했을 때의 최종 Error 접두사. 뒤에 마지막 실패 원인이 붙는다. */
         const val MESSAGE_RECONNECT_FAILED_PREFIX = "Reconnect failed: "

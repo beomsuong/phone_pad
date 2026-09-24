@@ -1,6 +1,7 @@
 package com.example.phone_pad_app.data.network
 
 import com.example.phone_pad_app.domain.model.AuthFailedException
+import com.example.phone_pad_app.domain.model.SessionReplacedException
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -126,6 +127,21 @@ class TcpClientAuthTest {
 
         assertEquals(SESSION_TOKEN, result.getOrNull())
         assertEquals("""{"type":"AUTH","pin":""}""", firstLineFromClient.poll(5, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun `SESSION_REPLACED를 핸드셰이크로 받으면 SessionReplacedException을 던진다`() {
+        // protocol-qa W-1: 우리가 SESSION을 받기 전에 세 번째 기기가 우리를 다시 밀어낸
+        // 극히 드문 경합. null(=HANDSHAKE_FAILED, "서버가 아님")과 섞이면 안 된다.
+        startServer("""{"type":"SESSION_REPLACED"}""")
+
+        val result = connect()
+
+        assertTrue(
+            "실제 예외: ${result.exceptionOrNull()}",
+            result.exceptionOrNull() is SessionReplacedException,
+        )
+        assertNull(result.getOrNull())
     }
 
     @Test

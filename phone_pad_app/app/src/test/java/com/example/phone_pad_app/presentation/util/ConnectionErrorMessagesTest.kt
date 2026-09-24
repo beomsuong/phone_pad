@@ -3,6 +3,7 @@ package com.example.phone_pad_app.presentation.util
 import com.example.phone_pad_app.domain.model.ConnectionErrorKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -71,6 +72,28 @@ class ConnectionErrorMessagesTest {
     }
 
     @Test
+    fun `단일 클라이언트 정책으로 밀려난 경우는 자동 복구되지 않음을 알린다`() {
+        val message = ConnectionErrorMessages.userMessage(ConnectionErrorKind.SESSION_REPLACED)
+
+        // 원인: 다른 기기가 들어왔다
+        assertTrue(message.contains("기기"))
+        // 조치: 자동으로 되돌아가지 않으니 직접 다시 연결해야 한다.
+        // 이 종류만 자동 재연결을 하지 않으므로, 기다리면 복구된다는 오해를 남기면 안 된다.
+        assertTrue(message.contains("자동"))
+        assertTrue(message.contains("다시 연결"))
+    }
+
+    @Test
+    fun `밀려난 경우의 문구는 일반 연결 끊김 문구와 다르다`() {
+        // 조치가 정반대(하나는 "Wi-Fi/서버 확인 후 재연결", 하나는 "자동 복구 없음")라
+        // 같은 문장을 쓰면 종류를 나눈 의미가 사라진다.
+        assertNotEquals(
+            ConnectionErrorMessages.userMessage(ConnectionErrorKind.CONNECTION_LOST),
+            ConnectionErrorMessages.userMessage(ConnectionErrorKind.SESSION_REPLACED),
+        )
+    }
+
+    @Test
     fun `원인을 아는 종류의 주 메시지에는 예외 원문이 섞이지 않는다`() {
         // 핵심 요구사항: 영어 원문이 주 메시지를 점령하면 안 된다.
         val knownKinds = ConnectionErrorKind.values().filter { it != ConnectionErrorKind.UNKNOWN }
@@ -128,6 +151,7 @@ class ConnectionErrorMessagesTest {
             "Connection lost" to ConnectionErrorKind.CONNECTION_LOST,
             "Session handshake failed" to ConnectionErrorKind.HANDSHAKE_FAILED,
             "Reconnect failed: refused" to ConnectionErrorKind.RECONNECT_FAILED,
+            "Session replaced by another device" to ConnectionErrorKind.SESSION_REPLACED,
         )
 
         internals.forEach { (internal, kind) ->

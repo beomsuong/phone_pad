@@ -55,6 +55,9 @@ object ConnectionErrorClassifier {
             // 가장 먼저 본다: 서버가 명시적으로 거부한 경우이므로 다른 어떤 단서보다 확실하다.
             // (IOException 계열이라 메시지 추측 경로로 흘러가면 엉뚱하게 분류될 수 있다.)
             is AuthFailedException -> ConnectionErrorKind.AUTH_FAILED
+            // AuthFailedException과 같은 우선순위 — 둘 다 서버가 명시적으로 보낸 형식 있는
+            // 응답이라 메시지 키워드 추측 경로로 흘러가면 안 된다.
+            is SessionReplacedException -> ConnectionErrorKind.SESSION_REPLACED
             is SocketTimeoutException -> ConnectionErrorKind.TIMEOUT
             is UnknownHostException -> ConnectionErrorKind.UNKNOWN_HOST
             is NoRouteToHostException -> ConnectionErrorKind.NETWORK_UNREACHABLE

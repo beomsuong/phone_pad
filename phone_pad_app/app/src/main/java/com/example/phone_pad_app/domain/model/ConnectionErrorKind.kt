@@ -49,6 +49,21 @@ enum class ConnectionErrorKind {
     /** 자동 재연결 시도를 모두 소진 (`"Reconnect failed: ..."`). */
     RECONNECT_FAILED,
 
+    /**
+     * 다른 기기가 같은 PC에 접속해 이 연결이 밀려남 — 서버의 단일 클라이언트 정책
+     * (서버가 보낸 `{"type":"SESSION_REPLACED"}` 한 줄, AGENTS.md 섹션 4).
+     *
+     * [CONNECTION_LOST]와 분리하는 이유는 **동작이 다르기 때문**이다. 다른 유실은 전부
+     * 자동 재연결을 시작하지만 이 종류만은 재연결하지 않고 곧바로 `Error`로 간다 — 재연결하면
+     * 방금 자기를 밀어낸 상대를 다시 밀어내게 되어 두 기기가 서로 뺏고 뺏는 무한 핑퐁이 된다.
+     * 사용자에게 안내할 내용도 "Wi-Fi/서버를 확인하라"가 아니라 "자동으로 되돌아가지 않으니
+     * 직접 다시 연결하라"로 정반대다.
+     *
+     * [Throwable]에서 분류되지 않는다 — [HEARTBEAT_TIMEOUT]/[RECONNECT_FAILED]와 마찬가지로
+     * 코드가 직접 지정하므로 [ConnectionErrorClassifier]는 이 값을 만들지 않는다.
+     */
+    SESSION_REPLACED,
+
     /** 위 어디에도 해당하지 않음 — 표시 계층이 원문을 함께 보여주는 폴백. */
     UNKNOWN,
 }

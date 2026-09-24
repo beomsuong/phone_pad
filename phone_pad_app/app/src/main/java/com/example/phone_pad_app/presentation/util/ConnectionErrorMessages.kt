@@ -59,6 +59,13 @@ object ConnectionErrorMessages {
         ConnectionErrorKind.RECONNECT_FAILED ->
             "자동 재연결에 실패했습니다. PC 서버와 Wi-Fi를 확인한 뒤 다시 연결하세요."
 
+        // 다른 유실 문구와 달리 "자동으로 되돌아가지 않는다"를 반드시 말해야 한다 —
+        // 이 종류만 자동 재연결을 하지 않으므로, 사용자가 기다리면 복구될 것으로 오해하면
+        // 아무 일도 일어나지 않는 화면을 계속 보게 된다.
+        ConnectionErrorKind.SESSION_REPLACED ->
+            "다른 기기가 이 PC에 새로 연결되어 현재 연결이 끊겼습니다. " +
+                "자동으로 다시 연결되지 않으니, 계속 사용하려면 직접 다시 연결하세요."
+
         ConnectionErrorKind.UNKNOWN -> {
             val raw = rawMessage?.trim()
             if (raw.isNullOrEmpty()) GENERIC else "$UNKNOWN_PREFIX$raw"

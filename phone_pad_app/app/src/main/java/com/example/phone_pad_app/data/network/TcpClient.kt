@@ -1,6 +1,7 @@
 package com.example.phone_pad_app.data.network
 
 import com.example.phone_pad_app.domain.model.AuthFailedException
+import com.example.phone_pad_app.domain.model.SessionReplacedException
 import com.example.phone_pad_app.presentation.util.GestureConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -92,6 +93,12 @@ class TcpClient @Inject constructor() {
             if (AuthHandshake.isAuthFail(line)) {
                 // 형식이 맞는 거부 응답이다 — "서버가 아예 응답하지 않음"과 섞지 않는다.
                 throw AuthFailedException(AuthHandshake.parseFailReason(line))
+            }
+            if (SessionReplacedNotice.isSessionReplaced(line)) {
+                // 극히 드문 3자 경합(protocol-qa W-1) — 우리가 SESSION을 받기 전에 세 번째
+                // 기기가 우리를 다시 밀어냈다. HANDSHAKE_FAILED(엉뚱한 "서버가 아님" 안내)로
+                // 새지 않도록 SessionReplacedException 참조.
+                throw SessionReplacedException()
             }
             val session = SessionHandshake.parseSession(line)
             if (session != null) {
