@@ -45,18 +45,21 @@ phone_pad/
 │                               DragHoldDetector.kt, ConnectionErrorSection.kt,
 │                               ServerDiscoverySection.kt
 └── pc_server/                 ← Windows Python 서버
-    ├── server.py              소켓/세션/heartbeat + 정지 가능한 ServerRuntime, 콘솔/트레이 실행 모드
+    ├── server.py              소켓/세션/heartbeat + 정지 가능한 ServerRuntime, 콘솔/트레이/창 실행 모드
+    ├── gui.py                 tkinter 창 어댑터 (표준 라이브러리, 기본 모드) — 닫으면 트레이로 축소
+    ├── gui_state.py           창 순수 로직 (버튼 라벨 등) — tkinter 비의존
     ├── input_controller.py
     ├── discovery.py           UDP 9002 서버 탐색 응답자 (표준 라이브러리만, 기본 비활성 — main()만 켠다)
     ├── tray_status.py         트레이 순수 로직 (연결 수→상태/툴팁, LAN IP 조회) — pystray 비의존
     ├── tray.py                pystray 어댑터 (pystray/Pillow import는 여기에서만, 선택 의존성)
-    ├── requirements.txt       pystray, Pillow (트레이 전용 — 없어도 서버는 콘솔 모드로 동작)
+    ├── requirements.txt       pystray, Pillow (트레이 전용 — 없어도 서버는 창 모드로 동작, 트레이만 빠짐)
     ├── single_instance.py     중복 실행 방지 (Windows named mutex `Local\PhonePadServer`)
     ├── logging_setup.py       --noconsole 실행 시 print() → 로그 파일
     ├── phone_pad_server.spec  PyInstaller 빌드 정의 (onefile + windowed)
     ├── build_exe.ps1          저장소 밖 임시 venv 생성 → exe 빌드 스크립트
     └── tests/                 pytest 단위 테스트 (test_single_instance.py, test_logging_setup.py 포함,
-                               send_input_stub.py = SendInput 모킹 헬퍼, test_desktop_switch.py, test_discovery.py)
+                               send_input_stub.py = SendInput 모킹 헬퍼, test_desktop_switch.py, test_discovery.py,
+                               fake_tk.py = tkinter 위젯 대역)
 ```
 
 ---
@@ -438,8 +441,8 @@ Android                                          PC Server
 ```bash
 cd pc_server
 pip install -r requirements.txt   # 트레이 아이콘용 (선택 — 없으면 콘솔 모드로 동작)
-python server.py                  # 시스템 트레이 아이콘과 함께 실행
-python server.py --no-tray        # 트레이 없이 콘솔 모드 (Ctrl+C로 종료)
+python server.py                  # 창(PIN·접속 주소·연결 상태 + 시작/정지/종료 버튼) + 트레이 아이콘
+python server.py --no-tray        # 그래픽 UI(창+트레이) 전부 끄고 콘솔 모드 (Ctrl+C로 종료)
 python server.py --no-discovery   # UDP 9002 자동 탐색 응답 끄기 (수동 IP 입력만)
 python server.py --pin 123456     # 무작위 생성 대신 고정 PIN 사용
 python server.py --no-auth        # PIN 인증 완전히 끄기 (개발/디버깅용)
@@ -448,10 +451,12 @@ python server.py --no-auth        # PIN 인증 완전히 끄기 (개발/디버�
 # 단일 exe 빌드 — 임시 venv를 저장소 밖에 만든다(전역 Python은 건드리지 않음)
 ./build_exe.ps1                   # → dist/PhonePadServer.exe (약 15.6MB, 빌드 약 40초)
 ```
-**exe 실행:** 더블클릭하면 windowed(`--noconsole`)라 콘솔 창 없이 트레이 아이콘만 뜬다. 그래서 `print()` 로그는 **`%LOCALAPPDATA%\PhonePad\server.log`** 로 간다(줄 단위 flush, 1MB를 넘으면 시작 시 `server.log.1`로 1회 회전). 빌드 산출물(`build/`, `dist/`)은 커밋하지 않는다.
+**서버 창(기본 모드, ✅ 완료).** `python server.py`(또는 옵션 없이 실행한 exe)는 이제 tkinter 창이 먼저 뜬다 — PIN·접속 주소·연결 상태를 보여주고 **시작/정지** 토글 버튼(포트를 열고 닫는다 — 새로 "시작"할 때마다 PIN도 새로 생긴다)과 **종료** 버튼이 있다. 창을 X로 닫으면 **종료가 아니라 트레이로 숨는다**(pystray/Pillow가 있을 때만 — 없으면 X가 곧 종료, 콘솔에 경고 한 줄). 트레이 메뉴의 "창 열기"로 다시 연다. **그래픽 UI 폴백 사슬**: 창+트레이 → (tkinter 없으면) 트레이만 → (pystray/Pillow도 없으면) 콘솔 — `--no-tray`는 이 사슬 전체를 건너뛰고 곧장 콘솔로 간다(플래그 이름은 그대로 두고 의미만 "그래픽 UI 전부 끄기"로 넓혔다).
+**exe 실행:** 더블클릭하면 windowed(`--noconsole`)라 콘솔 창 없이 서버 창(+트레이 아이콘)이 뜬다. 그래서 `print()` 로그는 **`%LOCALAPPDATA%\PhonePad\server.log`** 로 간다(줄 단위 flush, 1MB를 넘으면 시작 시 `server.log.1`로 1회 회전). 빌드 산출물(`build/`, `dist/`)은 커밋하지 않는다.
 **PIN 인증(기본 켜짐):** 서버를 실행하면 콘솔에 `[Server] PIN for this session: 483920`이 한 번 출력되고 트레이 툴팁/메뉴에도 같은 값이 보인다. 앱 연결 화면의 PIN 입력란에 이 값을 그대로 입력해야 한다(수동 확인 — 탐색으로 서버를 찾아도 PIN은 자동으로 채워지지 않는다). 서버가 재시작되면 PIN도 새로 바뀐다.
 **트레이 모드:** 아이콘 색이 상태를 보여준다(회색 = 대기 중, 초록 = 연결됨). 툴팁은 `Phone Pad - 연결됨 (N대) - PIN: 483920`, 메뉴에는 앱에 입력할 **접속 주소(`PC의 LAN IP:9000`)** 와 **PIN**이 표시되며 **"종료"** 로 끈다. `pystray`/`Pillow`가 설치돼 있지 않으면 경고 한 줄을 출력하고 자동으로 콘솔 모드로 동작한다(서버 기능은 트레이 의존성에 막히지 않는다). 서버가 예외로 죽으면(포트 바인드 실패 등) 트레이도 함께 내려가 프로세스가 종료 코드 1로 끝난다 — 아이콘만 남는 좀비는 생기지 않는다.
 **서버를 두 번 실행하면 자동으로 차단된다:** Windows에서는 `SO_REUSEADDR` 때문에 이미 점유된 포트에도 bind가 성공해 예전에는 트레이 아이콘이 2개 뜨고 한쪽만 트래픽을 받았다. 이제 두 번째 프로세스가 named mutex(`Local\PhonePadServer`)로 이를 감지해 "이미 실행 중입니다" 안내창(windowed) 또는 stderr 한 줄(콘솔)을 띄우고 **종료 코드 2**로 끝난다 — 첫 인스턴스는 영향받지 않는다. 개발 중 일부러 두 개를 띄우려면 `--allow-multiple`. 단 다른 로그인 세션에서 띄운 서버는 감지하지 못한다(아래 섹션 10 참조).
+**서버 '정지' 버튼과 이미 붙어 있던 폰:** '정지'를 누르면 리슨/UDP 소켓만 닫는 것으로는 부족하다 — 이미 연결된 폰은 heartbeat로 계속 살아있는 척해서 CLICK/DRAG가 계속 실행될 수 있었다(구멍이었다가 이번에 발견·수정됨). 이제 '정지'는 현재 연결도 clean EOF로 끊는다(`SESSION_REPLACED`는 안 보낸다 — 그러면 앱이 재연결을 포기한다). 폰은 평소의 연결 유실처럼 보고 자동 재연결을 시도하며, '시작'을 다시 누르면 붙는다.
 **Windows 방화벽(exe):** `python.exe`로 허용해 둔 기존 규칙은 `PhonePadServer.exe`에 적용되지 않으므로 exe로 처음 실행하면 새 방화벽 프롬프트가 뜰 수 있다(미검증 — 이 환경에서 확인 불가). 허용 대상은 아래와 같다.
 
 **Windows 방화벽:** UDP 9001 인바운드를 허용해야 한다 (TCP 9000만 열려 있으면 커서가 전혀 움직이지 않음 — CLICK은 되는데 MOVE만 안 되면 이 문제일 가능성이 높다). **자동 탐색을 쓰려면 UDP 9002 인바운드도 허용해야 한다**(안 열려 있으면 "서버 찾기"만 실패하고 수동 IP 연결은 그대로 동작한다).
@@ -497,6 +502,10 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - **마지막 줄을 보내고 닫는 모든 경로는 close 전에 수신 큐를 비운다** — `shutdown(SHUT_RDWR)`만으로는 RST를 막지 못한다(미판독 바이트가 남아 있으면 커널이 RST를 보내 이미 보낸 마지막 줄까지 상대 버퍼에서 사라진다). PIN 브루트포스 잠금(F-1)과 단일 클라이언트 밀어내기, 두 번 겪은 함정
 - **와이어 순서(누가 먼저 말하는지)를 바꾸는 변경은 파괴적 변경으로 취급한다** — 새 테스트 추가만으로는 부족하고, grep으로 기존 handshake 시뮬레이션 테스트를 전수 조사해 갱신해야 한다(놓친 파일이 실제로 있었다 — `test_discovery.py`). 가짜 소켓 헬퍼가 여러 파일에 흩어져 있었다면 이 기회에 공용 모듈로 합친다(`tests/fake_conn.py`)
 - **소켓을 닫기 전에 미판독 바이트가 남아 있으면 커널이 RST를 보낸다** — clean EOF(정상 종료로 관측됨)와 RST(예외로 관측됨)는 클라이언트 쪽에서 다른 종류로 보인다. "형식 오류"와 "의도적 거부"를 와이어 상 구분되지 않게 하려면, close 전에 짧은 타임아웃으로 큐를 비울 것
+- **서버 쪽에 새 UI/부가 기능을 추가할 때도 필수 의존성을 늘리지 않는다** — pystray/Pillow가 트레이 전용 선택 의존성이듯, 창은 표준 라이브러리 `tkinter`로 만든다(GUI 프레임워크를 새로 pip install 하지 않는다)
+- **`ServerRuntime`은 재사용할 수 없다** — `close()`한 소켓은 다시 못 연다. "시작/정지"처럼 서버를 다시 띄워야 하는 기능은 인스턴스가 아니라 **인자 없이 부르면 새 인스턴스를 반환하는 factory**를 받는다(`ServerSupervisor`/`run_with_gui` 참조). PIN처럼 "매 시작마다 새로 생겨야 하는 값"도 factory 안에서 다시 계산하면 자연히 해결된다
+- **tkinter `mainloop()`는 메인 스레드, pystray는 백그라운드 스레드에 둔다**(이 프로젝트는 Windows 전용이라 pystray의 `_win32` 백엔드가 자신이 만든 창이 속한 스레드에서 메시지 루프를 돌리면 되므로 가능 — macOS Cocoa 백엔드였다면 안 된다). 트레이 스레드에서 tkinter 위젯을 직접 건드리지 않는다(스레드 세이프하지 않음) — 큐 + `after()` 폴링으로 메인(=tkinter) 스레드에서 실행되게 한다. **실제로 창+트레이를 동시에 띄워 눈으로 확인할 것** — 이런 이중 이벤트 루프 설계는 문서만 보고 판단하면 안 된다
+- **PyInstaller `.spec`의 `excludes` 목록은 새 기능이 그 라이브러리를 필요로 하게 되면 함께 갱신해야 한다** — `tkinter`가 "서버는 GUI가 없다"는 이유로 제외돼 있었는데, 창을 기본 모드로 추가하면서 안 지웠다면 exe는 **오류 없이 조용히** 트레이 전용 모드로 폴백했을 것이다(발견하기 어려운 종류의 회귀)
 - **`ServerRuntime`의 새 선택 인자는 기본값을 "비활성"으로 둔다** — 기본값이 실제 포트를 잡으면 서버가 떠 있는 동안 무관한 테스트가 깨진다(트레이/단일 인스턴스/탐색에서 세 번 겪은 교훈). 켜는 것은 `main()`의 몫
 - **Windows UDP 수신 루프에서 `except OSError: break`를 쓰지 않는다** — 정상 동작 중에도 `WSAEMSGSIZE`/`WSAECONNRESET`이 `recvfrom`에서 `OSError`로 올라와 리스너가 조용히 죽는다. 정지 신호/소켓 닫힘과 구분해서 계속 돌 것
 - **KDoc·주석에 유니코드 escape 리터럴을 적지 않는다** — kapt 스텁 주석으로 복사되어 `illegal unicode escape`로 빌드가 깨진다. 말로 풀어 쓸 것
@@ -561,4 +570,5 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 | 탐색 응답 위조 가능 | 인증 이전 단계라 같은 LAN의 누구나 `SERVER` 응답을 위조해 목록에 줄을 올릴 수 있다. 선택은 입력란만 채우고 연결은 사용자가 누르게 했지만 이름만 보고 누르면 공격자 주소로 붙는다 — 근본 해결은 PIN 인증과 함께(위 "PIN 인증" 행). 반대로 같은 LAN의 누구나 PC 이름·TCP 포트를 알 수 있다(스펙이 의도한 트레이드오프, 토큰은 절대 넣지 않음) |
 | 탐색의 한계 | IPv6 전용 네트워크 미지원(브로드캐스트는 IPv4 개념 — mDNS 등 별도 설계 필요), 응답에 TCP 포트만 있어 서버가 비표준 UDP(MOVE) 포트로 뜨면 앱이 알 수 없음(현재 `main()`은 항상 9001), 서버 recv 오류가 50회 연속이면 탐색 스레드가 포기하는데 `start()`는 이미 `True`를 돌려준 뒤라 9002를 점유한 채 응답이 없다(QA W-6, 발생 조건이 좁아 허용), 취소 후 최대 200ms 소켓이 살아 있음, 같은 IP 뒤의 두 앱은 응답 제한(IP 단위 5회/초)을 공유 |
 | 서버 두 번째 인스턴스의 9002 | 탐색 소켓은 `SO_REUSEADDR`를 쓰지 않아 **두 번째 인스턴스의 9002 bind는 실패**한다(응답이 두 개 나가지 않음 — named mutex와 별개의 두 번째 방어선). `--allow-multiple`로 일부러 두 개를 띄우면 두 번째는 탐색이 꺼진 채 동작한다 |
+| 서버 GUI 실기기/exe 미검증 | 창+트레이 동시 구동은 개발자의 실제 Windows 데스크톱에서 실측(23/23 PASS, 3회 반복) — 창 표시, X→트레이 축소, 트레이에서 창 복원, 시작/정지로 포트 열고 닫기, 재시작마다 새 PIN까지 확인. **PyInstaller 재빌드는 이번 범위 밖**이라 exe에서도 같은지 미확인(스펙의 `tkinter` 제외를 풀었으니 되어야 하지만 실측 필요) |
 | 앱 백그라운드 진입 시 드래그 미종료 | 드래그 홀드 중 Android 앱이 백그라운드로 가서 `TrackpadViewModel`이 파기되면 `DRAG_END`를 보낼 기회가 없다 — 서버 heartbeat 타임아웃(≈15초)이 감지해 강제로 놓을 때까지 PC 버튼이 눌린 채 유지됨. 실기기 미검증 |
