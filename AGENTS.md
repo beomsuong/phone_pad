@@ -451,7 +451,7 @@ python server.py --no-auth        # PIN 인증 완전히 끄기 (개발/디버�
 # 단일 exe 빌드 — 임시 venv를 저장소 밖에 만든다(전역 Python은 건드리지 않음)
 ./build_exe.ps1                   # → dist/PhonePadServer.exe (약 15.6MB, 빌드 약 40초)
 ```
-**서버 창(기본 모드, ✅ 완료).** `python server.py`(또는 옵션 없이 실행한 exe)는 이제 tkinter 창이 먼저 뜬다 — PIN·접속 주소·연결 상태를 보여주고 **시작/정지** 토글 버튼(포트를 열고 닫는다 — 새로 "시작"할 때마다 PIN도 새로 생긴다)과 **종료** 버튼이 있다. 창을 X로 닫으면 **종료가 아니라 트레이로 숨는다**(pystray/Pillow가 있을 때만 — 없으면 X가 곧 종료, 콘솔에 경고 한 줄). 트레이 메뉴의 "창 열기"로 다시 연다. **그래픽 UI 폴백 사슬**: 창+트레이 → (tkinter 없으면) 트레이만 → (pystray/Pillow도 없으면) 콘솔 — `--no-tray`는 이 사슬 전체를 건너뛰고 곧장 콘솔로 간다(플래그 이름은 그대로 두고 의미만 "그래픽 UI 전부 끄기"로 넓혔다).
+**서버 창(기본 모드, ✅ 완료).** `python server.py`(또는 옵션 없이 실행한 exe)는 이제 tkinter 창이 먼저 뜬다 — PIN·접속 주소·연결 상태를 보여주고 **시작/정지** 토글 버튼(포트를 열고 닫는다 — 새로 "시작"할 때마다 PIN도 새로 생긴다)과 **종료** 버튼이 있다. 창을 X로 닫으면 **종료가 아니라 트레이로 숨는다**(pystray/Pillow가 있을 때만 — 없으면 X가 곧 종료, 콘솔에 경고 한 줄). 트레이 메뉴의 "창 열기"로 다시 연다. **그래픽 UI 폴백 사슬**: 창+트레이 → (tkinter 없으면) 트레이만 → (pystray/Pillow도 없으면) 콘솔 — `--no-tray`는 이 사슬 전체를 건너뛰고 곧장 콘솔로 간다(플래그 이름은 그대로 두고 의미만 "그래픽 UI 전부 끄기"로 넓혔다). **디자인(✅ 완료, 순수 스타일링).** `ttk` + Windows 네이티브 "vista" 테마(새 pip 의존성 없음)로 리스타일링했다 — PIN은 크고 굵은 등폭 글씨(`Consolas`)로 강조, 연결 상태는 트레이와 같은 의미의 색 점(회색/초록)으로도 보여주고, 시작 버튼은 가능하면 강조 스타일(`Accent.TButton`, 없는 Tcl/Tk 버전이면 굵은 글씨로 폴백)을 쓴다. 창/작업표시줄 아이콘도 Pillow 없이 순수 `tkinter.PhotoImage`로 그린다.
 **exe 실행:** 더블클릭하면 windowed(`--noconsole`)라 콘솔 창 없이 서버 창(+트레이 아이콘)이 뜬다. 그래서 `print()` 로그는 **`%LOCALAPPDATA%\PhonePad\server.log`** 로 간다(줄 단위 flush, 1MB를 넘으면 시작 시 `server.log.1`로 1회 회전). 빌드 산출물(`build/`, `dist/`)은 커밋하지 않는다.
 **PIN 인증(기본 켜짐):** 서버를 실행하면 콘솔에 `[Server] PIN for this session: 483920`이 한 번 출력되고 트레이 툴팁/메뉴에도 같은 값이 보인다. 앱 연결 화면의 PIN 입력란에 이 값을 그대로 입력해야 한다(수동 확인 — 탐색으로 서버를 찾아도 PIN은 자동으로 채워지지 않는다). 서버가 재시작되면 PIN도 새로 바뀐다.
 **트레이 모드:** 아이콘 색이 상태를 보여준다(회색 = 대기 중, 초록 = 연결됨). 툴팁은 `Phone Pad - 연결됨 (N대) - PIN: 483920`, 메뉴에는 앱에 입력할 **접속 주소(`PC의 LAN IP:9000`)** 와 **PIN**이 표시되며 **"종료"** 로 끈다. `pystray`/`Pillow`가 설치돼 있지 않으면 경고 한 줄을 출력하고 자동으로 콘솔 모드로 동작한다(서버 기능은 트레이 의존성에 막히지 않는다). 서버가 예외로 죽으면(포트 바인드 실패 등) 트레이도 함께 내려가 프로세스가 종료 코드 1로 끝난다 — 아이콘만 남는 좀비는 생기지 않는다.
@@ -511,6 +511,8 @@ cd phone_pad_app && ./gradlew :app:testDebugUnitTest   # Android 단위 테스�
 - **KDoc·주석에 유니코드 escape 리터럴을 적지 않는다** — kapt 스텁 주석으로 복사되어 `illegal unicode escape`로 빌드가 깨진다. 말로 풀어 쓸 것
 - **suspend 호출을 `runCatching`으로 감싸지 않는다** — `CancellationException`까지 삼켜 취소를 실패로 보고한다. `try/catch(CancellationException){throw}/catch(Exception)`을 쓴다
 - **테스트는 하나의 `TestDispatcher`를 필드로 두고 `runTest(dispatcher)`로 넘긴다** — `runTest {}` 안에서 새 디스패처를 만들면 `Detected use of different schedulers`로 무더기 실패한다
+- **tkinter 실제 위젯 테스트에서 `PhotoImage` 등 Tcl 객체를 지역 변수로 따로 쥐고 있지 않는다** — `destroy()` 이후 테스트 함수가 반환되며 그 참조가 GC될 때 `__del__`이 이미 파괴된 Tcl 인터프리터를 호출해 `RuntimeError: main thread is not in main loop`가 난다(pytest가 실패로 잡음). 다 쓴 참조는 `destroy()` 호출 전에 `del`로 놓을 것
+- **Tcl/Tk의 `cget()`은 버전에 따라 색상 같은 옵션값을 평범한 `str`이 아니라 래퍼 객체로 돌려줄 수 있다** — `repr`은 같아 보여도 `==`이 str과 바로 성립하지 않는다. 비교할 때는 `str(...)`로 감쌀 것
 - **새 기능/버그 수정 시 테스트 코드도 함께 작성**
   - Android: `usecase`/`repository` 등 도메인 로직은 JUnit + MockK 단위 테스트, 제스처 판정 로직(`GestureConfig` 기준값)은 별도 테스트로 검증
   - Python 서버: `input_controller.py`의 `handle_event` 등 이벤트 처리 로직은 `unittest`/`pytest`로 단위 테스트 작성
